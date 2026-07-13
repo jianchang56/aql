@@ -302,12 +302,22 @@ enum Command {
     },
     /// Show the canonical SQL schema without opening Agent data.
     Schema {
+        #[arg(conflicts_with = "list")]
         table: Option<String>,
+        /// List canonical table names without rendering their columns.
+        #[arg(long)]
+        list: bool,
         #[arg(long, value_enum, default_value_t = SchemaOutput::Table)]
         output: SchemaOutput,
     },
     /// Print curated read-only SQL examples without executing them.
-    Examples { name: Option<String> },
+    Examples {
+        #[arg(conflicts_with = "list")]
+        name: Option<String>,
+        /// List available example names.
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1666,6 +1676,27 @@ fn render_schema(
     Ok(())
 }
 
+fn render_schema_list(output: SchemaOutput) -> Result<(), Box<dyn std::error::Error>> {
+    match output {
+        SchemaOutput::Table => {
+            println!("table");
+            for schema in QUERY_SCHEMAS {
+                println!("{}", schema.name);
+            }
+        }
+        SchemaOutput::Json => println!(
+            "{}",
+            serde_json::to_string(
+                &QUERY_SCHEMAS
+                    .iter()
+                    .map(|schema| schema.name)
+                    .collect::<Vec<_>>()
+            )?
+        ),
+    }
+    Ok(())
+}
+
 fn render_examples(name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(name) = name {
         let sql = SQL_EXAMPLES
@@ -2693,8 +2724,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Sources { sources } => execute_source_command(sources)?,
         Command::Profile { profile } => execute_profile_command(profile, "profile")?,
         Command::Database { database } => execute_database_command(database)?,
-        Command::Schema { table, output } => render_schema(table, output)?,
-        Command::Examples { name } => render_examples(name)?,
+        Command::Schema {
+            table,
+            list,
+            output,
+        } => {
+            if list {
+                render_schema_list(output)?;
+            } else {
+                render_schema(table, output)?;
+            }
+        }
+        Command::Examples { name, list } => {
+            render_examples(if list { None } else { name })?;
+        }
     }
     Ok(())
 }
@@ -5287,6 +5330,14 @@ mod tests {
                 .iter()
                 .any(|column| column.name == "session_id")
         );
+    }
+
+    #[test]
+    fn schema_and_examples_have_explicit_list_modes() {
+        assert!(Cli::try_parse_from(["aql", "schema", "--list"]).is_ok());
+        assert!(Cli::try_parse_from(["aql", "schema", "sessions", "--list"]).is_err());
+        assert!(Cli::try_parse_from(["aql", "examples", "--list"]).is_ok());
+        assert!(Cli::try_parse_from(["aql", "examples", "token-usage", "--list"]).is_err());
     }
 
     #[test]

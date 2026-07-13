@@ -191,9 +191,11 @@ printf '%s\n' 'SELECT COUNT(*) FROM sessions' | aql query -d codex --stdin
 
 ```bash
 aql schema
+aql schema --list
 aql schema sessions
 aql schema --output json
 aql examples
+aql examples --list
 aql examples sessions-by-model
 ```
 
