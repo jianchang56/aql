@@ -181,7 +181,7 @@ enum Command {
         #[arg(long, default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
         /// Atomically write the export to this new local file instead of stdout.
-        #[arg(long)]
+        #[arg(long = "output-file", visible_alias = "file")]
         file: Option<PathBuf>,
         sql: String,
     },
@@ -4855,6 +4855,24 @@ mod tests {
         for arguments in [
             vec!["aql", "doctor", "-d", "codex"],
             vec!["aql", "export", "-d", "codex", "SELECT 1"],
+            vec![
+                "aql",
+                "export",
+                "-d",
+                "codex",
+                "--output-file",
+                "synthetic.json",
+                "SELECT 1",
+            ],
+            vec![
+                "aql",
+                "export",
+                "-d",
+                "codex",
+                "--file",
+                "synthetic.json",
+                "SELECT 1",
+            ],
             vec!["aql", "report", "-d", "codex", "summary"],
             vec!["aql", "search", "-d", "codex", "synthetic"],
             vec!["aql", "index", "status", "-d", "codex"],

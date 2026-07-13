@@ -205,7 +205,7 @@ portable JSON 导出：
 aql export -d work \
   'SELECT agent_id, model, SUM(total_tokens) FROM usage GROUP BY agent_id, model'
 
-aql export -d work --file ./usage.json \
+aql export -d work --output-file ./usage.json \
   'SELECT * FROM usage'
 ```
 
