@@ -124,19 +124,19 @@ enum Command {
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
         /// Stop after scanning this many canonical records across the complete query.
-        #[arg(long, default_value_t = 100_000)]
+        #[arg(long, default_value = "100k", value_parser = parse_count)]
         max_records: u64,
         /// Maximum source bytes that all adapters may read for this query.
-        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        #[arg(long, default_value = "256MiB", value_parser = parse_byte_size)]
         max_bytes_read: u64,
         /// Maximum bytes that may be published to stdout.
-        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        #[arg(long, default_value = "64MiB", value_parser = parse_byte_size)]
         max_output_bytes: u64,
         /// Reject any single sensitive value larger than this limit.
-        #[arg(long, default_value_t = 16 * 1024 * 1024)]
+        #[arg(long, default_value = "16MiB", value_parser = parse_byte_size)]
         max_single_value_bytes: u64,
         /// Maximum in-memory query execution working set.
-        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        #[arg(long, default_value = "256MiB", value_parser = parse_usize_byte_size)]
         max_memory_bytes: usize,
         /// Cancel the complete query when this duration elapses.
         #[arg(long, default_value = "30s", value_parser = parse_duration)]
@@ -178,19 +178,19 @@ enum Command {
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
         /// Stop after scanning this many canonical records across the complete export.
-        #[arg(long, default_value_t = 100_000)]
+        #[arg(long, default_value = "100k", value_parser = parse_count)]
         max_records: u64,
         /// Maximum source bytes that all adapters may read.
-        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        #[arg(long, default_value = "256MiB", value_parser = parse_byte_size)]
         max_bytes_read: u64,
         /// Maximum bytes in the complete portable JSON export.
-        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        #[arg(long, default_value = "64MiB", value_parser = parse_byte_size)]
         max_output_bytes: u64,
         /// Reject any single sensitive value larger than this limit.
-        #[arg(long, default_value_t = 16 * 1024 * 1024)]
+        #[arg(long, default_value = "16MiB", value_parser = parse_byte_size)]
         max_single_value_bytes: u64,
         /// Maximum in-memory query execution working set.
-        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        #[arg(long, default_value = "256MiB", value_parser = parse_usize_byte_size)]
         max_memory_bytes: usize,
         /// Cancel the complete export when this duration elapses.
         #[arg(long, default_value = "30s", value_parser = parse_duration)]
@@ -220,19 +220,19 @@ enum Command {
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
         /// Stop after scanning this many canonical records across all report queries.
-        #[arg(long, default_value_t = 100_000)]
+        #[arg(long, default_value = "100k", value_parser = parse_count)]
         max_records: u64,
         /// Maximum source bytes that all report queries may read.
-        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        #[arg(long, default_value = "256MiB", value_parser = parse_byte_size)]
         max_bytes_read: u64,
         /// Maximum rendered Markdown bytes.
-        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        #[arg(long, default_value = "64MiB", value_parser = parse_byte_size)]
         max_output_bytes: u64,
         /// Reject any single sensitive value larger than this limit.
-        #[arg(long, default_value_t = 16 * 1024 * 1024)]
+        #[arg(long, default_value = "16MiB", value_parser = parse_byte_size)]
         max_single_value_bytes: u64,
         /// Maximum in-memory execution working set.
-        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        #[arg(long, default_value = "256MiB", value_parser = parse_usize_byte_size)]
         max_memory_bytes: usize,
         /// Cancel the complete report when this duration elapses.
         #[arg(long, default_value = "30s", value_parser = parse_duration)]
@@ -263,7 +263,7 @@ enum Command {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=1000))]
         limit: u64,
         /// Maximum rendered search-result bytes.
-        #[arg(long, default_value_t = 1024 * 1024)]
+        #[arg(long, default_value = "1MiB", value_parser = parse_byte_size)]
         max_output_bytes: u64,
         /// Cancel the search when this duration elapses.
         #[arg(long, default_value = "5s", value_parser = parse_duration)]
@@ -585,11 +585,11 @@ enum IndexCommand {
         /// Confirm that Content will be copied into persistent AQL-owned storage.
         #[arg(long)]
         acknowledge_persistent_sensitive_copy: bool,
-        #[arg(long, default_value_t = 100_000)]
+        #[arg(long, default_value = "100k", value_parser = parse_count)]
         max_records: u64,
-        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        #[arg(long, default_value = "256MiB", value_parser = parse_byte_size)]
         max_bytes_read: u64,
-        #[arg(long, default_value_t = 512 * 1024 * 1024)]
+        #[arg(long, default_value = "512MiB", value_parser = parse_byte_size)]
         max_index_bytes: u64,
         #[arg(long, default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
@@ -615,11 +615,11 @@ enum IndexCommand {
         access: Vec<Access>,
         #[arg(long)]
         acknowledge_persistent_sensitive_copy: bool,
-        #[arg(long, default_value_t = 100_000)]
+        #[arg(long, default_value = "100k", value_parser = parse_count)]
         max_records: u64,
-        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        #[arg(long, default_value = "256MiB", value_parser = parse_byte_size)]
         max_bytes_read: u64,
-        #[arg(long, default_value_t = 512 * 1024 * 1024)]
+        #[arg(long, default_value = "512MiB", value_parser = parse_byte_size)]
         max_index_bytes: u64,
         #[arg(long, default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
@@ -4360,6 +4360,50 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     }
 }
 
+fn parse_count(value: &str) -> Result<u64, String> {
+    parse_scaled_u64(value, &[("k", 1_000), ("m", 1_000_000)], "record count")
+}
+
+fn parse_byte_size(value: &str) -> Result<u64, String> {
+    parse_scaled_u64(
+        value,
+        &[
+            ("gib", 1024 * 1024 * 1024),
+            ("mib", 1024 * 1024),
+            ("kib", 1024),
+            ("gb", 1_000_000_000),
+            ("mb", 1_000_000),
+            ("kb", 1_000),
+            ("b", 1),
+        ],
+        "byte size",
+    )
+}
+
+fn parse_usize_byte_size(value: &str) -> Result<usize, String> {
+    usize::try_from(parse_byte_size(value)?).map_err(|_| "byte size is too large".to_string())
+}
+
+fn parse_scaled_u64(value: &str, suffixes: &[(&str, u64)], label: &str) -> Result<u64, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let (digits, multiplier) = suffixes
+        .iter()
+        .find_map(|(suffix, multiplier)| {
+            normalized
+                .strip_suffix(suffix)
+                .map(|digits| (digits, *multiplier))
+        })
+        .unwrap_or((normalized.as_str(), 1));
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("invalid {label}"));
+    }
+    digits
+        .parse::<u64>()
+        .map_err(|_| format!("invalid {label}"))?
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("{label} is too large"))
+}
+
 fn write_rendered(
     writer: &mut impl Write,
     rendered: &str,
@@ -5032,6 +5076,34 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(arguments).is_err());
         }
+    }
+
+    #[test]
+    fn human_readable_limits_parse_without_breaking_raw_integers() {
+        assert_eq!(parse_count("100k").expect("count parses"), 100_000);
+        assert_eq!(parse_count("42").expect("raw count parses"), 42);
+        assert_eq!(
+            parse_byte_size("256MiB").expect("binary size parses"),
+            256 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_byte_size("64MB").expect("decimal size parses"),
+            64_000_000
+        );
+        assert_eq!(parse_byte_size("1024").expect("raw bytes parse"), 1024);
+        assert!(parse_byte_size("1.5MiB").is_err());
+        Cli::try_parse_from([
+            "aql",
+            "query",
+            "-d",
+            "codex",
+            "--max-records",
+            "10k",
+            "--max-memory-bytes",
+            "32MiB",
+            "SELECT 1",
+        ])
+        .expect("human-readable CLI limits parse");
     }
 
     #[test]
