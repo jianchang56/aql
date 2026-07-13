@@ -2189,145 +2189,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             file,
             stdin,
         } => {
-            let ExecutionLimits {
-                max_records,
-                max_bytes_read,
-                max_output_bytes,
-                max_single_value_bytes,
-                max_memory_bytes,
-                timeout,
-            } = limits;
-            validate_csv_options(output, csv_formulas, acknowledge_raw_csv_formulas)?;
-            let sql = read_sql_input(sql, file, stdin)?;
-            let query_started = Instant::now();
-            let (sql, explain) = match explain_sql(&sql) {
-                Some(inner) if !inner.is_empty() => (inner, true),
-                Some(_) => return Err("EXPLAIN requires one SELECT or WITH query".into()),
-                None => (sql.as_str(), false),
-            };
-            let validated_sql = validate_read_only_sql(sql)?;
-            let (query_budget, _) = execution_budget(
-                max_records,
-                max_bytes_read,
-                max_output_bytes,
-                max_single_value_bytes,
-                timeout,
-            )?;
-            let mut options = QueryOptions {
-                access: access_grant(&access),
-                budget: query_budget,
-                max_memory_bytes,
-                ..QueryOptions::default()
-            };
-            prepare_query(&validated_sql, options.clone()).await?;
-            let inputs = resolve_source_inputs(data_root, source, profile, database)?;
-            let installation_salt = installation_salt()?;
-            options.redaction_salt = installation_salt.clone();
-            let cancellation = options.cancellation.clone();
-            let budget = options.budget.clone();
-            let prepared = prepare_query(&validated_sql, options).await?;
-            let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
-            if sources.is_empty() {
-                return Err("probe returned no compatible source".into());
-            }
-            if plan || explain {
-                let summary = prepared.plan_summary();
-                eprintln!("plan.tables={}", summary.tables.join(","));
-                eprintln!("plan.columns={}", summary.columns.join(","));
-                eprintln!("plan.required_access={}", summary.required_access.join(","));
-                eprintln!("plan.max_records={}", summary.max_records);
-                eprintln!("plan.max_bytes_read={}", summary.max_bytes_read);
-                eprintln!("plan.max_output_bytes={}", summary.max_output_bytes);
-                eprintln!("plan.max_memory_bytes={}", summary.max_memory_bytes);
-                for source in &sources {
-                    eprintln!("plan.source_id={}", source.manifest.source_id);
-                    eprintln!("plan.format={}", source.manifest.format_fingerprint);
-                }
-                return Ok(());
-            }
-            let mut query_task = tokio::spawn(async move { prepared.execute(sources).await });
-            let deadline = tokio::time::sleep(timeout);
-            tokio::pin!(deadline);
-            let result = tokio::select! {
-                result = &mut query_task => result??,
-                signal = tokio::signal::ctrl_c() => {
-                    signal?;
-                    cancellation.cancel();
-                    if tokio::time::timeout(
-                        std::time::Duration::from_secs(3),
-                        &mut query_task,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return Err("query cancellation did not stop within three seconds".into());
-                    }
-                    return Err("query cancelled".into());
-                }
-                _ = &mut deadline => {
-                    cancellation.cancel();
-                    if tokio::time::timeout(
-                        Duration::from_secs(3),
-                        &mut query_task,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return Err("query timeout did not stop within three seconds".into());
-                    }
-                    return Err("query timed out".into());
-                }
-            };
-            if !quiet {
-                for warning in &result.metadata.warnings {
-                    eprintln!("warning={warning}");
-                }
-            }
-            if metadata {
-                eprintln!("metadata.sources={}", result.metadata.source_ids.join(","));
-                eprintln!(
-                    "metadata.records_scanned={}",
-                    result.metadata.records_scanned
-                );
-                eprintln!("metadata.bytes_read={}", result.metadata.bytes_read);
-                for scan in &result.metadata.scans {
-                    eprintln!(
-                        "metadata.scan=table:{},source:{},predicates:{},limit:{},ordering:{},snapshot:{},stale:{}",
-                        scan.table,
-                        scan.source_id,
-                        scan.predicate_pushdown.join("+"),
-                        scan.limit_pushdown.as_deref().unwrap_or("none"),
-                        scan.ordering_pushdown.join("+"),
-                        scan.snapshot_strength,
-                        scan.stale,
-                    );
-                }
-            }
-            let batches = result.batches;
-            let returned_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
-            let (rendered, formula_escaped) = match output {
-                Output::Table => (pretty_format_batches(&batches)?.to_string(), false),
-                Output::Json => (batches_to_json(&batches)?, false),
-                Output::Jsonl => (batches_to_jsonl(&batches)?, false),
-                Output::Csv => {
-                    let csv = batches_to_csv(&batches, csv_formulas)?;
-                    (csv.rendered, csv.formula_escaped)
-                }
-            };
-            budget.charge_output_bytes(rendered_publication_len(&rendered) as u64)?;
-            if formula_escaped && !quiet {
-                eprintln!("warning=CSV formula-like text was escaped");
-            }
-            if !access.is_empty() && !io::stdout().is_terminal() && !quiet {
-                eprintln!("warning=sensitive access was granted for non-terminal output");
-            }
-            write_rendered(&mut io::stdout().lock(), &rendered, &cancellation)?;
-            if shell_summary && !quiet {
-                eprintln!(
-                    "({returned_rows} rows, {} ms)",
-                    query_started.elapsed().as_millis()
-                );
-            }
+            execute_query(
+                QueryExecution {
+                    data_root,
+                    source,
+                    profile,
+                    database,
+                    output,
+                    csv_formulas,
+                    acknowledge_raw_csv_formulas,
+                    access,
+                    limits,
+                    plan,
+                    metadata,
+                    shell_summary,
+                    sql,
+                    file,
+                    stdin,
+                },
+                quiet,
+            )
+            .await?;
         }
         Command::Export {
             data_root,
@@ -2339,61 +2221,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             file,
             sql,
         } => {
-            let ExecutionLimits {
-                max_records,
-                max_bytes_read,
-                max_output_bytes,
-                max_single_value_bytes,
-                max_memory_bytes,
-                timeout,
-            } = limits;
-            let validated_sql = validate_read_only_sql(&sql)?;
-            let (budget, deadline_at) = execution_budget(
-                max_records,
-                max_bytes_read,
-                max_output_bytes,
-                max_single_value_bytes,
-                timeout,
-            )?;
-            let mut options = QueryOptions {
-                access: access_grant(&access),
-                budget: budget.clone(),
-                max_memory_bytes,
-                ..QueryOptions::default()
-            };
-            prepare_query(&validated_sql, options.clone()).await?;
-            let inputs = resolve_source_inputs(data_root, source, profile, database)?;
-            let mut secure_output = file.as_deref().map(SecureOutputFile::create).transpose()?;
-            let installation_salt = installation_salt()?;
-            options.redaction_salt = installation_salt.clone();
-            let cancellation = options.cancellation.clone();
-            let prepared = prepare_query(&validated_sql, options).await?;
-            let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
-            let result = prepared.execute_stream(sources).await?;
-            let remaining = deadline_at.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                cancellation.cancel();
-                return Err("query timed out".into());
-            }
-            if let Some(output) = secure_output.as_mut() {
-                stream_portable_json(output.writer(), result, &budget, &cancellation, remaining)
-                    .await?;
-            } else {
-                if !access.is_empty() && !io::stdout().is_terminal() && !quiet {
-                    eprintln!("warning=sensitive access was granted for non-terminal output");
-                }
-                let mut transaction = TransactionalOutput::new(max_memory_bytes);
-                stream_portable_json(&mut transaction, result, &budget, &cancellation, remaining)
-                    .await?;
-                publish_bytes(
-                    &mut io::stdout().lock(),
-                    transaction.as_bytes(),
-                    &cancellation,
-                )?;
-            }
-            if let Some(output) = secure_output {
-                output.commit()?;
-            }
+            execute_export(
+                ExportExecution {
+                    data_root,
+                    source,
+                    profile,
+                    database,
+                    access,
+                    limits,
+                    file,
+                    sql,
+                },
+                quiet,
+            )
+            .await?;
         }
         Command::Report {
             data_root,
@@ -2404,78 +2245,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             limits,
             report,
         } => {
-            let ExecutionLimits {
-                max_records,
-                max_bytes_read,
-                max_output_bytes,
-                max_single_value_bytes,
-                max_memory_bytes,
-                timeout,
-            } = limits;
-            let (budget, deadline_at) = execution_budget(
-                max_records,
-                max_bytes_read,
-                max_output_bytes,
-                max_single_value_bytes,
-                timeout,
-            )?;
-            let mut options = QueryOptions {
-                access: access_grant(&access),
-                budget: budget.clone(),
-                max_memory_bytes,
-                ..QueryOptions::default()
-            };
-            let sections = report_sections(report);
-            let mut validated = Vec::with_capacity(sections.len());
-            for section in &sections {
-                let sql = validate_read_only_sql(section.sql)?;
-                prepare_query(&sql, options.clone()).await?;
-                validated.push(sql);
-            }
-            let inputs = resolve_source_inputs(data_root, source, profile, database)?;
-            let installation_salt = installation_salt()?;
-            options.redaction_salt = installation_salt.clone();
-            let cancellation = options.cancellation.clone();
-            let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
-            let mut transaction = TransactionalOutput::new(max_memory_bytes);
-            let report_title = match report {
-                ReportKind::Summary => "# AQL Agent Usage Summary\n\n",
-                ReportKind::Project => "# AQL Project Activity Report\n\n",
-            };
-            if !write_export_chunk(
-                &mut transaction,
-                report_title.as_bytes(),
-                &budget,
-                &cancellation,
-            )? {
-                return Ok(());
-            }
-            for (section, sql) in sections.iter().zip(validated.iter()) {
-                let prepared = prepare_query(sql, options.clone()).await?;
-                let result = prepared.execute_stream(sources.clone()).await?;
-                let remaining = deadline_at.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    cancellation.cancel();
-                    return Err("query timed out".into());
-                }
-                if !stream_markdown_section(
-                    &mut transaction,
-                    section.title,
-                    result,
-                    &budget,
-                    &cancellation,
-                    remaining,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-            }
-            publish_bytes(
-                &mut io::stdout().lock(),
-                transaction.as_bytes(),
-                &cancellation,
-            )?;
+            execute_report(ReportExecution {
+                data_root,
+                source,
+                profile,
+                database,
+                access,
+                limits,
+                report,
+            })
+            .await?;
         }
         Command::Search {
             data_root,
@@ -2725,6 +2504,363 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Examples { name, list } => {
             render_examples(if list { None } else { name })?;
         }
+    }
+    Ok(())
+}
+
+struct ReportExecution {
+    data_root: Option<PathBuf>,
+    source: Vec<String>,
+    profile: Option<String>,
+    database: Option<String>,
+    access: Vec<Access>,
+    limits: ExecutionLimits,
+    report: ReportKind,
+}
+
+async fn execute_report(request: ReportExecution) -> Result<(), Box<dyn std::error::Error>> {
+    let ReportExecution {
+        data_root,
+        source,
+        profile,
+        database,
+        access,
+        limits,
+        report,
+    } = request;
+    let ExecutionLimits {
+        max_records,
+        max_bytes_read,
+        max_output_bytes,
+        max_single_value_bytes,
+        max_memory_bytes,
+        timeout,
+    } = limits;
+    let (budget, deadline_at) = execution_budget(
+        max_records,
+        max_bytes_read,
+        max_output_bytes,
+        max_single_value_bytes,
+        timeout,
+    )?;
+    let mut options = QueryOptions {
+        access: access_grant(&access),
+        budget: budget.clone(),
+        max_memory_bytes,
+        ..QueryOptions::default()
+    };
+    let sections = report_sections(report);
+    let mut validated = Vec::with_capacity(sections.len());
+    for section in &sections {
+        let sql = validate_read_only_sql(section.sql)?;
+        prepare_query(&sql, options.clone()).await?;
+        validated.push(sql);
+    }
+    let inputs = resolve_source_inputs(data_root, source, profile, database)?;
+    let installation_salt = installation_salt()?;
+    options.redaction_salt = installation_salt.clone();
+    let cancellation = options.cancellation.clone();
+    let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
+    let mut transaction = TransactionalOutput::new(max_memory_bytes);
+    let report_title = match report {
+        ReportKind::Summary => "# AQL Agent Usage Summary\n\n",
+        ReportKind::Project => "# AQL Project Activity Report\n\n",
+    };
+    if !write_export_chunk(
+        &mut transaction,
+        report_title.as_bytes(),
+        &budget,
+        &cancellation,
+    )? {
+        return Ok(());
+    }
+    for (section, sql) in sections.iter().zip(validated.iter()) {
+        let prepared = prepare_query(sql, options.clone()).await?;
+        let result = prepared.execute_stream(sources.clone()).await?;
+        let remaining = deadline_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            cancellation.cancel();
+            return Err("query timed out".into());
+        }
+        if !stream_markdown_section(
+            &mut transaction,
+            section.title,
+            result,
+            &budget,
+            &cancellation,
+            remaining,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+    }
+    publish_bytes(
+        &mut io::stdout().lock(),
+        transaction.as_bytes(),
+        &cancellation,
+    )?;
+    Ok(())
+}
+
+struct QueryExecution {
+    data_root: Option<PathBuf>,
+    source: Vec<String>,
+    profile: Option<String>,
+    database: Option<String>,
+    output: Output,
+    csv_formulas: CsvFormulaMode,
+    acknowledge_raw_csv_formulas: bool,
+    access: Vec<Access>,
+    limits: ExecutionLimits,
+    plan: bool,
+    metadata: bool,
+    shell_summary: bool,
+    sql: Option<String>,
+    file: Option<PathBuf>,
+    stdin: bool,
+}
+
+async fn execute_query(
+    request: QueryExecution,
+    quiet: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let QueryExecution {
+        data_root,
+        source,
+        profile,
+        database,
+        output,
+        csv_formulas,
+        acknowledge_raw_csv_formulas,
+        access,
+        limits,
+        plan,
+        metadata,
+        shell_summary,
+        sql,
+        file,
+        stdin,
+    } = request;
+    let ExecutionLimits {
+        max_records,
+        max_bytes_read,
+        max_output_bytes,
+        max_single_value_bytes,
+        max_memory_bytes,
+        timeout,
+    } = limits;
+    validate_csv_options(output, csv_formulas, acknowledge_raw_csv_formulas)?;
+    let sql = read_sql_input(sql, file, stdin)?;
+    let query_started = Instant::now();
+    let (sql, explain) = match explain_sql(&sql) {
+        Some(inner) if !inner.is_empty() => (inner, true),
+        Some(_) => return Err("EXPLAIN requires one SELECT or WITH query".into()),
+        None => (sql.as_str(), false),
+    };
+    let validated_sql = validate_read_only_sql(sql)?;
+    let (query_budget, _) = execution_budget(
+        max_records,
+        max_bytes_read,
+        max_output_bytes,
+        max_single_value_bytes,
+        timeout,
+    )?;
+    let mut options = QueryOptions {
+        access: access_grant(&access),
+        budget: query_budget,
+        max_memory_bytes,
+        ..QueryOptions::default()
+    };
+    prepare_query(&validated_sql, options.clone()).await?;
+    let inputs = resolve_source_inputs(data_root, source, profile, database)?;
+    let installation_salt = installation_salt()?;
+    options.redaction_salt = installation_salt.clone();
+    let cancellation = options.cancellation.clone();
+    let budget = options.budget.clone();
+    let prepared = prepare_query(&validated_sql, options).await?;
+    let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
+    if sources.is_empty() {
+        return Err("probe returned no compatible source".into());
+    }
+    if plan || explain {
+        let summary = prepared.plan_summary();
+        eprintln!("plan.tables={}", summary.tables.join(","));
+        eprintln!("plan.columns={}", summary.columns.join(","));
+        eprintln!("plan.required_access={}", summary.required_access.join(","));
+        eprintln!("plan.max_records={}", summary.max_records);
+        eprintln!("plan.max_bytes_read={}", summary.max_bytes_read);
+        eprintln!("plan.max_output_bytes={}", summary.max_output_bytes);
+        eprintln!("plan.max_memory_bytes={}", summary.max_memory_bytes);
+        for source in &sources {
+            eprintln!("plan.source_id={}", source.manifest.source_id);
+            eprintln!("plan.format={}", source.manifest.format_fingerprint);
+        }
+        return Ok(());
+    }
+    let mut query_task = tokio::spawn(async move { prepared.execute(sources).await });
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let result = tokio::select! {
+        result = &mut query_task => result??,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            cancellation.cancel();
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                &mut query_task,
+            )
+            .await
+            .is_err()
+            {
+                return Err("query cancellation did not stop within three seconds".into());
+            }
+            return Err("query cancelled".into());
+        }
+        _ = &mut deadline => {
+            cancellation.cancel();
+            if tokio::time::timeout(
+                Duration::from_secs(3),
+                &mut query_task,
+            )
+            .await
+            .is_err()
+            {
+                return Err("query timeout did not stop within three seconds".into());
+            }
+            return Err("query timed out".into());
+        }
+    };
+    if !quiet {
+        for warning in &result.metadata.warnings {
+            eprintln!("warning={warning}");
+        }
+    }
+    if metadata {
+        eprintln!("metadata.sources={}", result.metadata.source_ids.join(","));
+        eprintln!(
+            "metadata.records_scanned={}",
+            result.metadata.records_scanned
+        );
+        eprintln!("metadata.bytes_read={}", result.metadata.bytes_read);
+        for scan in &result.metadata.scans {
+            eprintln!(
+                "metadata.scan=table:{},source:{},predicates:{},limit:{},ordering:{},snapshot:{},stale:{}",
+                scan.table,
+                scan.source_id,
+                scan.predicate_pushdown.join("+"),
+                scan.limit_pushdown.as_deref().unwrap_or("none"),
+                scan.ordering_pushdown.join("+"),
+                scan.snapshot_strength,
+                scan.stale,
+            );
+        }
+    }
+    let batches = result.batches;
+    let returned_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+    let (rendered, formula_escaped) = match output {
+        Output::Table => (pretty_format_batches(&batches)?.to_string(), false),
+        Output::Json => (batches_to_json(&batches)?, false),
+        Output::Jsonl => (batches_to_jsonl(&batches)?, false),
+        Output::Csv => {
+            let csv = batches_to_csv(&batches, csv_formulas)?;
+            (csv.rendered, csv.formula_escaped)
+        }
+    };
+    budget.charge_output_bytes(rendered_publication_len(&rendered) as u64)?;
+    if formula_escaped && !quiet {
+        eprintln!("warning=CSV formula-like text was escaped");
+    }
+    if !access.is_empty() && !io::stdout().is_terminal() && !quiet {
+        eprintln!("warning=sensitive access was granted for non-terminal output");
+    }
+    write_rendered(&mut io::stdout().lock(), &rendered, &cancellation)?;
+    if shell_summary && !quiet {
+        eprintln!(
+            "({returned_rows} rows, {} ms)",
+            query_started.elapsed().as_millis()
+        );
+    }
+    Ok(())
+}
+
+struct ExportExecution {
+    data_root: Option<PathBuf>,
+    source: Vec<String>,
+    profile: Option<String>,
+    database: Option<String>,
+    access: Vec<Access>,
+    limits: ExecutionLimits,
+    file: Option<PathBuf>,
+    sql: String,
+}
+
+async fn execute_export(
+    request: ExportExecution,
+    quiet: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ExportExecution {
+        data_root,
+        source,
+        profile,
+        database,
+        access,
+        limits,
+        file,
+        sql,
+    } = request;
+    let ExecutionLimits {
+        max_records,
+        max_bytes_read,
+        max_output_bytes,
+        max_single_value_bytes,
+        max_memory_bytes,
+        timeout,
+    } = limits;
+    let validated_sql = validate_read_only_sql(&sql)?;
+    let (budget, deadline_at) = execution_budget(
+        max_records,
+        max_bytes_read,
+        max_output_bytes,
+        max_single_value_bytes,
+        timeout,
+    )?;
+    let mut options = QueryOptions {
+        access: access_grant(&access),
+        budget: budget.clone(),
+        max_memory_bytes,
+        ..QueryOptions::default()
+    };
+    prepare_query(&validated_sql, options.clone()).await?;
+    let inputs = resolve_source_inputs(data_root, source, profile, database)?;
+    let mut secure_output = file.as_deref().map(SecureOutputFile::create).transpose()?;
+    let installation_salt = installation_salt()?;
+    options.redaction_salt = installation_salt.clone();
+    let cancellation = options.cancellation.clone();
+    let prepared = prepare_query(&validated_sql, options).await?;
+    let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
+    let result = prepared.execute_stream(sources).await?;
+    let remaining = deadline_at.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        cancellation.cancel();
+        return Err("query timed out".into());
+    }
+    if let Some(output) = secure_output.as_mut() {
+        stream_portable_json(output.writer(), result, &budget, &cancellation, remaining).await?;
+    } else {
+        if !access.is_empty() && !io::stdout().is_terminal() && !quiet {
+            eprintln!("warning=sensitive access was granted for non-terminal output");
+        }
+        let mut transaction = TransactionalOutput::new(max_memory_bytes);
+        stream_portable_json(&mut transaction, result, &budget, &cancellation, remaining).await?;
+        publish_bytes(
+            &mut io::stdout().lock(),
+            transaction.as_bytes(),
+            &cancellation,
+        )?;
+    }
+    if let Some(output) = secure_output {
+        output.commit()?;
     }
     Ok(())
 }
