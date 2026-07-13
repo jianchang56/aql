@@ -24,6 +24,12 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+mod authorizer;
+mod storage;
+
+use authorizer::AuthorizerPolicy;
+use storage::{file_identity, optional_file_identity, safe_directory, safe_file, table_columns};
+
 const MAX_JSON_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 type MessageCursor = (String, i64, String);
 type LoadedMessage = (CurrentMessage, MessageCursor, u64);
@@ -129,12 +135,6 @@ struct RootBinding {
     database_identity: FileIdentity,
     wal_identity: Option<FileIdentity>,
     shm_identity: Option<FileIdentity>,
-}
-
-#[derive(Clone)]
-struct AuthorizerPolicy {
-    reads: BTreeMap<&'static str, BTreeSet<&'static str>>,
-    schema_pragmas: BTreeSet<&'static str>,
 }
 
 struct SessionStream {
@@ -343,85 +343,6 @@ struct ToolStart {
 struct ToolRange {
     start: i64,
     end: i64,
-}
-
-impl AuthorizerPolicy {
-    fn schema() -> Self {
-        let mut reads = BTreeMap::new();
-        reads.insert("migration", BTreeSet::from(["id"]));
-        reads.insert(
-            "sqlite_master",
-            BTreeSet::from(["type", "name", "tbl_name", "rootpage", "sql"]),
-        );
-        reads.insert(
-            "sqlite_schema",
-            BTreeSet::from(["type", "name", "tbl_name", "rootpage", "sql"]),
-        );
-        Self {
-            reads,
-            schema_pragmas: BTreeSet::from(["session", "message", "part"]),
-        }
-    }
-
-    fn table(table: &'static str, columns: impl IntoIterator<Item = &'static str>) -> Self {
-        Self {
-            reads: BTreeMap::from([(table, columns.into_iter().collect())]),
-            schema_pragmas: BTreeSet::new(),
-        }
-    }
-
-    fn message_parts() -> Self {
-        Self {
-            reads: BTreeMap::from([
-                (
-                    "message",
-                    BTreeSet::from(["id", "session_id", "time_created", "data"]),
-                ),
-                (
-                    "part",
-                    BTreeSet::from([
-                        "id",
-                        "message_id",
-                        "session_id",
-                        "time_created",
-                        "time_updated",
-                        "data",
-                    ]),
-                ),
-            ]),
-            schema_pragmas: BTreeSet::new(),
-        }
-    }
-
-    fn messages_only() -> Self {
-        Self::table("message", ["id", "session_id", "time_created", "data"])
-    }
-
-    fn allows(&self, context: AuthContext<'_>) -> bool {
-        if context.database_name.is_some_and(|name| name != "main") || context.accessor.is_some() {
-            return false;
-        }
-        match context.action {
-            AuthAction::Select => true,
-            AuthAction::Read {
-                table_name,
-                column_name,
-            } => self
-                .reads
-                .get(table_name)
-                .is_some_and(|columns| columns.contains(column_name)),
-            AuthAction::Pragma {
-                pragma_name,
-                pragma_value,
-            } => {
-                pragma_name.eq_ignore_ascii_case("table_info")
-                    && pragma_value.is_some_and(|table| self.schema_pragmas.contains(table))
-            }
-            AuthAction::Transaction { .. } => true,
-            AuthAction::Function { function_name } => function_name.eq_ignore_ascii_case("length"),
-            _ => false,
-        }
-    }
 }
 
 pub struct OpenCodeAdapter {
@@ -2213,99 +2134,6 @@ fn db_error(error: rusqlite::Error, request: &ScanRequest, stage: &str) -> Adapt
             stage: stage.to_string(),
         }
     }
-}
-
-fn safe_directory(path: &Path, stage: &str) -> Result<fs::Metadata, AdapterError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => AdapterError::NotFound {
-            stage: stage.to_string(),
-        },
-        _ => AdapterError::PermissionDenied {
-            stage: stage.to_string(),
-        },
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(AdapterError::UnsupportedFormat {
-            stage: stage.to_string(),
-        });
-    }
-    Ok(metadata)
-}
-
-fn safe_file(path: &Path, stage: &str) -> Result<fs::Metadata, AdapterError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => AdapterError::NotFound {
-            stage: stage.to_string(),
-        },
-        _ => AdapterError::PermissionDenied {
-            stage: stage.to_string(),
-        },
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(AdapterError::UnsupportedFormat {
-            stage: stage.to_string(),
-        });
-    }
-    Ok(metadata)
-}
-
-fn optional_file_identity(path: &Path, stage: &str) -> Result<Option<FileIdentity>, AdapterError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            Err(AdapterError::UnsupportedFormat {
-                stage: stage.to_string(),
-            })
-        }
-        Ok(metadata) => Ok(Some(file_identity(&metadata))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(AdapterError::PermissionDenied {
-            stage: stage.to_string(),
-        }),
-    }
-}
-
-#[cfg(unix)]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    use std::os::unix::fs::MetadataExt;
-    FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    }
-}
-
-#[cfg(not(unix))]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    FileIdentity {
-        device: 0,
-        inode: metadata.len(),
-    }
-}
-
-fn table_columns(connection: &Connection, table: &str) -> Result<BTreeSet<String>, AdapterError> {
-    let sql = match table {
-        "session" => "PRAGMA table_info(session)",
-        "message" => "PRAGMA table_info(message)",
-        "part" => "PRAGMA table_info(part)",
-        _ => {
-            return Err(AdapterError::Internal {
-                stage: "opencode_schema_table".to_string(),
-            });
-        }
-    };
-    let mut statement = connection
-        .prepare(sql)
-        .map_err(|_| AdapterError::UnsupportedFormat {
-            stage: "opencode_schema_query".to_string(),
-        })?;
-    statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|_| AdapterError::UnsupportedFormat {
-            stage: "opencode_schema_query".to_string(),
-        })?
-        .collect::<Result<BTreeSet<_>, _>>()
-        .map_err(|_| AdapterError::UnsupportedFormat {
-            stage: "opencode_schema_value".to_string(),
-        })
 }
 
 #[cfg(test)]
