@@ -86,6 +86,7 @@ enum Command {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
+        /// Select the database to diagnose; no database is selected implicitly.
         #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
         database: Option<String>,
     },
@@ -109,22 +110,31 @@ enum Command {
         /// Acknowledge that raw CSV formulas may execute when opened in a spreadsheet.
         #[arg(long)]
         acknowledge_raw_csv_formulas: bool,
+        /// Grant access to sensitive column classes for this query only; repeat as needed.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
+        /// Stop after scanning this many canonical records across the complete query.
         #[arg(long, default_value_t = 100_000)]
         max_records: u64,
+        /// Maximum source bytes that all adapters may read for this query.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_bytes_read: u64,
+        /// Maximum bytes that may be published to stdout.
         #[arg(long, default_value_t = 64 * 1024 * 1024)]
         max_output_bytes: u64,
+        /// Reject any single sensitive value larger than this limit.
         #[arg(long, default_value_t = 16 * 1024 * 1024)]
         max_single_value_bytes: u64,
+        /// Maximum in-memory query execution working set.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_memory_bytes: usize,
+        /// Cancel the complete query when this duration elapses.
         #[arg(long, default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
+        /// Print the authorized, redacted query plan without executing the query.
         #[arg(long)]
         plan: bool,
+        /// Print source, scan, pushdown and budget metadata to stderr.
         #[arg(long)]
         metadata: bool,
         #[arg(skip)]
@@ -146,22 +156,31 @@ enum Command {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
+        /// Select the database to export; no database is selected implicitly.
         #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
         database: Option<String>,
+        /// Grant access to sensitive column classes for this export only; repeat as needed.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
+        /// Stop after scanning this many canonical records across the complete export.
         #[arg(long, default_value_t = 100_000)]
         max_records: u64,
+        /// Maximum source bytes that all adapters may read.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_bytes_read: u64,
+        /// Maximum bytes in the complete portable JSON export.
         #[arg(long, default_value_t = 64 * 1024 * 1024)]
         max_output_bytes: u64,
+        /// Reject any single sensitive value larger than this limit.
         #[arg(long, default_value_t = 16 * 1024 * 1024)]
         max_single_value_bytes: u64,
+        /// Maximum in-memory query execution working set.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_memory_bytes: usize,
+        /// Cancel the complete export when this duration elapses.
         #[arg(long, default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
+        /// Atomically write the export to this new local file instead of stdout.
         #[arg(long)]
         file: Option<PathBuf>,
         sql: String,
@@ -174,20 +193,28 @@ enum Command {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
+        /// Select the database used by the report.
         #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
         database: Option<String>,
+        /// Grant access to sensitive column classes for this report only; repeat as needed.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
+        /// Stop after scanning this many canonical records across all report queries.
         #[arg(long, default_value_t = 100_000)]
         max_records: u64,
+        /// Maximum source bytes that all report queries may read.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_bytes_read: u64,
+        /// Maximum rendered Markdown bytes.
         #[arg(long, default_value_t = 64 * 1024 * 1024)]
         max_output_bytes: u64,
+        /// Reject any single sensitive value larger than this limit.
         #[arg(long, default_value_t = 16 * 1024 * 1024)]
         max_single_value_bytes: u64,
+        /// Maximum in-memory execution working set.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_memory_bytes: usize,
+        /// Cancel the complete report when this duration elapses.
         #[arg(long, default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
         #[command(subcommand)]
@@ -201,14 +228,19 @@ enum Command {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
+        /// Select the database whose explicitly built Content index is searched.
         #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
         database: Option<String>,
+        /// Grant Content access for this search invocation.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
+        /// Maximum number of search matches to return.
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=1000))]
         limit: u64,
+        /// Maximum rendered search-result bytes.
         #[arg(long, default_value_t = 1024 * 1024)]
         max_output_bytes: u64,
+        /// Cancel the search when this duration elapses.
         #[arg(long, default_value = "5s", value_parser = parse_duration)]
         timeout: Duration,
         query: String,
@@ -477,6 +509,7 @@ impl From<SyntheticFaultArg> for SyntheticFault {
 
 #[derive(Subcommand)]
 enum IndexCommand {
+    /// Show whether the selected database has a current AQL-owned index.
     Status {
         #[arg(long, hide = true, conflicts_with_all = ["source", "profile", "database"])]
         data_root: Option<PathBuf>,
@@ -486,9 +519,11 @@ enum IndexCommand {
         profile: Option<String>,
         #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
         database: Option<String>,
+        /// Select text or stable JSON status rendering.
         #[arg(long, value_enum, default_value_t = IndexStatusOutput::Text)]
         output: IndexStatusOutput,
     },
+    /// Build a new transactional index generation for the selected database.
     Build {
         #[arg(long, hide = true, conflicts_with_all = ["source", "profile", "database"])]
         data_root: Option<PathBuf>,
@@ -498,10 +533,13 @@ enum IndexCommand {
         profile: Option<String>,
         #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
         database: Option<String>,
+        /// Store metadata only, or include authorized message Content.
         #[arg(long, value_enum, default_value_t = IndexPolicyArg::Metadata)]
         policy: IndexPolicyArg,
+        /// Grant sensitive access needed by the selected index policy.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
+        /// Confirm that Content will be copied into persistent AQL-owned storage.
         #[arg(long)]
         acknowledge_persistent_sensitive_copy: bool,
         #[arg(long, default_value_t = 100_000)]
@@ -513,6 +551,7 @@ enum IndexCommand {
         #[arg(long, default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
     },
+    /// Incrementally publish a replacement generation using saved watermarks.
     Update {
         #[arg(long, hide = true, conflicts_with_all = ["source", "profile", "database"])]
         data_root: Option<PathBuf>,
@@ -537,6 +576,7 @@ enum IndexCommand {
         #[arg(long, default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
     },
+    /// Remove one source index or all indexes owned by AQL.
     Clear {
         #[arg(long, hide = true, conflicts_with_all = ["source", "profile", "database"])]
         data_root: Option<PathBuf>,
@@ -553,6 +593,7 @@ enum IndexCommand {
         #[arg(long, requires = "all")]
         acknowledge_clear_all_indexes: bool,
     },
+    /// Remove only validated abandoned AQL index generations.
     Repair {
         #[arg(long, hide = true, conflicts_with_all = ["source", "profile", "database"])]
         data_root: Option<PathBuf>,
@@ -588,7 +629,9 @@ impl From<IndexPolicyArg> for IndexPolicy {
 
 #[derive(Clone, Copy, Subcommand)]
 enum ReportKind {
+    /// Render database-wide session, message, tool and usage totals.
     Summary,
+    /// Render activity grouped by canonical project.
     Project,
 }
 
