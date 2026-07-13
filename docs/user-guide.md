@@ -304,4 +304,9 @@ aql --error-format json query -d missing 'SELECT COUNT(*) FROM sessions'
 脚本可以增加全局 `--quiet` 抑制非必要 warning 和 Shell 摘要；错误仍使用统一的
 `--error-format json` 单行对象，显式请求的 `--plan` 与 `--metadata` 不会被隐藏。
 
+CI 也可以设置 `AQL_ERROR_FORMAT`、`AQL_TIMEOUT`、`AQL_MAX_RECORDS`、
+`AQL_MAX_BYTES_READ`、`AQL_MAX_OUTPUT_BYTES`、`AQL_MAX_SINGLE_VALUE_BYTES`、
+`AQL_MAX_MEMORY_BYTES` 和 `AQL_MAX_INDEX_BYTES`。命令行参数优先；数据库和敏感访问
+授权故意不支持环境默认。
+
 JSON 包含 `category`、`message`、`hint` 和 `exit_code`。

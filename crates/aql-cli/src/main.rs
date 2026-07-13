@@ -52,7 +52,13 @@ use rustyline::{Context, Helper};
 )]
 struct Cli {
     /// Select stable text or single-line JSON error rendering.
-    #[arg(long, global = true, value_enum, default_value_t = ErrorFormat::Text)]
+    #[arg(
+        long,
+        global = true,
+        env = "AQL_ERROR_FORMAT",
+        value_enum,
+        default_value_t = ErrorFormat::Text
+    )]
     error_format: ErrorFormat,
     /// Suppress non-essential warnings and shell summaries; errors and requested metadata remain visible.
     #[arg(long, global = true)]
@@ -127,22 +133,22 @@ enum Command {
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
         /// Stop after scanning this many canonical records across the complete query.
-        #[arg(long, default_value = "100k", value_parser = parse_count)]
+        #[arg(long, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
         max_records: u64,
         /// Maximum source bytes that all adapters may read for this query.
-        #[arg(long, default_value = "256MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
         max_bytes_read: u64,
         /// Maximum bytes that may be published to stdout.
-        #[arg(long, default_value = "64MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_OUTPUT_BYTES", default_value = "64MiB", value_parser = parse_byte_size)]
         max_output_bytes: u64,
         /// Reject any single sensitive value larger than this limit.
-        #[arg(long, default_value = "16MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_SINGLE_VALUE_BYTES", default_value = "16MiB", value_parser = parse_byte_size)]
         max_single_value_bytes: u64,
         /// Maximum in-memory query execution working set.
-        #[arg(long, default_value = "256MiB", value_parser = parse_usize_byte_size)]
+        #[arg(long, env = "AQL_MAX_MEMORY_BYTES", default_value = "256MiB", value_parser = parse_usize_byte_size)]
         max_memory_bytes: usize,
         /// Cancel the complete query when this duration elapses.
-        #[arg(long, default_value = "30s", value_parser = parse_duration)]
+        #[arg(long, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
         /// Print the authorized, redacted query plan without executing the query.
         #[arg(long)]
@@ -181,22 +187,22 @@ enum Command {
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
         /// Stop after scanning this many canonical records across the complete export.
-        #[arg(long, default_value = "100k", value_parser = parse_count)]
+        #[arg(long, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
         max_records: u64,
         /// Maximum source bytes that all adapters may read.
-        #[arg(long, default_value = "256MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
         max_bytes_read: u64,
         /// Maximum bytes in the complete portable JSON export.
-        #[arg(long, default_value = "64MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_OUTPUT_BYTES", default_value = "64MiB", value_parser = parse_byte_size)]
         max_output_bytes: u64,
         /// Reject any single sensitive value larger than this limit.
-        #[arg(long, default_value = "16MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_SINGLE_VALUE_BYTES", default_value = "16MiB", value_parser = parse_byte_size)]
         max_single_value_bytes: u64,
         /// Maximum in-memory query execution working set.
-        #[arg(long, default_value = "256MiB", value_parser = parse_usize_byte_size)]
+        #[arg(long, env = "AQL_MAX_MEMORY_BYTES", default_value = "256MiB", value_parser = parse_usize_byte_size)]
         max_memory_bytes: usize,
         /// Cancel the complete export when this duration elapses.
-        #[arg(long, default_value = "30s", value_parser = parse_duration)]
+        #[arg(long, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
         /// Atomically write the export to this new local file instead of stdout.
         #[arg(long = "output-file", visible_alias = "file")]
@@ -223,22 +229,22 @@ enum Command {
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
         /// Stop after scanning this many canonical records across all report queries.
-        #[arg(long, default_value = "100k", value_parser = parse_count)]
+        #[arg(long, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
         max_records: u64,
         /// Maximum source bytes that all report queries may read.
-        #[arg(long, default_value = "256MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
         max_bytes_read: u64,
         /// Maximum rendered Markdown bytes.
-        #[arg(long, default_value = "64MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_OUTPUT_BYTES", default_value = "64MiB", value_parser = parse_byte_size)]
         max_output_bytes: u64,
         /// Reject any single sensitive value larger than this limit.
-        #[arg(long, default_value = "16MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_SINGLE_VALUE_BYTES", default_value = "16MiB", value_parser = parse_byte_size)]
         max_single_value_bytes: u64,
         /// Maximum in-memory execution working set.
-        #[arg(long, default_value = "256MiB", value_parser = parse_usize_byte_size)]
+        #[arg(long, env = "AQL_MAX_MEMORY_BYTES", default_value = "256MiB", value_parser = parse_usize_byte_size)]
         max_memory_bytes: usize,
         /// Cancel the complete report when this duration elapses.
-        #[arg(long, default_value = "30s", value_parser = parse_duration)]
+        #[arg(long, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
         #[command(subcommand)]
         report: ReportKind,
@@ -266,10 +272,10 @@ enum Command {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=1000))]
         limit: u64,
         /// Maximum rendered search-result bytes.
-        #[arg(long, default_value = "1MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_OUTPUT_BYTES", default_value = "1MiB", value_parser = parse_byte_size)]
         max_output_bytes: u64,
         /// Cancel the search when this duration elapses.
-        #[arg(long, default_value = "5s", value_parser = parse_duration)]
+        #[arg(long, env = "AQL_TIMEOUT", default_value = "5s", value_parser = parse_duration)]
         timeout: Duration,
         query: String,
     },
@@ -599,13 +605,13 @@ enum IndexCommand {
         /// Confirm that Content will be copied into persistent AQL-owned storage.
         #[arg(long)]
         acknowledge_persistent_sensitive_copy: bool,
-        #[arg(long, default_value = "100k", value_parser = parse_count)]
+        #[arg(long, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
         max_records: u64,
-        #[arg(long, default_value = "256MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
         max_bytes_read: u64,
-        #[arg(long, default_value = "512MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_INDEX_BYTES", default_value = "512MiB", value_parser = parse_byte_size)]
         max_index_bytes: u64,
-        #[arg(long, default_value = "30s", value_parser = parse_duration)]
+        #[arg(long, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
     },
     /// Incrementally publish a replacement generation using saved watermarks.
@@ -629,13 +635,13 @@ enum IndexCommand {
         access: Vec<Access>,
         #[arg(long)]
         acknowledge_persistent_sensitive_copy: bool,
-        #[arg(long, default_value = "100k", value_parser = parse_count)]
+        #[arg(long, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
         max_records: u64,
-        #[arg(long, default_value = "256MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
         max_bytes_read: u64,
-        #[arg(long, default_value = "512MiB", value_parser = parse_byte_size)]
+        #[arg(long, env = "AQL_MAX_INDEX_BYTES", default_value = "512MiB", value_parser = parse_byte_size)]
         max_index_bytes: u64,
-        #[arg(long, default_value = "30s", value_parser = parse_duration)]
+        #[arg(long, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
     },
     /// Remove one source index or all indexes owned by AQL.
@@ -2100,6 +2106,9 @@ fn requested_error_format() -> ErrorFormat {
         if argument == "--error-format" && arguments.next().is_some_and(|value| value == "json") {
             return ErrorFormat::Json;
         }
+    }
+    if std::env::var_os("AQL_ERROR_FORMAT").is_some_and(|value| value == "json") {
+        return ErrorFormat::Json;
     }
     ErrorFormat::Text
 }
@@ -5216,6 +5225,29 @@ mod tests {
             "SELECT 1",
         ])
         .expect("human-readable CLI limits parse");
+    }
+
+    #[test]
+    fn automation_environment_defaults_exclude_database_and_access() {
+        let command = Cli::command();
+        let query = command
+            .get_subcommands()
+            .find(|command| command.get_name() == "query")
+            .expect("query command exists");
+        let environment = |name: &str| {
+            query
+                .get_arguments()
+                .find(|argument| argument.get_id() == name)
+                .and_then(clap::Arg::get_env)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(environment("timeout").as_deref(), Some("AQL_TIMEOUT"));
+        assert_eq!(
+            environment("max_records").as_deref(),
+            Some("AQL_MAX_RECORDS")
+        );
+        assert_eq!(environment("database"), None);
+        assert_eq!(environment("access"), None);
     }
 
     #[test]

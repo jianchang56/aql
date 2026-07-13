@@ -25,7 +25,7 @@ aql-action-kimi-code = { path = "../aql-action-kimi-code" }
 aql-action-opencode = { path = "../aql-action-opencode" }
 aql-action-synthetic = { path = "../aql-action-synthetic" }
 aql-model = { path = "../aql-model" }
-clap = { version = "4.5", features = ["derive", "string"] }
+clap = { version = "4.5", features = ["derive", "env", "string"] }
 clap_complete = "4.5"
 clap_mangen = "0.2"
 chrono = "0.4"
