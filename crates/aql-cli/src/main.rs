@@ -1857,7 +1857,7 @@ async fn run_shell(initial_database: Option<String>) -> Result<(), Box<dyn std::
     }
     loop {
         let prompt = if buffer.is_empty() {
-            format!("aql[{}]> ", selected_database.as_deref().unwrap_or("none"))
+            shell_prompt(selected_database.as_deref(), &access)
         } else {
             "      -> ".to_owned()
         };
@@ -2013,6 +2013,24 @@ async fn run_shell(initial_database: Option<String>) -> Result<(), Box<dyn std::
             }
         }
     }
+}
+
+fn shell_prompt(selected_database: Option<&str>, access: &[Access]) -> String {
+    let grants = if access.is_empty() {
+        "safe".to_string()
+    } else {
+        access
+            .iter()
+            .map(|grant| match grant {
+                Access::Path => "path",
+                Access::Content => "content",
+                Access::ToolInput => "tool-input",
+                Access::ToolOutput => "tool-output",
+            })
+            .collect::<Vec<_>>()
+            .join("+")
+    };
+    format!("aql[{}|{grants}]> ", selected_database.unwrap_or("none"))
 }
 
 fn shell_welcome(databases: &[String], selected_database: Option<&str>) -> Vec<String> {
@@ -5295,6 +5313,11 @@ mod tests {
             .expect("duplicate grant is harmless");
         assert_eq!(access, vec![Access::Content, Access::ToolInput]);
         assert!(grant_shell_access(&shell_words("grant secret for session"), &mut access).is_err());
+        assert_eq!(
+            shell_prompt(Some("codex"), &access),
+            "aql[codex|content+tool-input]> "
+        );
+        assert_eq!(shell_prompt(None, &[]), "aql[none|safe]> ");
     }
 
     #[test]
