@@ -87,7 +87,12 @@ enum Command {
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
         /// Select the database to diagnose; no database is selected implicitly.
-        #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
+        #[arg(
+            short = 'd',
+            long,
+            conflicts_with_all = ["data_root", "source", "profile"],
+            required_unless_present_any = ["data_root", "source", "profile"]
+        )]
         database: Option<String>,
     },
     /// Run one read-only SQL query against an explicit database.
@@ -99,7 +104,12 @@ enum Command {
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
         /// Select a built-in or configured database.
-        #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
+        #[arg(
+            short = 'd',
+            long,
+            conflicts_with_all = ["data_root", "source", "profile"],
+            required_unless_present_any = ["data_root", "source", "profile"]
+        )]
         database: Option<String>,
         /// Select table, JSON, JSONL or RFC 4180 CSV rendering.
         #[arg(long, value_enum, default_value_t = Output::Table)]
@@ -157,7 +167,12 @@ enum Command {
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
         /// Select the database to export; no database is selected implicitly.
-        #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
+        #[arg(
+            short = 'd',
+            long,
+            conflicts_with_all = ["data_root", "source", "profile"],
+            required_unless_present_any = ["data_root", "source", "profile"]
+        )]
         database: Option<String>,
         /// Grant access to sensitive column classes for this export only; repeat as needed.
         #[arg(long = "access", value_enum)]
@@ -194,7 +209,12 @@ enum Command {
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
         /// Select the database used by the report.
-        #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
+        #[arg(
+            short = 'd',
+            long,
+            conflicts_with_all = ["data_root", "source", "profile"],
+            required_unless_present_any = ["data_root", "source", "profile"]
+        )]
         database: Option<String>,
         /// Grant access to sensitive column classes for this report only; repeat as needed.
         #[arg(long = "access", value_enum)]
@@ -229,7 +249,12 @@ enum Command {
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
         /// Select the database whose explicitly built Content index is searched.
-        #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
+        #[arg(
+            short = 'd',
+            long,
+            conflicts_with_all = ["data_root", "source", "profile"],
+            required_unless_present_any = ["data_root", "source", "profile"]
+        )]
         database: Option<String>,
         /// Grant Content access for this search invocation.
         #[arg(long = "access", value_enum)]
@@ -517,7 +542,12 @@ enum IndexCommand {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
-        #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
+        #[arg(
+            short = 'd',
+            long,
+            conflicts_with_all = ["data_root", "source", "profile"],
+            required_unless_present_any = ["data_root", "source", "profile"]
+        )]
         database: Option<String>,
         /// Select text or stable JSON status rendering.
         #[arg(long, value_enum, default_value_t = IndexStatusOutput::Text)]
@@ -531,7 +561,12 @@ enum IndexCommand {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
-        #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
+        #[arg(
+            short = 'd',
+            long,
+            conflicts_with_all = ["data_root", "source", "profile"],
+            required_unless_present_any = ["data_root", "source", "profile"]
+        )]
         database: Option<String>,
         /// Store metadata only, or include authorized message Content.
         #[arg(long, value_enum, default_value_t = IndexPolicyArg::Metadata)]
@@ -559,7 +594,12 @@ enum IndexCommand {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
-        #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
+        #[arg(
+            short = 'd',
+            long,
+            conflicts_with_all = ["data_root", "source", "profile"],
+            required_unless_present_any = ["data_root", "source", "profile"]
+        )]
         database: Option<String>,
         #[arg(long, value_enum, default_value_t = IndexPolicyArg::Metadata)]
         policy: IndexPolicyArg,
@@ -584,7 +624,12 @@ enum IndexCommand {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
-        #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
+        #[arg(
+            short = 'd',
+            long,
+            conflicts_with_all = ["data_root", "source", "profile"],
+            required_unless_present_any = ["data_root", "source", "profile"]
+        )]
         database: Option<String>,
         #[arg(long, conflicts_with = "all")]
         source_id: Option<String>,
@@ -601,7 +646,12 @@ enum IndexCommand {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
-        #[arg(short = 'd', long, conflicts_with_all = ["data_root", "source", "profile"])]
+        #[arg(
+            short = 'd',
+            long,
+            conflicts_with_all = ["data_root", "source", "profile"],
+            required_unless_present_any = ["data_root", "source", "profile"]
+        )]
         database: Option<String>,
     },
 }
@@ -4508,15 +4558,26 @@ fn public_command(source: &clap::Command) -> clap::Command {
         .filter(|argument| !argument.is_hide_set())
     {
         // This command tree is used only to render public completion and man
-        // output. Remove parser-only relationships because they can refer to
-        // hidden compatibility arguments that are intentionally omitted.
-        command = command.arg(
+        // output. Public database selection is required because hidden
+        // compatibility alternatives are intentionally omitted here.
+        let argument = if argument.get_id() == "database" && source.get_name() != "shell" {
+            let mut database = clap::Arg::new("database")
+                .short('d')
+                .long("database")
+                .value_name("DATABASE")
+                .required(true);
+            if let Some(help) = argument.get_help() {
+                database = database.help(help.clone());
+            }
+            database
+        } else {
             argument
                 .clone()
                 .conflicts_with(clap::builder::Resettable::Reset)
                 .requires(clap::builder::Resettable::Reset)
-                .overrides_with(clap::builder::Resettable::Reset),
-        );
+                .overrides_with(clap::builder::Resettable::Reset)
+        };
+        command = command.arg(argument);
     }
     for subcommand in source
         .get_subcommands()
@@ -4900,6 +4961,16 @@ mod tests {
             vec!["aql", "index", "repair", "-d", "codex"],
         ] {
             Cli::try_parse_from(arguments).expect("database syntax must parse");
+        }
+        for arguments in [
+            vec!["aql", "doctor"],
+            vec!["aql", "query", "SELECT 1"],
+            vec!["aql", "export", "SELECT 1"],
+            vec!["aql", "report", "summary"],
+            vec!["aql", "search", "synthetic"],
+            vec!["aql", "index", "status"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
         }
     }
 
