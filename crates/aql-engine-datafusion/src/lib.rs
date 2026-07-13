@@ -2223,42 +2223,7 @@ impl AdapterBatchState {
             return None;
         }
         if self.table.name == "agents" {
-            self.finished = true;
-            if self.agents_emitted {
-                return None;
-            }
-            self.agents_emitted = true;
-            if let Err(error) = self
-                .binding
-                .options
-                .budget
-                .charge_records(self.binding.sources.len() as u64)
-            {
-                return Some(Err(DataFusionError::External(Box::new(error))));
-            }
-            let arrays = self
-                .projection
-                .iter()
-                .map(|index| {
-                    agent_array(
-                        self.table.columns[*index].name,
-                        &self
-                            .binding
-                            .sources
-                            .iter()
-                            .map(|source| source.manifest.clone())
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect::<Result<Vec<_>>>();
-            return Some(arrays.and_then(|arrays| {
-                RecordBatch::try_new_with_options(
-                    self.schema.clone(),
-                    arrays,
-                    &RecordBatchOptions::new().with_row_count(Some(self.binding.sources.len())),
-                )
-                .map_err(Into::into)
-            }));
+            return self.next_agents_batch();
         }
 
         let Some(table_name) = self.table_name else {
@@ -2270,6 +2235,45 @@ impl AdapterBatchState {
         if table_name == TableName::Sessions {
             return self.next_session_batch();
         }
+        self.next_record_batch(table_name)
+    }
+
+    fn next_agents_batch(&mut self) -> Option<Result<RecordBatch>> {
+        self.finished = true;
+        if self.agents_emitted {
+            return None;
+        }
+        self.agents_emitted = true;
+        if let Err(error) = self
+            .binding
+            .options
+            .budget
+            .charge_records(self.binding.sources.len() as u64)
+        {
+            return Some(Err(DataFusionError::External(Box::new(error))));
+        }
+        let manifests = self
+            .binding
+            .sources
+            .iter()
+            .map(|source| source.manifest.clone())
+            .collect::<Vec<_>>();
+        let arrays = self
+            .projection
+            .iter()
+            .map(|index| agent_array(self.table.columns[*index].name, &manifests))
+            .collect::<Result<Vec<_>>>();
+        Some(arrays.and_then(|arrays| {
+            RecordBatch::try_new_with_options(
+                self.schema.clone(),
+                arrays,
+                &RecordBatchOptions::new().with_row_count(Some(self.binding.sources.len())),
+            )
+            .map_err(Into::into)
+        }))
+    }
+
+    fn next_record_batch(&mut self, table_name: TableName) -> Option<Result<RecordBatch>> {
         let mut records = Vec::with_capacity(1024);
         while records.len() < 1024 && self.limit.is_none_or(|limit| self.emitted < limit) {
             if self.current.is_none() {
@@ -2419,81 +2423,11 @@ impl AdapterBatchState {
     }
 
     fn next_session_batch(&mut self) -> Option<Result<RecordBatch>> {
-        if !self.sessions_reconciled {
-            loop {
-                if self.current.is_none() {
-                    match self.open_next_source(TableName::Sessions, None) {
-                        Ok(true) => {}
-                        Ok(false) => break,
-                        Err(error) => {
-                            self.finished = true;
-                            return Some(Err(error));
-                        }
-                    }
-                }
-                match self.current.as_mut().and_then(Iterator::next) {
-                    Some(Ok(record)) => {
-                        if let Err(error) = validate_record_metrics(&record) {
-                            self.finished = true;
-                            return Some(Err(error));
-                        }
-                        let retained_bytes = match retained_session_bytes(&record) {
-                            Ok(bytes) => bytes,
-                            Err(error) => {
-                                self.finished = true;
-                                return Some(Err(error));
-                            }
-                        };
-                        if let Err(error) = self.reconciliation_memory.try_grow(retained_bytes) {
-                            self.finished = true;
-                            return Some(Err(error));
-                        }
-                        self.session_records.push(record);
-                    }
-                    Some(Err(error)) => {
-                        self.finished = true;
-                        return Some(Err(DataFusionError::External(Box::new(error))));
-                    }
-                    None => {
-                        if let Err(error) = self.flush_current_diagnostics() {
-                            self.finished = true;
-                            return Some(Err(error));
-                        }
-                        self.current = None;
-                        self.source_index += 1;
-                    }
-                }
-            }
-            let reconciled = Catalog.reconcile_sessions(std::mem::take(&mut self.session_records));
-            if let Ok(mut metadata) = self.binding.metadata.lock() {
-                metadata
-                    .warnings
-                    .extend(reconciled.warnings.iter().map(|warning| {
-                        format!(
-                            "catalog:{:?}:entity_id={}:field={}",
-                            warning.kind,
-                            warning.entity_id,
-                            warning.field.as_deref().unwrap_or("none")
-                        )
-                    }));
-            } else {
-                self.finished = true;
-                return Some(Err(DataFusionError::External(Box::new(
-                    aql_adapter_api::AdapterError::Internal {
-                        stage: "query_metadata".to_string(),
-                    },
-                ))));
-            }
-            let mut records = reconciled
-                .records
-                .into_iter()
-                .map(CanonicalRecord::Session)
-                .collect::<Vec<_>>();
-            if let Some(limit) = self.limit {
-                records.truncate(limit);
-            }
-            self.pending_sessions = records.into();
-            self.sessions_reconciled = true;
+        if !self.sessions_reconciled
+            && let Err(error) = self.reconcile_sessions()
+        {
+            self.finished = true;
+            return Some(Err(error));
         }
 
         let records = self
@@ -2521,6 +2455,61 @@ impl AdapterBatchState {
             )
             .map_err(Into::into)
         }))
+    }
+
+    fn reconcile_sessions(&mut self) -> Result<()> {
+        self.collect_session_records()?;
+        let reconciled = Catalog.reconcile_sessions(std::mem::take(&mut self.session_records));
+        let mut metadata = self.binding.metadata.lock().map_err(|_| {
+            DataFusionError::External(Box::new(aql_adapter_api::AdapterError::Internal {
+                stage: "query_metadata".to_string(),
+            }))
+        })?;
+        metadata
+            .warnings
+            .extend(reconciled.warnings.iter().map(|warning| {
+                format!(
+                    "catalog:{:?}:entity_id={}:field={}",
+                    warning.kind,
+                    warning.entity_id,
+                    warning.field.as_deref().unwrap_or("none")
+                )
+            }));
+        drop(metadata);
+
+        let mut records = reconciled
+            .records
+            .into_iter()
+            .map(CanonicalRecord::Session)
+            .collect::<Vec<_>>();
+        if let Some(limit) = self.limit {
+            records.truncate(limit);
+        }
+        self.pending_sessions = records.into();
+        self.sessions_reconciled = true;
+        Ok(())
+    }
+
+    fn collect_session_records(&mut self) -> Result<()> {
+        loop {
+            if self.current.is_none() && !self.open_next_source(TableName::Sessions, None)? {
+                return Ok(());
+            }
+            match self.current.as_mut().and_then(Iterator::next) {
+                Some(Ok(record)) => {
+                    validate_record_metrics(&record)?;
+                    self.reconciliation_memory
+                        .try_grow(retained_session_bytes(&record)?)?;
+                    self.session_records.push(record);
+                }
+                Some(Err(error)) => return Err(DataFusionError::External(Box::new(error))),
+                None => {
+                    self.flush_current_diagnostics()?;
+                    self.current = None;
+                    self.source_index += 1;
+                }
+            }
+        }
     }
 
     fn flush_current_diagnostics(&mut self) -> Result<()> {
