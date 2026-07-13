@@ -334,6 +334,7 @@ enum DatabaseCommand {
         agent: Vec<String>,
         #[arg(long = "path", hide = true, requires = "agent")]
         path: Vec<PathBuf>,
+        /// Confirm storage of adapter IDs and exact absolute paths only; SQL, grants and results are never stored.
         #[arg(long)]
         acknowledge_persistent_path: bool,
     },

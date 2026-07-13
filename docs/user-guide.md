@@ -46,6 +46,8 @@ Shell 支持多行 SELECT/CTE、`EXPLAIN SELECT`、表/字段/数据库补全，
 
 保存命名数据库需要明确确认持久化路径：
 
+确认后只会保存 adapter ID 与精确绝对路径；SQL、查询结果、访问授权和凭据不会保存。
+
 ```bash
 aql database add work \
   --member claude=/absolute/path/to/.claude \
