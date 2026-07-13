@@ -299,4 +299,7 @@ aql doctor -d codex
 aql --error-format json query -d missing 'SELECT COUNT(*) FROM sessions'
 ```
 
+脚本可以增加全局 `--quiet` 抑制非必要 warning 和 Shell 摘要；错误仍使用统一的
+`--error-format json` 单行对象，显式请求的 `--plan` 与 `--metadata` 不会被隐藏。
+
 JSON 包含 `category`、`message`、`hint` 和 `exit_code`。

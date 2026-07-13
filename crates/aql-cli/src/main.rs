@@ -54,6 +54,9 @@ struct Cli {
     /// Select stable text or single-line JSON error rendering.
     #[arg(long, global = true, value_enum, default_value_t = ErrorFormat::Text)]
     error_format: ErrorFormat,
+    /// Suppress non-essential warnings and shell summaries; errors and requested metadata remain visible.
+    #[arg(long, global = true)]
+    quiet: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -1943,6 +1946,7 @@ async fn run_shell(initial_database: Option<String>) -> Result<(), Box<dyn std::
                     };
                     let query = Cli {
                         error_format: ErrorFormat::Text,
+                        quiet: false,
                         command: Some(Command::Query {
                             data_root: None,
                             source: Vec::new(),
@@ -2052,6 +2056,7 @@ fn requested_error_format() -> ErrorFormat {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let quiet = cli.quiet;
     let Some(command) = cli.command else {
         return run_shell(None).await;
     };
@@ -2221,8 +2226,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     return Err("query timed out".into());
                 }
             };
-            for warning in &result.metadata.warnings {
-                eprintln!("warning={warning}");
+            if !quiet {
+                for warning in &result.metadata.warnings {
+                    eprintln!("warning={warning}");
+                }
             }
             if metadata {
                 eprintln!("metadata.sources={}", result.metadata.source_ids.join(","));
@@ -2256,14 +2263,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             budget.charge_output_bytes(rendered_publication_len(&rendered) as u64)?;
-            if formula_escaped {
+            if formula_escaped && !quiet {
                 eprintln!("warning=CSV formula-like text was escaped");
             }
-            if !access.is_empty() && !io::stdout().is_terminal() {
+            if !access.is_empty() && !io::stdout().is_terminal() && !quiet {
                 eprintln!("warning=sensitive access was granted for non-terminal output");
             }
             write_rendered(&mut io::stdout().lock(), &rendered, &cancellation)?;
-            if shell_summary {
+            if shell_summary && !quiet {
                 eprintln!(
                     "({returned_rows} rows, {} ms)",
                     query_started.elapsed().as_millis()
@@ -2321,7 +2328,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 stream_portable_json(output.writer(), result, &budget, &cancellation, remaining)
                     .await?;
             } else {
-                if !access.is_empty() && !io::stdout().is_terminal() {
+                if !access.is_empty() && !io::stdout().is_terminal() && !quiet {
                     eprintln!("warning=sensitive access was granted for non-terminal output");
                 }
                 let mut transaction = TransactionalOutput::new(max_memory_bytes);
@@ -2500,7 +2507,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 writeln!(stdout, "{rendered}")?;
             }
             stdout.flush()?;
-            if !io::stdout().is_terminal() {
+            if !io::stdout().is_terminal() && !quiet {
                 eprintln!("warning=search results are derived from persisted Content");
             }
         }
@@ -5075,6 +5082,7 @@ mod tests {
         assert!(!help.contains("profile"));
         assert!(!help.contains("sources"));
         assert!(!help.contains("action"));
+        assert!(Cli::try_parse_from(["aql", "--quiet", "schema"]).is_ok());
     }
 
     #[test]
