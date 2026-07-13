@@ -1,0 +1,39 @@
+class Aql < Formula
+  desc "Local-first SQL query tool for Agent data"
+  homepage "@HOMEPAGE@"
+  version "@VERSION@"
+  license "MIT"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "@BASE_URL@/aql-@VERSION@-aarch64-macos.tar.gz"
+      sha256 "@AARCH64_MACOS_SHA256@"
+    else
+      url "@BASE_URL@/aql-@VERSION@-x86_64-macos.tar.gz"
+      sha256 "@X86_64_MACOS_SHA256@"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "@BASE_URL@/aql-@VERSION@-aarch64-linux.tar.gz"
+      sha256 "@AARCH64_LINUX_SHA256@"
+    else
+      url "@BASE_URL@/aql-@VERSION@-x86_64-linux.tar.gz"
+      sha256 "@X86_64_LINUX_SHA256@"
+    end
+  end
+
+  def install
+    bin.install "bin/aql"
+    bash_completion.install "share/bash-completion/completions/aql"
+    zsh_completion.install "share/zsh/site-functions/_aql"
+    fish_completion.install "share/fish/vendor_completions.d/aql.fish"
+    man1.install "share/man/man1/aql.1"
+    doc.install Dir["share/doc/aql/*"]
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/aql --version")
+  end
+end

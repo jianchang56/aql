@@ -1,0 +1,45 @@
+[package]
+name = "aql-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "aql"
+path = "src/main.rs"
+
+[dependencies]
+aql-adapter-api = { path = "../aql-adapter-api" }
+aql-adapter-claude-code = { path = "../aql-adapter-claude-code" }
+aql-adapter-codex = { path = "../aql-adapter-codex" }
+aql-adapter-kimi-code = { path = "../aql-adapter-kimi-code" }
+aql-adapter-opencode = { path = "../aql-adapter-opencode" }
+aql-catalog = { path = "../aql-catalog" }
+aql-config = { path = "../aql-config" }
+aql-engine-datafusion = { path = "../aql-engine-datafusion" }
+aql-index = { path = "../aql-index" }
+aql-actions = { path = "../aql-actions" }
+aql-action-codex = { path = "../aql-action-codex" }
+aql-action-claude-code = { path = "../aql-action-claude-code" }
+aql-action-kimi-code = { path = "../aql-action-kimi-code" }
+aql-action-opencode = { path = "../aql-action-opencode" }
+aql-action-synthetic = { path = "../aql-action-synthetic" }
+aql-model = { path = "../aql-model" }
+clap = { version = "4.5", features = ["derive", "string"] }
+clap_complete = "4.5"
+clap_mangen = "0.2"
+chrono = "0.4"
+datafusion = { version = "54.0.0", default-features = false, features = ["sql"] }
+humantime = "2.3"
+futures = "0.3"
+rand = "0.9"
+rustyline = "15.0"
+rustix = { version = "1.1", features = ["fs"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

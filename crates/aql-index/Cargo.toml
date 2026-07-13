@@ -1,0 +1,16 @@
+[package]
+name = "aql-index"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.38", features = ["bundled"] }
+rand = "0.9"
+rustix = { version = "1.1", features = ["fs"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[lints]
+workspace = true

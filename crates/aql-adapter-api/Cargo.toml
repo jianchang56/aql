@@ -1,0 +1,12 @@
+[package]
+name = "aql-adapter-api"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+aql-model = { path = "../aql-model" }
+thiserror = "2.0"
+
+[lints]
+workspace = true

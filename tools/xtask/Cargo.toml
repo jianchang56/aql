@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+aql-test-support = { path = "../../crates/aql-test-support" }
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

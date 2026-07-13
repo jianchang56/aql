@@ -1,0 +1,20 @@
+[package]
+name = "aql-adapter-claude-code"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+aql-adapter-api = { path = "../aql-adapter-api" }
+aql-model = { path = "../aql-model" }
+chrono = "0.4"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+
+[dev-dependencies]
+aql-test-support = { path = "../aql-test-support" }
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

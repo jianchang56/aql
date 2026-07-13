@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 ||
+            gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft --verify-tag --title "AQL ${GITHUB_REF_NAME}"
+
+  build:
+    needs: prepare
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target_name: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            target_name: aarch64-linux
+          - runner: macos-15-intel
+            target_name: x86_64-macos
+          - runner: macos-15
+            target_name: aarch64-macos
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout tag without credentials
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup override set 1.88.0
+      - name: Verify tag version
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          test "$version" = "$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+      - name: Build and test release binary
+        run: |
+          case "${{ matrix.target_name }}" in
+            aarch64-*) test "$(uname -m)" = "arm64" -o "$(uname -m)" = "aarch64" ;;
+            x86_64-*) test "$(uname -m)" = "x86_64" ;;
+          esac
+          cargo test --locked -p aql-cli -p aql-release
+          cargo build --locked --release -p aql-cli
+      - name: Build and verify deterministic archive
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          epoch=$(git show -s --format=%ct HEAD)
+          SOURCE_DATE_EPOCH=$epoch cargo run --locked --release -p aql-release -- build \
+            --binary target/release/aql \
+            --output-dir target/publish \
+            --version "$version" \
+            --target "${{ matrix.target_name }}"
+          archive="target/publish/aql-$version-${{ matrix.target_name }}.tar.gz"
+          sha=$(awk '{print $1}' "$archive.sha256")
+          cargo run --locked --release -p aql-release -- verify \
+            --archive "$archive" \
+            --expected-sha256 "$sha" \
+            --version "$version" \
+            --target "${{ matrix.target_name }}"
+      - name: Upload verified build artifact without release permission
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.target_name }}
+          path: target/publish/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tag without credentials
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          persist-credentials: false
+      - name: Download all isolated build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          path: target/release-assets
+          merge-multiple: true
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup override set 1.88.0
+      - name: Reverify every archive and generate Homebrew formula
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          checksum() { awk '{print $1}' "target/release-assets/aql-$version-$1.tar.gz.sha256"; }
+          for target_name in aarch64-linux aarch64-macos x86_64-linux x86_64-macos; do
+            archive="target/release-assets/aql-$version-$target_name.tar.gz"
+            cargo run --locked --release -p aql-release -- verify \
+              --archive "$archive" \
+              --expected-sha256 "$(checksum "$target_name")" \
+              --version "$version" \
+              --target "$target_name"
+          done
+          cargo run --locked --release -p aql-release -- formula \
+            --version "$version" \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}" \
+            --homepage "https://github.com/${GITHUB_REPOSITORY}" \
+            --aarch64-macos-sha256 "$(checksum aarch64-macos)" \
+            --x86-64-macos-sha256 "$(checksum x86_64-macos)" \
+            --aarch64-linux-sha256 "$(checksum aarch64-linux)" \
+            --x86-64-linux-sha256 "$(checksum x86_64-linux)" \
+            --output target/release-assets/aql.rb
+      - name: Upload and publish only after every artifact verifies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" target/release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+          gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest

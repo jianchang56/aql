@@ -1,0 +1,23 @@
+[package]
+name = "aql-engine-datafusion"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+aql-adapter-api = { path = "../aql-adapter-api" }
+aql-catalog = { path = "../aql-catalog" }
+aql-model = { path = "../aql-model" }
+async-trait = "0.1"
+datafusion = { version = "54.0.0", default-features = false, features = ["sql"] }
+futures = "0.3"
+sqlparser = { version = "0.62.0", features = ["visitor"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+aql-adapter-codex = { path = "../aql-adapter-codex" }
+tokio = { version = "1.52", features = ["macros", "rt"] }

@@ -1,0 +1,792 @@
+//! Read-only adapter for the observed Claude Code 2.x local transcript format.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use aql_adapter_api::{
+    AdapterError, AdapterSchema, AgentAdapter, Capabilities, ColumnCapability, ColumnName,
+    ProbeRequest, ProbeResult, PushdownReport, PushdownState, ScanDiagnostics, ScanRequest,
+    ScanResult, SnapshotReport, SnapshotStrength, TableName, check_scan_state,
+    validate_projection_access,
+};
+use aql_model::{
+    AccessClass, CanonicalRecord, EntityId, IdentityConfidence, NativeId, SessionEdgeRecord,
+    SessionRecord, SnapshotState, SourceId, SourceManifest,
+};
+use chrono::{DateTime, Utc};
+
+mod transcript;
+
+const FORMAT: &str = "claude-code-2.x-jsonl-observed-v1";
+const MAX_TRANSCRIPTS: usize = 100_000;
+const MAX_TRANSCRIPT_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_RECORD_BYTES: usize = 1024 * 1024;
+pub(crate) type MainTranscripts = BTreeSet<(String, String)>;
+type TranscriptInventory = (Vec<TranscriptDescriptor>, MainTranscripts);
+
+pub struct ClaudeCodeAdapter {
+    installation_salt: Vec<u8>,
+    roots: Mutex<BTreeMap<SourceId, RootBinding>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RootBinding {
+    path: PathBuf,
+    identity: FileIdentity,
+    projects: PathBuf,
+    projects_identity: FileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct TranscriptDescriptor {
+    path: PathBuf,
+    project: PathBuf,
+    project_identity: FileIdentity,
+    project_key: String,
+    kind: TranscriptKind,
+    identity: FileIdentity,
+    len: u64,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone)]
+pub(crate) enum TranscriptKind {
+    Main { session: String },
+    Agent { agent: String },
+}
+
+#[derive(Clone)]
+pub(crate) struct LogicalTranscript {
+    descriptor: TranscriptDescriptor,
+    main_native: String,
+    logical_native: String,
+    agent: Option<String>,
+}
+
+struct SessionStream {
+    root: RootBinding,
+    request: ScanRequest,
+    diagnostics: ScanDiagnostics,
+    descriptors: VecDeque<TranscriptDescriptor>,
+    mains: MainTranscripts,
+    emitted: u64,
+    finished: bool,
+}
+
+struct EdgeStream {
+    root: RootBinding,
+    request: ScanRequest,
+    diagnostics: ScanDiagnostics,
+    descriptors: VecDeque<TranscriptDescriptor>,
+    mains: MainTranscripts,
+    emitted: u64,
+    finished: bool,
+}
+
+impl ClaudeCodeAdapter {
+    #[must_use]
+    pub fn new(installation_salt: impl Into<Vec<u8>>) -> Self {
+        Self {
+            installation_salt: installation_salt.into(),
+            roots: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn validate_root(path: &Path) -> Result<RootBinding, AdapterError> {
+        let metadata = fs::symlink_metadata(path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => AdapterError::NotFound {
+                stage: "claude_root".to_string(),
+            },
+            _ => AdapterError::PermissionDenied {
+                stage: "claude_root".to_string(),
+            },
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(AdapterError::UnsupportedFormat {
+                stage: "claude_root_type".to_string(),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o022 != 0 {
+                return Err(AdapterError::PermissionDenied {
+                    stage: "claude_root_permissions".to_string(),
+                });
+            }
+        }
+        let path = path.canonicalize().map_err(|_| AdapterError::NotFound {
+            stage: "claude_root_canonicalize".to_string(),
+        })?;
+        let root_metadata = fs::metadata(&path).map_err(|_| AdapterError::NotFound {
+            stage: "claude_root_identity".to_string(),
+        })?;
+        let projects = path.join("projects");
+        let projects_metadata =
+            fs::symlink_metadata(&projects).map_err(|_| AdapterError::UnsupportedFormat {
+                stage: "claude_projects_missing".to_string(),
+            })?;
+        if projects_metadata.file_type().is_symlink() || !projects_metadata.is_dir() {
+            return Err(AdapterError::UnsupportedFormat {
+                stage: "claude_projects_type".to_string(),
+            });
+        }
+        Ok(RootBinding {
+            path,
+            identity: file_identity(&root_metadata),
+            projects,
+            projects_identity: file_identity(&projects_metadata),
+        })
+    }
+
+    fn root_for(&self, source: &SourceManifest) -> Result<RootBinding, AdapterError> {
+        self.roots
+            .lock()
+            .map_err(|_| AdapterError::Internal {
+                stage: "claude_roots".to_string(),
+            })?
+            .get(&source.source_id)
+            .cloned()
+            .ok_or_else(|| AdapterError::NotFound {
+                stage: "claude_manifest".to_string(),
+            })
+    }
+}
+
+impl AgentAdapter for ClaudeCodeAdapter {
+    fn id(&self) -> &'static str {
+        "claude-code"
+    }
+
+    fn probe(&self, request: &ProbeRequest) -> Result<ProbeResult, AdapterError> {
+        let root = Self::validate_root(Path::new(&request.data_root))?;
+        let (descriptors, _) = enumerate_transcripts(&root)?;
+        if !descriptors
+            .iter()
+            .any(|item| matches!(item.kind, TranscriptKind::Main { .. }))
+        {
+            return Err(AdapterError::UnsupportedFormat {
+                stage: "claude_main_transcript_missing".to_string(),
+            });
+        }
+        let root_text = root.path.to_string_lossy();
+        let source_id = SourceId::for_data_root(self.id(), &root_text, &self.installation_salt);
+        self.roots
+            .lock()
+            .map_err(|_| AdapterError::Internal {
+                stage: "claude_roots".to_string(),
+            })?
+            .insert(source_id.clone(), root);
+        Ok(ProbeResult {
+            manifests: vec![SourceManifest {
+                source_id,
+                agent_id: self.id().to_string(),
+                display_name: "Claude Code 2.x".to_string(),
+                data_root_token: "selected-claude-code-root".to_string(),
+                format_fingerprint: FORMAT.to_string(),
+                capabilities: vec![
+                    "sessions".to_string(),
+                    "messages".to_string(),
+                    "tool_calls".to_string(),
+                    "usage".to_string(),
+                    "session_edges".to_string(),
+                ],
+                snapshot: None,
+                warnings: Vec::new(),
+            }],
+        })
+    }
+
+    fn capabilities(&self, _manifest: &SourceManifest) -> Capabilities {
+        Capabilities {
+            tables: vec![
+                TableName::Sessions,
+                TableName::Messages,
+                TableName::ToolCalls,
+                TableName::Usage,
+                TableName::SessionEdges,
+            ],
+            columns: columns(),
+            snapshot_strength: SnapshotStrength::Weak,
+        }
+    }
+
+    fn schema(&self, _manifest: &SourceManifest) -> AdapterSchema {
+        AdapterSchema { columns: columns() }
+    }
+
+    fn scan(&self, mut request: ScanRequest) -> Result<ScanResult, AdapterError> {
+        validate_projection_access(
+            &request.projection,
+            &self.schema(&request.source),
+            request.access,
+        )?;
+        check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
+        let root = self.root_for(&request.source)?;
+        let (descriptors, mains) = enumerate_transcripts(&root)?;
+        let diagnostics = ScanDiagnostics::default();
+        let predicate_count = request.predicates.len();
+        let ordering_count = request.order_hint.len();
+        let limit = normalize_limit(&mut request);
+        let records = match request.table {
+            TableName::Sessions => Box::new(SessionStream {
+                root,
+                request,
+                diagnostics: diagnostics.clone(),
+                descriptors: descriptors.into(),
+                mains,
+                emitted: 0,
+                finished: false,
+            }) as aql_adapter_api::RecordStream,
+            TableName::Messages | TableName::ToolCalls | TableName::Usage => {
+                transcript::scan(root, descriptors, mains, request, diagnostics.clone())
+            }
+            TableName::SessionEdges => Box::new(EdgeStream {
+                root,
+                request,
+                diagnostics: diagnostics.clone(),
+                descriptors: descriptors.into(),
+                mains,
+                emitted: 0,
+                finished: false,
+            }),
+            TableName::Artifacts => {
+                return Err(AdapterError::UnsupportedFormat {
+                    stage: "claude_table".to_string(),
+                });
+            }
+        };
+        Ok(ScanResult {
+            records,
+            pushdown: PushdownReport {
+                predicates: vec![PushdownState::Unsupported; predicate_count],
+                limit,
+                ordering: vec![PushdownState::Unsupported; ordering_count],
+            },
+            diagnostics,
+            snapshot: SnapshotReport {
+                token: None,
+                strength: SnapshotStrength::Weak,
+                stale: false,
+            },
+        })
+    }
+}
+
+impl Iterator for SessionStream {
+    type Item = Result<CanonicalRecord, AdapterError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished
+            || self
+                .request
+                .limit
+                .is_some_and(|limit| self.emitted >= limit)
+        {
+            self.finished = true;
+            return None;
+        }
+        if let Err(error) = check_scan_state(
+            &self.request.cancellation,
+            &self.request.budget,
+            self.emitted,
+            self.request.budget.bytes_read_used(),
+        ) {
+            self.finished = true;
+            return Some(Err(error));
+        }
+        let descriptor = self.descriptors.pop_front()?;
+        let logical = match transcript::resolve_logical(
+            &self.root,
+            descriptor,
+            &self.mains,
+            &self.request,
+            &self.diagnostics,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.finished = true;
+                return Some(Err(error));
+            }
+        };
+        let summary =
+            match transcript::summarize(&self.root, &logical, &self.request, &self.diagnostics) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+            };
+        let native_id = NativeId::new(logical.logical_native.clone());
+        let record = SessionRecord {
+            session_id: EntityId::from_parts(
+                "claude-code",
+                &self.request.source.source_id,
+                &native_id,
+            ),
+            native_id,
+            source_id: self.request.source.source_id.clone(),
+            agent_id: "claude-code".to_string(),
+            title: None,
+            preview: summary.preview,
+            cwd: summary.cwd.clone(),
+            project: summary.cwd,
+            model: summary.model,
+            provider: None,
+            created_at: summary.created_at,
+            updated_at: logical.descriptor.updated_at,
+            status: logical.agent.as_ref().map(|_| "subagent".to_string()),
+            archived: Some(false),
+            message_count: summary.message_count,
+            tool_call_count: summary.tool_call_count,
+            tokens_used: summary.tokens_used,
+            identity_confidence: IdentityConfidence::Exact,
+            snapshot_state: SnapshotState::Weak,
+            provenance: BTreeMap::new(),
+            extensions: BTreeMap::new(),
+        };
+        if let Err(error) = self.request.budget.charge_records(1) {
+            self.finished = true;
+            return Some(Err(error));
+        }
+        self.emitted += 1;
+        Some(Ok(CanonicalRecord::Session(record)))
+    }
+}
+
+impl Iterator for EdgeStream {
+    type Item = Result<CanonicalRecord, AdapterError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished
+            || self
+                .request
+                .limit
+                .is_some_and(|limit| self.emitted >= limit)
+        {
+            self.finished = true;
+            return None;
+        }
+        loop {
+            if let Err(error) = check_scan_state(
+                &self.request.cancellation,
+                &self.request.budget,
+                self.emitted,
+                self.request.budget.bytes_read_used(),
+            ) {
+                self.finished = true;
+                return Some(Err(error));
+            }
+            let descriptor = self.descriptors.pop_front()?;
+            if !matches!(descriptor.kind, TranscriptKind::Agent { .. }) {
+                continue;
+            }
+            let logical = match transcript::resolve_logical(
+                &self.root,
+                descriptor,
+                &self.mains,
+                &self.request,
+                &self.diagnostics,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+            };
+            let agent = logical.agent.clone().ok_or_else(|| AdapterError::Internal {
+                stage: "claude_edge_agent".to_string(),
+            });
+            let agent = match agent {
+                Ok(value) => value,
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+            };
+            let parent_native = NativeId::new(logical.main_native.clone());
+            let child_native = NativeId::new(logical.logical_native.clone());
+            let edge_native = NativeId::new(format!("{}/edge/{agent}", logical.main_native));
+            let record = SessionEdgeRecord {
+                edge_id: EntityId::from_parts(
+                    "claude-code",
+                    &self.request.source.source_id,
+                    &edge_native,
+                ),
+                source_id: self.request.source.source_id.clone(),
+                parent_session_id: EntityId::from_parts(
+                    "claude-code",
+                    &self.request.source.source_id,
+                    &parent_native,
+                ),
+                child_session_id: EntityId::from_parts(
+                    "claude-code",
+                    &self.request.source.source_id,
+                    &child_native,
+                ),
+                edge_kind: "subagent".to_string(),
+                created_at: logical.descriptor.updated_at,
+                native_edge_id: Some(edge_native),
+                provenance: BTreeMap::new(),
+                extensions: BTreeMap::new(),
+            };
+            if let Err(error) = self.request.budget.charge_records(1) {
+                self.finished = true;
+                return Some(Err(error));
+            }
+            self.emitted += 1;
+            return Some(Ok(CanonicalRecord::SessionEdge(record)));
+        }
+    }
+}
+
+fn enumerate_transcripts(root: &RootBinding) -> Result<TranscriptInventory, AdapterError> {
+    validate_root_identity(root)?;
+    let mut descriptors = Vec::new();
+    let mut mains = BTreeSet::new();
+    let mut main_ids = BTreeSet::new();
+    let projects = fs::read_dir(&root.projects).map_err(|_| AdapterError::PermissionDenied {
+        stage: "claude_projects_read".to_string(),
+    })?;
+    for project in projects {
+        let project = project.map_err(|_| AdapterError::PermissionDenied {
+            stage: "claude_project_entry".to_string(),
+        })?;
+        let file_type = project
+            .file_type()
+            .map_err(|_| AdapterError::PermissionDenied {
+                stage: "claude_project_type".to_string(),
+            })?;
+        if file_type.is_symlink() {
+            return Err(AdapterError::UnsupportedFormat {
+                stage: "claude_project_symlink".to_string(),
+            });
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        let project_key =
+            project
+                .file_name()
+                .into_string()
+                .map_err(|_| AdapterError::UnsupportedFormat {
+                    stage: "claude_project_name".to_string(),
+                })?;
+        if !safe_project_key(&project_key) {
+            return Err(AdapterError::UnsupportedFormat {
+                stage: "claude_project_name".to_string(),
+            });
+        }
+        let project_path = project.path();
+        validate_directory(&project_path)?;
+        let project_identity = file_identity(
+            &fs::symlink_metadata(&project_path).map_err(|_| AdapterError::SnapshotUnavailable)?,
+        );
+        let files = fs::read_dir(&project_path).map_err(|_| AdapterError::PermissionDenied {
+            stage: "claude_project_read".to_string(),
+        })?;
+        for entry in files {
+            let entry = entry.map_err(|_| AdapterError::PermissionDenied {
+                stage: "claude_transcript_entry".to_string(),
+            })?;
+            let file_type = entry
+                .file_type()
+                .map_err(|_| AdapterError::PermissionDenied {
+                    stage: "claude_transcript_type".to_string(),
+                })?;
+            let name =
+                entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| AdapterError::UnsupportedFormat {
+                        stage: "claude_transcript_name".to_string(),
+                    })?;
+            if !name.ends_with(".jsonl") {
+                continue;
+            }
+            if file_type.is_symlink() || !file_type.is_file() {
+                return Err(AdapterError::UnsupportedFormat {
+                    stage: "claude_transcript_type".to_string(),
+                });
+            }
+            let stem = name.trim_end_matches(".jsonl");
+            let kind = if uuid(stem) {
+                if !main_ids.insert(stem.to_string()) {
+                    return Err(AdapterError::CorruptSource {
+                        stage: "claude_duplicate_session".to_string(),
+                    });
+                }
+                mains.insert((project_key.clone(), stem.to_string()));
+                TranscriptKind::Main {
+                    session: stem.to_string(),
+                }
+            } else if let Some(agent) = stem.strip_prefix("agent-") {
+                if !safe_component(agent, 128) {
+                    return Err(AdapterError::UnsupportedFormat {
+                        stage: "claude_agent_name".to_string(),
+                    });
+                }
+                TranscriptKind::Agent {
+                    agent: agent.to_string(),
+                }
+            } else {
+                return Err(AdapterError::UnsupportedFormat {
+                    stage: "claude_transcript_name".to_string(),
+                });
+            };
+            let metadata =
+                fs::symlink_metadata(entry.path()).map_err(|_| AdapterError::PermissionDenied {
+                    stage: "claude_transcript_metadata".to_string(),
+                })?;
+            if metadata.len() > MAX_TRANSCRIPT_BYTES {
+                return Err(AdapterError::BudgetExceeded {
+                    resource: "claude_transcript_bytes".to_string(),
+                    actual: metadata.len(),
+                });
+            }
+            descriptors.push(TranscriptDescriptor {
+                path: entry.path(),
+                project: project_path.clone(),
+                project_identity,
+                project_key: project_key.clone(),
+                kind,
+                identity: file_identity(&metadata),
+                len: metadata.len(),
+                updated_at: metadata.modified().ok().map(DateTime::<Utc>::from),
+            });
+            if descriptors.len() > MAX_TRANSCRIPTS {
+                return Err(AdapterError::BudgetExceeded {
+                    resource: "claude_transcript_count".to_string(),
+                    actual: descriptors.len() as u64,
+                });
+            }
+        }
+    }
+    descriptors.sort_by(|left, right| {
+        (&left.project_key, &left.path).cmp(&(&right.project_key, &right.path))
+    });
+    validate_root_identity(root)?;
+    Ok((descriptors, mains))
+}
+
+pub(crate) fn validate_root_identity(root: &RootBinding) -> Result<(), AdapterError> {
+    let root_metadata =
+        fs::symlink_metadata(&root.path).map_err(|_| AdapterError::SnapshotUnavailable)?;
+    let projects_metadata =
+        fs::symlink_metadata(&root.projects).map_err(|_| AdapterError::SnapshotUnavailable)?;
+    if root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || file_identity(&root_metadata) != root.identity
+        || projects_metadata.file_type().is_symlink()
+        || !projects_metadata.is_dir()
+        || file_identity(&projects_metadata) != root.projects_identity
+    {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_descriptor_chain(
+    root: &RootBinding,
+    descriptor: &TranscriptDescriptor,
+) -> Result<(), AdapterError> {
+    validate_root_identity(root)?;
+    if descriptor.project.parent() != Some(root.projects.as_path())
+        || descriptor.path.parent() != Some(descriptor.project.as_path())
+    {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    validate_directory(&descriptor.project)?;
+    let project_metadata =
+        fs::symlink_metadata(&descriptor.project).map_err(|_| AdapterError::SnapshotUnavailable)?;
+    if file_identity(&project_metadata) != descriptor.project_identity {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    Ok(())
+}
+
+fn validate_directory(path: &Path) -> Result<(), AdapterError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| AdapterError::SnapshotUnavailable)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    Ok(())
+}
+
+pub(crate) fn open_transcript(
+    root: &RootBinding,
+    descriptor: &TranscriptDescriptor,
+) -> Result<File, AdapterError> {
+    validate_descriptor_chain(root, descriptor)?;
+    let before = fs::symlink_metadata(&descriptor.path).map_err(|_| AdapterError::NotFound {
+        stage: "claude_transcript".to_string(),
+    })?;
+    if before.file_type().is_symlink()
+        || !before.is_file()
+        || file_identity(&before) != descriptor.identity
+        || before.len() < descriptor.len
+    {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&descriptor.path)
+        .map_err(|_| AdapterError::PermissionDenied {
+            stage: "claude_transcript_open".to_string(),
+        })?;
+    let opened = file
+        .metadata()
+        .map_err(|_| AdapterError::PermissionDenied {
+            stage: "claude_transcript_metadata".to_string(),
+        })?;
+    if !opened.is_file()
+        || file_identity(&opened) != descriptor.identity
+        || opened.len() < descriptor.len
+    {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    Ok(file)
+}
+
+pub(crate) fn revalidate_transcript(
+    root: &RootBinding,
+    descriptor: &TranscriptDescriptor,
+    file: &File,
+) -> Result<(), AdapterError> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| AdapterError::SnapshotUnavailable)?;
+    if file_identity(&metadata) != descriptor.identity || metadata.len() < descriptor.len {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    validate_descriptor_chain(root, descriptor)
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.len(),
+        inode: 0,
+    }
+}
+
+fn safe_component(value: &str, maximum: usize) -> bool {
+    !matches!(value, "." | "..")
+        && !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn safe_project_key(value: &str) -> bool {
+    !matches!(value, "." | "..")
+        && !value.is_empty()
+        && value.len() <= 1024
+        && !value.chars().any(char::is_control)
+}
+
+fn uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn normalize_limit(request: &mut ScanRequest) -> Option<PushdownState> {
+    request.limit.map(|_| {
+        if request.predicates.is_empty() && request.order_hint.is_empty() {
+            PushdownState::Exact
+        } else {
+            request.limit = None;
+            PushdownState::Unsupported
+        }
+    })
+}
+
+pub(crate) fn projected(projection: &[ColumnName], name: &str) -> bool {
+    projection.iter().any(|column| column.as_str() == name)
+}
+
+fn columns() -> Vec<ColumnCapability> {
+    [
+        ("session_id", AccessClass::Safe),
+        ("native_id", AccessClass::Safe),
+        ("source_id", AccessClass::Safe),
+        ("agent_id", AccessClass::Safe),
+        ("title", AccessClass::Content),
+        ("preview", AccessClass::Content),
+        ("cwd", AccessClass::Path),
+        ("project", AccessClass::Path),
+        ("created_at", AccessClass::Safe),
+        ("updated_at", AccessClass::Safe),
+        ("archived", AccessClass::Safe),
+        ("model", AccessClass::Safe),
+        ("provider", AccessClass::Safe),
+        ("message_count", AccessClass::Safe),
+        ("tool_call_count", AccessClass::Safe),
+        ("tokens_used", AccessClass::Safe),
+        ("message_id", AccessClass::Safe),
+        ("sequence", AccessClass::Safe),
+        ("role", AccessClass::Safe),
+        ("kind", AccessClass::Safe),
+        ("content", AccessClass::Content),
+        ("content_json", AccessClass::Content),
+        ("is_error", AccessClass::Safe),
+        ("tool_call_id", AccessClass::Safe),
+        ("tool_name", AccessClass::Safe),
+        ("namespace", AccessClass::Safe),
+        ("arguments", AccessClass::ToolInput),
+        ("output", AccessClass::ToolOutput),
+        ("status", AccessClass::Safe),
+        ("started_at", AccessClass::Safe),
+        ("ended_at", AccessClass::Safe),
+        ("duration_ms", AccessClass::Safe),
+        ("exit_code", AccessClass::Safe),
+        ("usage_id", AccessClass::Safe),
+        ("bucket_start", AccessClass::Safe),
+        ("input_tokens", AccessClass::Safe),
+        ("output_tokens", AccessClass::Safe),
+        ("cached_tokens", AccessClass::Safe),
+        ("total_tokens", AccessClass::Safe),
+        ("error_count", AccessClass::Safe),
+        ("edge_id", AccessClass::Safe),
+        ("parent_session_id", AccessClass::Safe),
+        ("child_session_id", AccessClass::Safe),
+        ("edge_kind", AccessClass::Safe),
+        ("native_edge_id", AccessClass::Safe),
+    ]
+    .into_iter()
+    .map(|(name, access)| ColumnCapability {
+        name: ColumnName::new(name),
+        access,
+    })
+    .collect()
+}

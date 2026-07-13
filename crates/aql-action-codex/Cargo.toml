@@ -1,0 +1,12 @@
+[package]
+name = "aql-action-codex"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+aql-actions = { path = "../aql-actions" }
+aql-model = { path = "../aql-model" }
+
+[lints]
+workspace = true

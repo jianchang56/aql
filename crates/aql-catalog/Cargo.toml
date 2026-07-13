@@ -1,0 +1,18 @@
+[package]
+name = "aql-catalog"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+aql-adapter-api = { path = "../aql-adapter-api" }
+aql-model = { path = "../aql-model" }
+
+[dev-dependencies]
+aql-adapter-codex = { path = "../aql-adapter-codex" }
+aql-model = { path = "../aql-model" }
+aql-test-support = { path = "../aql-test-support" }
+chrono = "0.4"
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+/target/
+/.aql/
+/fixtures/generated/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+rollout-*.jsonl
+benchmarks/**/*.json
+!benchmarks/engine/*.json
+!fixtures/**/*.json
+!fixtures/**/*.jsonl
+!fixtures/**/*.sql
+.env
+.DS_Store
+__pycache__/
+*.pyc
