@@ -684,6 +684,20 @@ enum IndexCommand {
     },
 }
 
+struct IndexWriteRequest {
+    data_root: Option<PathBuf>,
+    source: Vec<String>,
+    profile: Option<String>,
+    database: Option<String>,
+    policy: IndexPolicyArg,
+    access: Vec<Access>,
+    acknowledge_persistent_sensitive_copy: bool,
+    max_records: u64,
+    max_bytes_read: u64,
+    max_index_bytes: u64,
+    timeout: Duration,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum IndexPolicyArg {
     Metadata,
@@ -2207,18 +2221,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None => (sql.as_str(), false),
             };
             let validated_sql = validate_read_only_sql(sql)?;
-            let query_budget = ResourceBudget {
+            let (query_budget, _) = execution_budget(
                 max_records,
                 max_bytes_read,
                 max_output_bytes,
                 max_single_value_bytes,
-                deadline: Some(
-                    Instant::now()
-                        .checked_add(timeout)
-                        .ok_or("timeout exceeds the supported range")?,
-                ),
-                ..ResourceBudget::default()
-            };
+                timeout,
+            )?;
             let mut options = QueryOptions {
                 access: access_grant(&access),
                 budget: query_budget,
@@ -2351,17 +2360,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             sql,
         } => {
             let validated_sql = validate_read_only_sql(&sql)?;
-            let deadline_at = Instant::now()
-                .checked_add(timeout)
-                .ok_or("timeout exceeds the supported range")?;
-            let budget = ResourceBudget {
+            let (budget, deadline_at) = execution_budget(
                 max_records,
                 max_bytes_read,
                 max_output_bytes,
                 max_single_value_bytes,
-                deadline: Some(deadline_at),
-                ..ResourceBudget::default()
-            };
+                timeout,
+            )?;
             let mut options = QueryOptions {
                 access: access_grant(&access),
                 budget: budget.clone(),
@@ -2416,17 +2421,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             timeout,
             report,
         } => {
-            let deadline_at = Instant::now()
-                .checked_add(timeout)
-                .ok_or("timeout exceeds the supported range")?;
-            let budget = ResourceBudget {
+            let (budget, deadline_at) = execution_budget(
                 max_records,
                 max_bytes_read,
                 max_output_bytes,
                 max_single_value_bytes,
-                deadline: Some(deadline_at),
-                ..ResourceBudget::default()
-            };
+                timeout,
+            )?;
             let mut options = QueryOptions {
                 access: access_grant(&access),
                 budget: budget.clone(),
@@ -2627,38 +2628,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 max_bytes_read,
                 max_index_bytes,
                 timeout,
-            } => {
-                let policy = IndexPolicy::from(policy);
-                let grant = access_grant(&access);
-                if policy == IndexPolicy::Content
-                    && (!grant.content || !acknowledge_persistent_sensitive_copy)
-                {
-                    return Err("content indexing requires --access content and --acknowledge-persistent-sensitive-copy".into());
-                }
-                if policy == IndexPolicy::Content {
-                    require_fts5()?;
-                }
-                let deadline = Instant::now()
-                    .checked_add(timeout)
-                    .ok_or("timeout exceeds the supported range")?;
-                let budget = ResourceBudget {
+            } => execute_index_write(
+                IndexWriteRequest {
+                    data_root,
+                    source,
+                    profile,
+                    database,
+                    policy,
+                    access,
+                    acknowledge_persistent_sensitive_copy,
                     max_records,
                     max_bytes_read,
-                    max_output_bytes: 0,
-                    max_single_value_bytes: 16 * 1024 * 1024,
-                    deadline: Some(deadline),
-                    ..ResourceBudget::default()
-                };
-                let inputs = resolve_source_inputs(data_root, source, profile, database)?;
-                write_index(
-                    inputs,
-                    budget,
-                    MetadataWriteMode::Build,
-                    policy,
-                    grant,
                     max_index_bytes,
-                )?;
-            }
+                    timeout,
+                },
+                MetadataWriteMode::Build,
+            )?,
             IndexCommand::Update {
                 data_root,
                 source,
@@ -2671,38 +2656,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 max_bytes_read,
                 max_index_bytes,
                 timeout,
-            } => {
-                let policy = IndexPolicy::from(policy);
-                let grant = access_grant(&access);
-                if policy == IndexPolicy::Content
-                    && (!grant.content || !acknowledge_persistent_sensitive_copy)
-                {
-                    return Err("content indexing requires --access content and --acknowledge-persistent-sensitive-copy".into());
-                }
-                if policy == IndexPolicy::Content {
-                    require_fts5()?;
-                }
-                let deadline = Instant::now()
-                    .checked_add(timeout)
-                    .ok_or("timeout exceeds the supported range")?;
-                let budget = ResourceBudget {
+            } => execute_index_write(
+                IndexWriteRequest {
+                    data_root,
+                    source,
+                    profile,
+                    database,
+                    policy,
+                    access,
+                    acknowledge_persistent_sensitive_copy,
                     max_records,
                     max_bytes_read,
-                    max_output_bytes: 0,
-                    max_single_value_bytes: 16 * 1024 * 1024,
-                    deadline: Some(deadline),
-                    ..ResourceBudget::default()
-                };
-                let inputs = resolve_source_inputs(data_root, source, profile, database)?;
-                write_index(
-                    inputs,
-                    budget,
-                    MetadataWriteMode::Update,
-                    policy,
-                    grant,
                     max_index_bytes,
-                )?;
-            }
+                    timeout,
+                },
+                MetadataWriteMode::Update,
+            )?,
             IndexCommand::Clear {
                 data_root,
                 source,
@@ -3438,6 +3407,40 @@ enum MetadataWriteMode {
     Update,
 }
 
+fn execute_index_write(
+    request: IndexWriteRequest,
+    mode: MetadataWriteMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let policy = IndexPolicy::from(request.policy);
+    let grant = access_grant(&request.access);
+    if policy == IndexPolicy::Content
+        && (!grant.content || !request.acknowledge_persistent_sensitive_copy)
+    {
+        return Err("content indexing requires --access content and --acknowledge-persistent-sensitive-copy".into());
+    }
+    if policy == IndexPolicy::Content {
+        require_fts5()?;
+    }
+    let deadline = Instant::now()
+        .checked_add(request.timeout)
+        .ok_or("timeout exceeds the supported range")?;
+    let budget = ResourceBudget {
+        max_records: request.max_records,
+        max_bytes_read: request.max_bytes_read,
+        max_output_bytes: 0,
+        max_single_value_bytes: 16 * 1024 * 1024,
+        deadline: Some(deadline),
+        ..ResourceBudget::default()
+    };
+    let inputs = resolve_source_inputs(
+        request.data_root,
+        request.source,
+        request.profile,
+        request.database,
+    )?;
+    write_index(inputs, budget, mode, policy, grant, request.max_index_bytes)
+}
+
 fn write_index(
     inputs: SourceInputs,
     budget: ResourceBudget,
@@ -4149,6 +4152,29 @@ fn access_grant(values: &[Access]) -> AccessGrant {
         }
     }
     grant
+}
+
+fn execution_budget(
+    max_records: u64,
+    max_bytes_read: u64,
+    max_output_bytes: u64,
+    max_single_value_bytes: u64,
+    timeout: Duration,
+) -> Result<(ResourceBudget, Instant), Box<dyn std::error::Error>> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("timeout exceeds the supported range")?;
+    Ok((
+        ResourceBudget {
+            max_records,
+            max_bytes_read,
+            max_output_bytes,
+            max_single_value_bytes,
+            deadline: Some(deadline),
+            ..ResourceBudget::default()
+        },
+        deadline,
+    ))
 }
 
 fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
