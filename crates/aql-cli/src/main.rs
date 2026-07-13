@@ -322,9 +322,17 @@ enum DatabaseCommand {
     /// Add a named database backed by one or more explicit Agent paths.
     Add {
         name: String,
-        #[arg(long = "agent", required = true)]
+        /// Add one atomic member as AGENT=/absolute/path; repeat for federation.
+        #[arg(
+            long = "member",
+            value_name = "AGENT=PATH",
+            conflicts_with_all = ["agent", "path"],
+            required_unless_present = "agent"
+        )]
+        member: Vec<String>,
+        #[arg(long = "agent", hide = true, requires = "path")]
         agent: Vec<String>,
-        #[arg(long = "path", required = true)]
+        #[arg(long = "path", hide = true, requires = "agent")]
         path: Vec<PathBuf>,
         #[arg(long)]
         acknowledge_persistent_path: bool,
@@ -1236,18 +1244,34 @@ fn execute_database_command(command: DatabaseCommand) -> Result<(), Box<dyn std:
         DatabaseCommand::Discover => discover_sources(),
         DatabaseCommand::Add {
             name,
+            member,
             agent,
             path,
             acknowledge_persistent_path,
         } => {
-            if agent.len() != path.len() {
-                return Err(
-                    "database add requires the same number of --agent and --path values".into(),
-                );
-            }
-            let source = agent
+            let members = if member.is_empty() {
+                if agent.len() != path.len() {
+                    return Err(
+                        "database add requires the same number of --agent and --path values".into(),
+                    );
+                }
+                agent.into_iter().zip(path).collect::<Vec<_>>()
+            } else {
+                member
+                    .into_iter()
+                    .map(|member| {
+                        let (agent, path) = member
+                            .split_once('=')
+                            .ok_or("database member must use AGENT=/absolute/path syntax")?;
+                        if agent.is_empty() || path.is_empty() {
+                            return Err("database member agent and path cannot be empty".into());
+                        }
+                        Ok((agent.to_string(), PathBuf::from(path)))
+                    })
+                    .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
+            };
+            let source = members
                 .into_iter()
-                .zip(path)
                 .map(
                     |(agent, path)| -> Result<String, Box<dyn std::error::Error>> {
                         let adapter = match agent.as_str() {
@@ -4560,7 +4584,17 @@ fn public_command(source: &clap::Command) -> clap::Command {
         // This command tree is used only to render public completion and man
         // output. Public database selection is required because hidden
         // compatibility alternatives are intentionally omitted here.
-        let argument = if argument.get_id() == "database" && source.get_name() != "shell" {
+        let argument = if argument.get_id() == "member" {
+            let mut member = clap::Arg::new("member")
+                .long("member")
+                .value_name("AGENT=PATH")
+                .action(clap::ArgAction::Append)
+                .required(true);
+            if let Some(help) = argument.get_help() {
+                member = member.help(help.clone());
+            }
+            member
+        } else if argument.get_id() == "database" && source.get_name() != "shell" {
             let mut database = clap::Arg::new("database")
                 .short('d')
                 .long("database")
@@ -4905,6 +4939,32 @@ mod tests {
             panic!("query command expected");
         };
         assert_eq!(database.as_deref(), Some("codex"));
+        assert!(
+            Cli::try_parse_from([
+                "aql",
+                "database",
+                "add",
+                "work",
+                "--member",
+                "codex=/synthetic/codex",
+                "--acknowledge-persistent-path",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "aql",
+                "database",
+                "add",
+                "work",
+                "--agent",
+                "codex",
+                "--path",
+                "/synthetic/codex",
+                "--acknowledge-persistent-path",
+            ])
+            .is_ok()
+        );
         assert!(
             Cli::try_parse_from([
                 "aql",

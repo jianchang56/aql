@@ -114,8 +114,7 @@ aql query -d all --output json \
 
 ```bash
 aql database add work \
-  --agent codex \
-  --path /absolute/path/to/.codex \
+  --member codex=/absolute/path/to/.codex \
   --acknowledge-persistent-path
 
 aql query -d work 'SELECT COUNT(*) FROM sessions'

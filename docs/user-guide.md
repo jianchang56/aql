@@ -48,9 +48,9 @@ Shell 支持多行 SELECT/CTE、`EXPLAIN SELECT`、表/字段/数据库补全，
 
 ```bash
 aql database add work \
-  --agent claude --path /absolute/path/to/.claude \
-  --agent codex --path /absolute/path/to/.codex \
-  --agent opencode --path /absolute/path/to/opencode \
+  --member claude=/absolute/path/to/.claude \
+  --member codex=/absolute/path/to/.codex \
+  --member opencode=/absolute/path/to/opencode \
   --acknowledge-persistent-path
 
 aql database list
