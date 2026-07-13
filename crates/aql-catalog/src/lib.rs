@@ -96,6 +96,15 @@ fn merge_session(
     );
     merge_field(
         &existing.session_id,
+        "project",
+        &mut existing.project,
+        incoming.project,
+        authority(&existing_authority, "project"),
+        authority(&incoming_authority, "project"),
+        warnings,
+    );
+    merge_field(
+        &existing.session_id,
         "model",
         &mut existing.model,
         incoming.model,
@@ -137,6 +146,42 @@ fn merge_session(
         incoming.archived,
         authority(&existing_authority, "archived"),
         authority(&incoming_authority, "archived"),
+        warnings,
+    );
+    merge_field(
+        &existing.session_id,
+        "status",
+        &mut existing.status,
+        incoming.status,
+        authority(&existing_authority, "status"),
+        authority(&incoming_authority, "status"),
+        warnings,
+    );
+    merge_field(
+        &existing.session_id,
+        "message_count",
+        &mut existing.message_count,
+        incoming.message_count,
+        authority(&existing_authority, "message_count"),
+        authority(&incoming_authority, "message_count"),
+        warnings,
+    );
+    merge_field(
+        &existing.session_id,
+        "tool_call_count",
+        &mut existing.tool_call_count,
+        incoming.tool_call_count,
+        authority(&existing_authority, "tool_call_count"),
+        authority(&incoming_authority, "tool_call_count"),
+        warnings,
+    );
+    merge_field(
+        &existing.session_id,
+        "tokens_used",
+        &mut existing.tokens_used,
+        incoming.tokens_used,
+        authority(&existing_authority, "tokens_used"),
+        authority(&incoming_authority, "tokens_used"),
         warnings,
     );
     existing.snapshot_state = match (existing.snapshot_state, incoming.snapshot_state) {
@@ -185,13 +230,15 @@ fn authority_map(record: &SessionRecord) -> BTreeMap<String, u8> {
         .iter()
         .map(|(field, items)| {
             let authority = items
-                .first()
-                .map_or(0, |item| match item.source_kind.as_str() {
+                .iter()
+                .map(|item| match item.source_kind.as_str() {
                     "state_database" => 30,
                     "session_index" => 20,
                     "rollout" => 10,
                     _ => 0,
-                });
+                })
+                .max()
+                .unwrap_or(0);
             (field.clone(), authority)
         })
         .collect()
@@ -294,5 +341,46 @@ mod tests {
         let result = Catalog.reconcile_sessions(vec![CanonicalRecord::Session(stale)]);
         assert_eq!(result.records[0].snapshot_state, SnapshotState::Stale);
         assert_eq!(result.warnings[0].kind, CatalogWarningKind::StaleSnapshot);
+    }
+
+    #[test]
+    fn reconciliation_merges_every_public_session_field() {
+        let mut sparse = session("codex:profile-a", "session-1", "Synthetic", "session_index");
+        sparse.project = None;
+        sparse.status = None;
+        sparse.message_count = None;
+        sparse.tool_call_count = None;
+        sparse.tokens_used = None;
+        let mut complete = sparse.clone();
+        complete.project = Some("synthetic-project".to_string());
+        complete.status = Some("completed".to_string());
+        complete.message_count = Some(3);
+        complete.tool_call_count = Some(2);
+        complete.tokens_used = Some(42);
+
+        let result = Catalog.reconcile_sessions(vec![
+            CanonicalRecord::Session(sparse),
+            CanonicalRecord::Session(complete),
+        ]);
+        let merged = &result.records[0];
+        assert_eq!(merged.project.as_deref(), Some("synthetic-project"));
+        assert_eq!(merged.status.as_deref(), Some("completed"));
+        assert_eq!(merged.message_count, Some(3));
+        assert_eq!(merged.tool_call_count, Some(2));
+        assert_eq!(merged.tokens_used, Some(42));
+    }
+
+    #[test]
+    fn merged_authority_uses_the_highest_observed_provenance() {
+        let index = session("codex:profile-a", "session-1", "Index", "session_index");
+        let database = session("codex:profile-a", "session-1", "Database", "state_database");
+        let rollout = session("codex:profile-a", "session-1", "Rollout", "rollout");
+
+        let result = Catalog.reconcile_sessions(vec![
+            CanonicalRecord::Session(index),
+            CanonicalRecord::Session(database),
+            CanonicalRecord::Session(rollout),
+        ]);
+        assert_eq!(result.records[0].title.as_deref(), Some("Database"));
     }
 }

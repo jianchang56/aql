@@ -2559,19 +2559,84 @@ fn session_identity_predicate(predicate: &aql_adapter_api::Predicate) -> bool {
 }
 
 fn retained_session_bytes(record: &CanonicalRecord) -> Result<usize> {
-    if !matches!(record, CanonicalRecord::Session(_)) {
+    let CanonicalRecord::Session(session) = record else {
         return Err(DataFusionError::Execution(
             "sessions adapter produced a non-session record".to_string(),
         ));
+    };
+    let mut bytes = std::mem::size_of_val(session);
+    for value in [
+        session.session_id.as_str(),
+        session.native_id.as_str(),
+        session.source_id.as_str(),
+        &session.agent_id,
+    ] {
+        bytes = bytes.saturating_add(value.len());
     }
-    let serialized = serde_json::to_vec(record).map_err(|error| {
-        DataFusionError::Execution(format!("session memory accounting failed: {error}"))
-    })?;
-    serialized
-        .len()
-        .checked_mul(4)
-        .and_then(|bytes| bytes.checked_add(4096))
-        .ok_or_else(|| DataFusionError::ResourcesExhausted("session record is too large".into()))
+    for value in [
+        &session.title,
+        &session.preview,
+        &session.cwd,
+        &session.project,
+        &session.model,
+        &session.provider,
+        &session.status,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        bytes = bytes.saturating_add(value.capacity());
+    }
+    for (field, provenance) in &session.provenance {
+        bytes = bytes
+            .saturating_add(std::mem::size_of::<(String, Vec<aql_model::Provenance>)>())
+            .saturating_add(3 * std::mem::size_of::<usize>())
+            .saturating_add(field.capacity())
+            .saturating_add(
+                provenance
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<aql_model::Provenance>()),
+            );
+        for item in provenance {
+            bytes = bytes
+                .saturating_add(item.source_id.as_str().len())
+                .saturating_add(item.source_kind.capacity())
+                .saturating_add(item.source_locator.capacity())
+                .saturating_add(item.source_version.as_ref().map_or(0, String::capacity))
+                .saturating_add(item.watermark.as_ref().map_or(0, String::capacity));
+        }
+    }
+    for (key, value) in &session.extensions {
+        bytes = bytes
+            .saturating_add(std::mem::size_of::<(String, serde_json::Value)>())
+            .saturating_add(3 * std::mem::size_of::<usize>())
+            .saturating_add(key.capacity())
+            .saturating_add(json_retained_bytes(value));
+    }
+    Ok(bytes)
+}
+
+fn json_retained_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
+        serde_json::Value::String(value) => value.capacity(),
+        serde_json::Value::Array(values) => values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<serde_json::Value>())
+            .saturating_add(
+                values
+                    .iter()
+                    .map(json_retained_bytes)
+                    .fold(0, usize::saturating_add),
+            ),
+        serde_json::Value::Object(values) => values.iter().fold(0, |bytes, (key, value)| {
+            bytes
+                .saturating_add(std::mem::size_of::<(String, serde_json::Value)>())
+                .saturating_add(3 * std::mem::size_of::<usize>())
+                .saturating_add(key.capacity())
+                .saturating_add(json_retained_bytes(value))
+        }),
+    }
 }
 
 fn table_capability(table: TableName) -> &'static str {

@@ -4258,26 +4258,8 @@ fn load_or_create_installation_salt(
     state_root: &std::path::Path,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     use rustix::fs::{Mode, OFlags};
-    use std::os::unix::fs::DirBuilderExt;
 
-    let parent = state_root
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    fs::create_dir_all(parent)?;
-    let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700);
-    match builder.create(state_root) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    let directory = rustix::fs::openat(
-        rustix::fs::CWD,
-        state_root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
+    let directory = open_or_create_private_state_root(state_root)?;
     let directory_stat = rustix::fs::fstat(&directory)?;
     if rustix::fs::FileType::from_raw_mode(directory_stat.st_mode)
         != rustix::fs::FileType::Directory
@@ -4321,6 +4303,51 @@ fn load_or_create_installation_salt(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+#[cfg(unix)]
+fn open_or_create_private_state_root(
+    state_root: &std::path::Path,
+) -> Result<std::os::fd::OwnedFd, Box<dyn std::error::Error>> {
+    use rustix::fs::{Mode, OFlags};
+
+    if !state_root.is_absolute()
+        || state_root.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err("AQL state root must be normalized and absolute".into());
+    }
+    let components = state_root
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err("AQL state root cannot be the filesystem root".into());
+    }
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = rustix::fs::openat(rustix::fs::CWD, "/", flags, Mode::empty())?;
+    for component in components {
+        match rustix::fs::openat(&directory, component, flags, Mode::empty()) {
+            Ok(next) => directory = next,
+            Err(error) if error == rustix::io::Errno::NOENT => {
+                match rustix::fs::mkdirat(&directory, component, Mode::from_raw_mode(0o700)) {
+                    Ok(()) => {}
+                    Err(error) if error == rustix::io::Errno::EXIST => {}
+                    Err(error) => return Err(error.into()),
+                }
+                directory = rustix::fs::openat(&directory, component, flags, Mode::empty())?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(directory)
 }
 
 #[cfg(unix)]
@@ -5285,6 +5312,7 @@ mod tests {
             rand::random::<u64>()
         ));
         fs::create_dir(&root).expect("create synthetic parent");
+        let root = root.canonicalize().expect("canonicalize synthetic parent");
         let state_root = root.join("state");
         let first = load_or_create_installation_salt(&state_root).expect("salt is created");
         let second = load_or_create_installation_salt(&state_root).expect("salt is reloaded");
@@ -5317,6 +5345,13 @@ mod tests {
             fs::read(&outside).expect("outside file remains"),
             [7_u8; 32]
         );
+
+        let real_parent = root.join("real-parent");
+        fs::create_dir(&real_parent).expect("create real parent");
+        let linked_parent = root.join("linked-parent");
+        symlink(&real_parent, &linked_parent).expect("create intermediate symlink");
+        assert!(load_or_create_installation_salt(&linked_parent.join("state")).is_err());
+        assert!(!real_parent.join("state").exists());
         fs::remove_dir_all(root).expect("clean synthetic state");
     }
 

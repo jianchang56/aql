@@ -462,6 +462,8 @@ pub fn publish(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 
 #[derive(Clone)]
 struct Identity(PathBuf, u64, u64);
+#[derive(Clone, Copy)]
+struct ManagedFileIdentity(u64, u64);
 fn prefix(path: &Path, exists: bool) -> Result<Vec<Identity>> {
     if !path.is_absolute()
         || path == Path::new("/")
@@ -491,13 +493,10 @@ fn prefix(path: &Path, exists: bool) -> Result<Vec<Identity>> {
     let aql_config = std::env::var_os("AQL_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| config.join("aql"));
-    for protected in [
-        home.join(".codex"),
-        home.join(".kimi-code"),
-        data.join("opencode"),
-        state,
-        aql_config,
-    ] {
+    for root in [&home, &data, &config, &state, &aql_config] {
+        validate_environment_root(root)?;
+    }
+    for protected in protected_roots(&home, &data, state, aql_config) {
         if path.starts_with(&protected) || protected.starts_with(path) {
             return fail("prefix overlaps protected data");
         }
@@ -536,6 +535,28 @@ fn prefix(path: &Path, exists: bool) -> Result<Vec<Identity>> {
     }
     Ok(ids)
 }
+
+fn validate_environment_root(path: &Path) -> Result<()> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return fail("environment data roots must be normalized and absolute");
+    }
+    Ok(())
+}
+
+fn protected_roots(home: &Path, data: &Path, state: PathBuf, aql_config: PathBuf) -> Vec<PathBuf> {
+    vec![
+        home.join(".claude"),
+        home.join(".codex"),
+        home.join(".kimi-code"),
+        data.join("opencode"),
+        state,
+        aql_config,
+    ]
+}
 fn revalidate(ids: &[Identity]) -> Result<()> {
     for Identity(path, dev, ino) in ids {
         let m = fs::symlink_metadata(path)?;
@@ -572,6 +593,46 @@ fn relative_parent(root: &OwnedFd, relative: &Path) -> Result<(OwnedFd, OsString
         descriptor = openat(&descriptor, Path::new(*name), flags, Mode::empty())?;
     }
     Ok((descriptor, name.to_os_string()))
+}
+
+fn read_managed_file(
+    root: &OwnedFd,
+    relative: &Path,
+    limit: u64,
+) -> Result<(Vec<u8>, rustix::fs::Stat, ManagedFileIdentity)> {
+    let (parent, name) = relative_parent(root, relative)?;
+    let descriptor = openat(
+        &parent,
+        &name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    let before = fstat(&descriptor)?;
+    if !FileType::from_raw_mode(before.st_mode).is_file()
+        || before.st_uid != rustix::process::getuid().as_raw()
+        || before.st_size < 0
+        || u64::try_from(before.st_size).map_or(true, |size| size > limit)
+    {
+        return fail("unsafe installed file");
+    }
+    let mut file = File::from(descriptor);
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    let identity = ManagedFileIdentity(
+        u64::try_from(before.st_dev).map_err(|_| Error::new("invalid installed file device"))?,
+        before.st_ino,
+    );
+    if after.dev() != identity.0
+        || after.ino() != before.st_ino
+        || after.len() != u64::try_from(before.st_size).unwrap_or(u64::MAX)
+        || bytes.len() as u64 != after.len()
+    {
+        return fail("installed file changed while reading");
+    }
+    Ok((bytes, before, identity))
 }
 fn files() -> Vec<String> {
     let mut out = PAYLOAD
@@ -727,18 +788,80 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
     {
         return fail("invalid uninstall allowlist");
     }
+    let mut identities = BTreeMap::new();
+    identities.insert(
+        "UNINSTALL_MANIFEST".to_string(),
+        ManagedFileIdentity(
+            u64::try_from(manifest_stat.st_dev)
+                .map_err(|_| Error::new("invalid uninstall manifest device"))?,
+            manifest_stat.st_ino,
+        ),
+    );
+    let (installed_manifest_bytes, installed_manifest_stat, installed_manifest_identity) =
+        read_managed_file(&root, Path::new("manifest.json"), 1024 * 1024)?;
+    if installed_manifest_stat.st_mode & 0o777 != 0o644 {
+        return fail("installed manifest mode changed");
+    }
+    let installed_manifest: Manifest = serde_json::from_slice(&installed_manifest_bytes)?;
+    if canonical(&installed_manifest)? != installed_manifest_bytes
+        || installed_manifest.schema_version != "aql-release-v1"
+        || installed_manifest.package != PACKAGE
+        || installed_manifest.version != parsed.version
+        || installed_manifest.target != parsed.target
+        || installed_manifest.build_metadata != metadata(&parsed.version, &parsed.target)
+        || installed_manifest.entries.len() != PAYLOAD.len()
+    {
+        return fail("invalid installed manifest");
+    }
+    identities.insert("manifest.json".to_string(), installed_manifest_identity);
+    let entries = installed_manifest
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    if entries.len() != PAYLOAD.len() {
+        return fail("invalid installed manifest entries");
+    }
+    for (relative, mode) in PAYLOAD {
+        let entry = entries
+            .get(relative)
+            .ok_or_else(|| Error::new("installed manifest entry is missing"))?;
+        if entry.mode != format!("{mode:04o}") || entry.size as u64 > MAX_ARCHIVE {
+            return fail("installed manifest entry is invalid");
+        }
+        let (content, stat, identity) = read_managed_file(&root, Path::new(relative), MAX_ARCHIVE)?;
+        if u32::from(stat.st_mode & 0o777) != mode
+            || content.len() != entry.size
+            || hex::encode(Sha256::digest(&content)) != entry.sha256
+        {
+            return fail("installed file no longer matches the release manifest");
+        }
+        identities.insert(relative.to_string(), identity);
+    }
     revalidate(&ids)?;
     for relative in &parsed.files {
         let (parent, name) = relative_parent(&root, Path::new(relative))?;
         let stat = statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if !FileType::from_raw_mode(stat.st_mode).is_file() {
+        let expected = identities
+            .get(relative)
+            .ok_or_else(|| Error::new("installed file identity is missing"))?;
+        if !FileType::from_raw_mode(stat.st_mode).is_file()
+            || u64::try_from(stat.st_dev).ok() != Some(expected.0)
+            || stat.st_ino != expected.1
+        {
             return fail("installed file was replaced");
         }
     }
     for relative in parsed.files.iter().rev() {
         let (parent, name) = relative_parent(&root, Path::new(relative))?;
         let stat = statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if !FileType::from_raw_mode(stat.st_mode).is_file() {
+        let expected = identities
+            .get(relative)
+            .ok_or_else(|| Error::new("installed file identity is missing"))?;
+        if !FileType::from_raw_mode(stat.st_mode).is_file()
+            || u64::try_from(stat.st_dev).ok() != Some(expected.0)
+            || stat.st_ino != expected.1
+        {
             return fail("installed file changed during uninstall");
         }
         unlinkat(&parent, &name, AtFlags::empty())?;
@@ -931,5 +1054,58 @@ mod tests {
             fs::read(destination.join("foreign")).expect("foreign remains"),
             b"foreign\n"
         );
+    }
+
+    #[test]
+    fn uninstall_refuses_replaced_managed_files() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let parent = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical temporary");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("private parent");
+        let bytes = archive(&valid_entries());
+        let (archive_path, digest) = write_archive(&parent, "release.tar.gz", &bytes);
+        let destination = parent.join("installed");
+        install(
+            &archive_path,
+            &digest,
+            "1.2.3",
+            "aarch64-macos",
+            &destination,
+            false,
+        )
+        .expect("install");
+        fs::write(destination.join("bin/aql"), b"foreign replacement\n")
+            .expect("replace managed file");
+
+        assert!(uninstall(&destination).is_err());
+        assert_eq!(
+            fs::read(destination.join("bin/aql")).expect("replacement remains"),
+            b"foreign replacement\n"
+        );
+    }
+
+    #[test]
+    fn install_prefixes_cannot_overlap_any_agent_store() {
+        let home = Path::new("/synthetic/home");
+        let data = Path::new("/synthetic/data");
+        let roots = protected_roots(
+            home,
+            data,
+            PathBuf::from("/synthetic/state/aql"),
+            PathBuf::from("/synthetic/config/aql"),
+        );
+        for protected in [
+            home.join(".claude"),
+            home.join(".codex"),
+            home.join(".kimi-code"),
+            data.join("opencode"),
+        ] {
+            assert!(roots.contains(&protected));
+        }
+        assert!(validate_environment_root(Path::new("relative/home")).is_err());
+        assert!(validate_environment_root(Path::new("/synthetic/../home")).is_err());
+        assert!(validate_environment_root(Path::new("/synthetic/home")).is_ok());
     }
 }
