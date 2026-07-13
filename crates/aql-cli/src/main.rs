@@ -1743,8 +1743,9 @@ async fn run_shell(initial_database: Option<String>) -> Result<(), Box<dyn std::
             editor_config,
         )?;
     editor.set_helper(Some(ShellHelper::new(&databases)));
-    println!("AQL interactive shell. End statements with ';'.");
-    println!("Run SHOW DATABASES; then USE <database>;");
+    for line in shell_welcome(&databases, selected_database.as_deref()) {
+        println!("{line}");
+    }
     loop {
         let prompt = if buffer.is_empty() {
             format!("aql[{}]> ", selected_database.as_deref().unwrap_or("none"))
@@ -1902,6 +1903,24 @@ async fn run_shell(initial_database: Option<String>) -> Result<(), Box<dyn std::
             }
         }
     }
+}
+
+fn shell_welcome(databases: &[String], selected_database: Option<&str>) -> Vec<String> {
+    let mut lines = vec![
+        "AQL interactive shell. End statements with ';'.".to_string(),
+        format!("Known databases: {}", databases.join(", ")),
+    ];
+    if let Some(database) = selected_database {
+        lines.push(format!("Selected database: {database}"));
+        lines.push("Next: SELECT * FROM sessions LIMIT 10;".to_string());
+    } else {
+        lines.extend([
+            "1. SHOW DATABASES;".to_string(),
+            "2. USE <database>;".to_string(),
+            "3. SELECT * FROM sessions LIMIT 10;".to_string(),
+        ]);
+    }
+    lines
 }
 
 #[tokio::main]
@@ -4977,6 +4996,26 @@ mod tests {
             .expect("duplicate grant is harmless");
         assert_eq!(access, vec![Access::Content, Access::ToolInput]);
         assert!(grant_shell_access(&shell_words("grant secret for session"), &mut access).is_err());
+    }
+
+    #[test]
+    fn shell_welcome_guides_selection_without_choosing_a_default() {
+        let databases = vec!["claude".to_string(), "codex".to_string()];
+        let welcome = shell_welcome(&databases, None);
+        assert!(welcome.iter().any(|line| line == "1. SHOW DATABASES;"));
+        assert!(welcome.iter().any(|line| line == "2. USE <database>;"));
+        assert!(
+            !welcome
+                .iter()
+                .any(|line| line.starts_with("Selected database:"))
+        );
+
+        let selected = shell_welcome(&databases, Some("codex"));
+        assert!(
+            selected
+                .iter()
+                .any(|line| line == "Selected database: codex")
+        );
     }
 
     #[test]
