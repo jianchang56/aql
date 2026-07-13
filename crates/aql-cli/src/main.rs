@@ -4073,27 +4073,28 @@ fn access_grant(values: &[Access]) -> AccessGrant {
     grant
 }
 
-fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
     if let Some(aql_engine_datafusion::QueryError::AccessDenied(access)) =
         error.downcast_ref::<aql_engine_datafusion::QueryError>()
     {
         return match *access {
-            "content" => Some("add `--access content` only when the query genuinely needs Content"),
-            "path" => Some("add `--access path` only when the query genuinely needs Path"),
-            "tool-input" => {
-                Some("add `--access tool-input` only when the query genuinely needs tool input")
-            }
-            "tool-output" => {
-                Some("add `--access tool-output` only when the query genuinely needs tool output")
-            }
-            _ => Some("run `aql schema <table>` and add only the required temporary access grant"),
+            "content" => Some(access_retry_hint("content", "Content")),
+            "path" => Some(access_retry_hint("path", "Path")),
+            "tool-input" => Some(access_retry_hint("tool-input", "tool input")),
+            "tool-output" => Some(access_retry_hint("tool-output", "tool output")),
+            _ => Some(
+                "run `aql schema <table>` and add only the required temporary access grant"
+                    .to_string(),
+            ),
         };
     }
     if matches!(
         error.downcast_ref::<aql_adapter_api::AdapterError>(),
         Some(aql_adapter_api::AdapterError::AccessDenied { .. })
     ) {
-        return Some("run `aql schema <table>` and add only the required temporary access grant");
+        return Some(
+            "run `aql schema <table>` and add only the required temporary access grant".to_string(),
+        );
     }
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("no database selected")
@@ -4101,21 +4102,62 @@ fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<&'static str>
         || message.contains("unknown database")
         || message.contains("unknown or unavailable database")
     {
-        Some("run `aql database list`, then select one with `-d <database>`")
+        Some("run `aql database list`, then select one with `-d <database>`".to_string())
     } else if message.contains("requires --access content") {
-        Some("add `--access content` only when the query genuinely needs Content")
+        Some(access_retry_hint("content", "Content"))
     } else if message.contains("requires --access path") {
-        Some("add `--access path` only when the query genuinely needs Path")
+        Some(access_retry_hint("path", "Path"))
     } else if message.contains("rebuild") && message.contains("index") {
-        Some(
-            "run `aql index build -d <database> --policy metadata`; Content search requires explicit Content indexing",
-        )
+        Some("run `aql index build -d <database> --policy metadata`; Content search requires explicit Content indexing".to_string())
     } else if message.contains("sql input") || message.contains("one sql input") {
-        Some("pass SQL directly, with `--file query.sql`, or with `--stdin`")
+        Some("pass SQL directly, with `--file query.sql`, or with `--stdin`".to_string())
     } else if message.contains("profile missing") {
-        Some("run `aql database list` or create it with `aql database add`")
+        Some("run `aql database list` or create it with `aql database add`".to_string())
     } else {
         None
+    }
+}
+
+fn access_retry_hint(access: &str, label: &str) -> String {
+    if io::stderr().is_terminal()
+        && let Some(command) = retry_query_command(access)
+    {
+        return format!("retry only if {label} is genuinely needed: `{command}`");
+    }
+    format!("retry with `--access {access}` only when the query genuinely needs {label}")
+}
+
+fn retry_query_command(access: &str) -> Option<String> {
+    let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let query_index = arguments.iter().position(|argument| argument == "query")?;
+    if arguments
+        .windows(2)
+        .any(|pair| pair == ["--access", access])
+    {
+        return None;
+    }
+    arguments.splice(
+        query_index + 1..query_index + 1,
+        ["--access".to_string(), access.to_string()],
+    );
+    Some(
+        std::iter::once("aql".to_string())
+            .chain(arguments)
+            .map(|argument| shell_quote(&argument))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'=' | b':')
+        })
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
 }
 
@@ -5163,6 +5205,8 @@ mod tests {
         let index = io::Error::other("index rebuild required");
         assert_eq!(error_category(&index), "index_missing");
         assert!(error_hint(&index).is_some());
+        assert_eq!(shell_quote("SELECT 1"), "'SELECT 1'");
+        assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
     }
 
     #[test]
