@@ -32,7 +32,7 @@ use aql_index::{
     TOKENIZER_VERSION, WatermarkComponent, require_fts5,
 };
 use aql_model::{AccessClass, CanonicalRecord, EntityId, SourceId, installation_scoped_hmac};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use futures::StreamExt;
@@ -71,6 +71,28 @@ struct Cli {
     quiet: bool,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Args, Clone)]
+struct ExecutionLimits {
+    /// Stop after scanning this many canonical records across the complete operation.
+    #[arg(long, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
+    max_records: u64,
+    /// Maximum source bytes that all adapters may read.
+    #[arg(long, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
+    max_bytes_read: u64,
+    /// Maximum bytes that may be published.
+    #[arg(long, env = "AQL_MAX_OUTPUT_BYTES", default_value = "64MiB", value_parser = parse_byte_size)]
+    max_output_bytes: u64,
+    /// Reject any single sensitive value larger than this limit.
+    #[arg(long, env = "AQL_MAX_SINGLE_VALUE_BYTES", default_value = "16MiB", value_parser = parse_byte_size)]
+    max_single_value_bytes: u64,
+    /// Maximum in-memory execution working set.
+    #[arg(long, env = "AQL_MAX_MEMORY_BYTES", default_value = "256MiB", value_parser = parse_usize_byte_size)]
+    max_memory_bytes: usize,
+    /// Cancel the complete operation when this duration elapses.
+    #[arg(long, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
+    timeout: Duration,
 }
 
 #[derive(Subcommand)]
@@ -138,24 +160,8 @@ enum Command {
         /// Grant access to sensitive column classes for this query only; repeat as needed.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
-        /// Stop after scanning this many canonical records across the complete query.
-        #[arg(long, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
-        max_records: u64,
-        /// Maximum source bytes that all adapters may read for this query.
-        #[arg(long, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
-        max_bytes_read: u64,
-        /// Maximum bytes that may be published to stdout.
-        #[arg(long, env = "AQL_MAX_OUTPUT_BYTES", default_value = "64MiB", value_parser = parse_byte_size)]
-        max_output_bytes: u64,
-        /// Reject any single sensitive value larger than this limit.
-        #[arg(long, env = "AQL_MAX_SINGLE_VALUE_BYTES", default_value = "16MiB", value_parser = parse_byte_size)]
-        max_single_value_bytes: u64,
-        /// Maximum in-memory query execution working set.
-        #[arg(long, env = "AQL_MAX_MEMORY_BYTES", default_value = "256MiB", value_parser = parse_usize_byte_size)]
-        max_memory_bytes: usize,
-        /// Cancel the complete query when this duration elapses.
-        #[arg(long, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
-        timeout: Duration,
+        #[command(flatten)]
+        limits: ExecutionLimits,
         /// Print the authorized, redacted query plan without executing the query.
         #[arg(long)]
         plan: bool,
@@ -192,24 +198,8 @@ enum Command {
         /// Grant access to sensitive column classes for this export only; repeat as needed.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
-        /// Stop after scanning this many canonical records across the complete export.
-        #[arg(long, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
-        max_records: u64,
-        /// Maximum source bytes that all adapters may read.
-        #[arg(long, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
-        max_bytes_read: u64,
-        /// Maximum bytes in the complete portable JSON export.
-        #[arg(long, env = "AQL_MAX_OUTPUT_BYTES", default_value = "64MiB", value_parser = parse_byte_size)]
-        max_output_bytes: u64,
-        /// Reject any single sensitive value larger than this limit.
-        #[arg(long, env = "AQL_MAX_SINGLE_VALUE_BYTES", default_value = "16MiB", value_parser = parse_byte_size)]
-        max_single_value_bytes: u64,
-        /// Maximum in-memory query execution working set.
-        #[arg(long, env = "AQL_MAX_MEMORY_BYTES", default_value = "256MiB", value_parser = parse_usize_byte_size)]
-        max_memory_bytes: usize,
-        /// Cancel the complete export when this duration elapses.
-        #[arg(long, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
-        timeout: Duration,
+        #[command(flatten)]
+        limits: ExecutionLimits,
         /// Atomically write the export to this new local file instead of stdout.
         #[arg(long = "output-file", visible_alias = "file")]
         file: Option<PathBuf>,
@@ -234,24 +224,8 @@ enum Command {
         /// Grant access to sensitive column classes for this report only; repeat as needed.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
-        /// Stop after scanning this many canonical records across all report queries.
-        #[arg(long, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
-        max_records: u64,
-        /// Maximum source bytes that all report queries may read.
-        #[arg(long, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
-        max_bytes_read: u64,
-        /// Maximum rendered Markdown bytes.
-        #[arg(long, env = "AQL_MAX_OUTPUT_BYTES", default_value = "64MiB", value_parser = parse_byte_size)]
-        max_output_bytes: u64,
-        /// Reject any single sensitive value larger than this limit.
-        #[arg(long, env = "AQL_MAX_SINGLE_VALUE_BYTES", default_value = "16MiB", value_parser = parse_byte_size)]
-        max_single_value_bytes: u64,
-        /// Maximum in-memory execution working set.
-        #[arg(long, env = "AQL_MAX_MEMORY_BYTES", default_value = "256MiB", value_parser = parse_usize_byte_size)]
-        max_memory_bytes: usize,
-        /// Cancel the complete report when this duration elapses.
-        #[arg(long, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
-        timeout: Duration,
+        #[command(flatten)]
+        limits: ExecutionLimits,
         #[command(subcommand)]
         report: ReportKind,
     },
@@ -2013,12 +1987,14 @@ async fn run_shell(initial_database: Option<String>) -> Result<(), Box<dyn std::
                             csv_formulas: CsvFormulaMode::Safe,
                             acknowledge_raw_csv_formulas: false,
                             access: access.clone(),
-                            max_records: 100_000,
-                            max_bytes_read: 256 * 1024 * 1024,
-                            max_output_bytes: 64 * 1024 * 1024,
-                            max_single_value_bytes: 16 * 1024 * 1024,
-                            max_memory_bytes: 256 * 1024 * 1024,
-                            timeout: Duration::from_secs(30),
+                            limits: ExecutionLimits {
+                                max_records: 100_000,
+                                max_bytes_read: 256 * 1024 * 1024,
+                                max_output_bytes: 64 * 1024 * 1024,
+                                max_single_value_bytes: 16 * 1024 * 1024,
+                                max_memory_bytes: 256 * 1024 * 1024,
+                                timeout: Duration::from_secs(30),
+                            },
                             plan: false,
                             metadata: false,
                             shell_summary: true,
@@ -2205,12 +2181,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             csv_formulas,
             acknowledge_raw_csv_formulas,
             access,
-            max_records,
-            max_bytes_read,
-            max_output_bytes,
-            max_single_value_bytes,
-            max_memory_bytes,
-            timeout,
+            limits,
             plan,
             metadata,
             shell_summary,
@@ -2218,6 +2189,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             file,
             stdin,
         } => {
+            let ExecutionLimits {
+                max_records,
+                max_bytes_read,
+                max_output_bytes,
+                max_single_value_bytes,
+                max_memory_bytes,
+                timeout,
+            } = limits;
             validate_csv_options(output, csv_formulas, acknowledge_raw_csv_formulas)?;
             let sql = read_sql_input(sql, file, stdin)?;
             let query_started = Instant::now();
@@ -2356,15 +2335,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             profile,
             database,
             access,
-            max_records,
-            max_bytes_read,
-            max_output_bytes,
-            max_single_value_bytes,
-            max_memory_bytes,
-            timeout,
+            limits,
             file,
             sql,
         } => {
+            let ExecutionLimits {
+                max_records,
+                max_bytes_read,
+                max_output_bytes,
+                max_single_value_bytes,
+                max_memory_bytes,
+                timeout,
+            } = limits;
             let validated_sql = validate_read_only_sql(&sql)?;
             let (budget, deadline_at) = execution_budget(
                 max_records,
@@ -2419,14 +2401,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             profile,
             database,
             access,
-            max_records,
-            max_bytes_read,
-            max_output_bytes,
-            max_single_value_bytes,
-            max_memory_bytes,
-            timeout,
+            limits,
             report,
         } => {
+            let ExecutionLimits {
+                max_records,
+                max_bytes_read,
+                max_output_bytes,
+                max_single_value_bytes,
+                max_memory_bytes,
+                timeout,
+            } = limits;
             let (budget, deadline_at) = execution_budget(
                 max_records,
                 max_bytes_read,
