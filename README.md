@@ -198,8 +198,8 @@ aql examples token-usage
 
 # 导出和报告
 aql export -d codex \
-  --file ./sessions.json 'SELECT * FROM sessions'
-aql report -d codex summary
+  --output-file ./sessions.json 'SELECT * FROM sessions'
+aql report summary -d codex
 
 # 自动补全和 man page
 aql completions zsh > ./_aql

@@ -211,14 +211,16 @@ aql query -d codex \
 非交互 Schema 和示例：
 
 ```bash
-aql schema
 aql schema --list
 aql schema sessions
+aql schema
 aql schema --output json
 aql examples
 aql examples --list
 aql examples sessions-by-model
 ```
+
+首次查看建议使用 `schema --list`，再用 `schema <table>` 查看单表；不带参数的 `schema` 会输出全部字段。
 
 计划和元数据写入 stderr，不包含 SQL literal 或原始路径。
 
@@ -239,15 +241,13 @@ aql export -d work --output-file ./usage.json \
 预定义 Markdown 报告：
 
 ```bash
-aql report -d work summary
-aql report -d work --access path project
-aql report -d work \
+aql report summary -d work
+aql report project -d work --access path
+aql report summary -d work \
   --since 2026-01-01T00:00:00Z \
-  --until 2026-02-01T00:00:00Z \
-  summary
-aql report -d work --access path \
-  --project '…/demo' \
-  project
+  --until 2026-02-01T00:00:00Z
+aql report project -d work --access path \
+  --project '…/demo'
 ```
 
 `--since` 和 `--until` 接受 RFC 3339 时间；`--project` 只适用于 project report，并匹配报告中显示的 masked project 值。参数绑定到固定的 `aql-reports-v1` 报告 SQL，不能提供 SQL 片段。
@@ -284,7 +284,7 @@ aql search -d codex \
   timeout
 ```
 
-搜索可通过 `--source-id`、canonical `--session-id` 和固定的 `--document-kind` 过滤。AQL 在内存中将 canonical session ID 转换为 installation-scoped private index ID，不持久化该映射。`--context-tokens 1..64` 返回 FTS 提供的有界 Content 摘录并将结果标记为 `access_class=content`；默认值 0 省略 `context` 字段并标记为 `content_derived`。所有过滤条件使用 SQLite 绑定参数，不能注入 FTS 或 SQL 片段。
+搜索可通过查询结果中的 `source_id`、`session_id` 和三个固定文本字段进行过滤。AQL 只在内存中把 `session_id` 转换为当前安装的私有索引 ID，不保存原始 ID 与索引 ID 的映射。`--context-tokens 1..64` 返回有界 Content 摘录并将结果标记为 `access_class=content`；默认值 0 省略 `context` 字段并标记为 `content_derived`。所有过滤条件使用绑定参数，不能注入搜索表达式或 SQL 片段。
 
 Content 索引不包含工具输入/输出、reasoning、permission/share/account/credential、日志、配置或项目文件。`index clear` 和 `index repair` 只操作 marker/catalog 验证后的 AQL-owned state，不承诺法证擦除。
 

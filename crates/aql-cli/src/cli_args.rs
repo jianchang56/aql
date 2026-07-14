@@ -111,7 +111,7 @@ pub(super) enum Command {
         /// Grant access to sensitive column classes for this query only; repeat as needed.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
-        /// Bind a named scalar placeholder as NAME=VALUE; repeat as needed.
+        /// Bind NAME=VALUE; use text:, int: or bool: to disambiguate values.
         #[arg(long = "param", value_name = "NAME=VALUE")]
         param: Vec<String>,
         #[command(flatten)]
@@ -155,7 +155,7 @@ pub(super) enum Command {
         /// Grant access to sensitive column classes for this export only; repeat as needed.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
-        /// Bind a named scalar placeholder as NAME=VALUE; repeat as needed.
+        /// Bind NAME=VALUE; use text:, int: or bool: to disambiguate values.
         #[arg(long = "param", value_name = "NAME=VALUE")]
         param: Vec<String>,
         #[command(flatten)]
@@ -214,22 +214,22 @@ pub(super) enum Command {
             required_unless_present_any = ["data_root", "source", "profile"]
         )]
         database: Option<String>,
-        /// Grant Content access for this search invocation.
+        /// Grant access for this search; --access content is required.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
         /// Maximum number of search matches to return.
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=1000))]
         limit: u64,
-        /// Restrict matches to one opaque source ID.
+        /// Restrict matches to a source_id returned by AQL.
         #[arg(long)]
         source_id: Option<String>,
-        /// Restrict matches to one canonical session ID; AQL derives the private index ID.
+        /// Restrict matches to a session_id returned by AQL.
         #[arg(long)]
         session_id: Option<String>,
-        /// Restrict matches to session_title, session_preview or message_content.
+        /// Restrict matches to one indexed text field.
         #[arg(long, value_enum)]
         document_kind: Option<SearchDocumentKindArg>,
-        /// Include a bounded FTS excerpt with this many tokens; zero omits Content.
+        /// Include a bounded matching excerpt with this many tokens; zero omits Content.
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=64))]
         context_tokens: u8,
         /// Maximum rendered search-result bytes.
@@ -267,13 +267,14 @@ pub(super) enum Command {
         #[command(subcommand)]
         database: DatabaseCommand,
     },
-    /// Show the canonical SQL schema without opening Agent data.
+    /// Show one table schema, or use --list for a short overview.
     Schema {
         #[arg(conflicts_with = "list")]
         table: Option<String>,
         /// List canonical table names without rendering their columns.
         #[arg(long)]
         list: bool,
+        /// Select table or stable JSON rendering.
         #[arg(long, value_enum, default_value_t = SchemaOutput::Table)]
         output: SchemaOutput,
     },
@@ -531,6 +532,7 @@ pub(super) enum IndexCommand {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
+        /// Select the database whose index status is shown.
         #[arg(
             short = 'd',
             long,
@@ -550,6 +552,7 @@ pub(super) enum IndexCommand {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
+        /// Select the single-source database to index.
         #[arg(
             short = 'd',
             long,
@@ -560,18 +563,22 @@ pub(super) enum IndexCommand {
         /// Store metadata only, or include authorized message Content.
         #[arg(long, value_enum, default_value_t = IndexPolicyArg::Metadata)]
         policy: IndexPolicyArg,
-        /// Grant sensitive access needed by the selected index policy.
+        /// Grant access needed by the policy; Content indexes require content.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
         /// Confirm that Content will be copied into persistent AQL-owned storage.
         #[arg(long)]
         acknowledge_persistent_sensitive_copy: bool,
+        /// Stop after scanning this many canonical records.
         #[arg(long, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
         max_records: u64,
+        /// Maximum source bytes that adapters may read.
         #[arg(long, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
         max_bytes_read: u64,
+        /// Maximum bytes in the published index generation.
         #[arg(long, env = "AQL_MAX_INDEX_BYTES", default_value = "512MiB", value_parser = parse_byte_size)]
         max_index_bytes: u64,
+        /// Cancel the complete index build when this duration elapses.
         #[arg(long, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
     },
@@ -583,6 +590,7 @@ pub(super) enum IndexCommand {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
+        /// Select the single-source database whose index is replaced.
         #[arg(
             short = 'd',
             long,
@@ -590,18 +598,25 @@ pub(super) enum IndexCommand {
             required_unless_present_any = ["data_root", "source", "profile"]
         )]
         database: Option<String>,
+        /// Select metadata-only or Content for the replacement generation.
         #[arg(long, value_enum, default_value_t = IndexPolicyArg::Metadata)]
         policy: IndexPolicyArg,
+        /// Grant access needed by the policy; Content indexes require content.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
+        /// Confirm that the replacement generation may persist Content.
         #[arg(long)]
         acknowledge_persistent_sensitive_copy: bool,
+        /// Stop after scanning this many canonical records.
         #[arg(long, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
         max_records: u64,
+        /// Maximum source bytes that adapters may read.
         #[arg(long, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
         max_bytes_read: u64,
+        /// Maximum bytes in the published index generation.
         #[arg(long, env = "AQL_MAX_INDEX_BYTES", default_value = "512MiB", value_parser = parse_byte_size)]
         max_index_bytes: u64,
+        /// Cancel the complete index update when this duration elapses.
         #[arg(long, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
     },
@@ -613,6 +628,7 @@ pub(super) enum IndexCommand {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
+        /// Select the single-source database whose AQL-owned index is removed.
         #[arg(
             short = 'd',
             long,
@@ -620,10 +636,13 @@ pub(super) enum IndexCommand {
             required_unless_present_any = ["data_root", "source", "profile"]
         )]
         database: Option<String>,
+        /// Remove only the generation for this source_id.
         #[arg(long, conflicts_with = "all")]
         source_id: Option<String>,
+        /// Remove every AQL-owned index after explicit acknowledgement.
         #[arg(long, conflicts_with = "source_id")]
         all: bool,
+        /// Confirm removal of every AQL-owned index.
         #[arg(long, requires = "all")]
         acknowledge_clear_all_indexes: bool,
     },
@@ -635,6 +654,7 @@ pub(super) enum IndexCommand {
         source: Vec<String>,
         #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
+        /// Select the single-source database whose abandoned generations are repaired.
         #[arg(
             short = 'd',
             long,
@@ -684,7 +704,7 @@ impl From<IndexPolicyArg> for IndexPolicy {
 pub(super) enum ReportKind {
     /// Render database-wide session, message, tool and usage totals.
     Summary,
-    /// Render activity grouped by canonical project.
+    /// Render activity grouped by masked project; requires --access path.
     Project,
 }
 
