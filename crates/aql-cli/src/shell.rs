@@ -516,6 +516,7 @@ pub(super) async fn run_shell(
                             csv_formulas: CsvFormulaMode::Safe,
                             acknowledge_raw_csv_formulas: false,
                             access: access.clone(),
+                            param: Vec::new(),
                             limits: ExecutionLimits {
                                 max_records: 100_000,
                                 max_bytes_read: 256 * 1024 * 1024,

@@ -11,6 +11,43 @@ use aql_model::{
 use datafusion::arrow::array::{Int64Array, StringArray};
 use datafusion::prelude::{col, lit};
 
+#[test]
+fn scalar_parameters_bind_only_value_placeholders() {
+    let parameters = BTreeMap::from([
+        (
+            "name".to_string(),
+            SqlParameter::Text("x' OR true --".to_string()),
+        ),
+        ("limit".to_string(), SqlParameter::Int64(5)),
+    ]);
+    let bound = bind_sql_parameters(
+        "SELECT session_id FROM sessions WHERE title = :name LIMIT :limit",
+        &parameters,
+    )
+    .expect("scalar parameters bind");
+    assert!(bound.contains("title = 'x'' OR true --'"));
+    validate_read_only_sql(&bound).expect("bound SQL remains read only");
+
+    assert!(bind_sql_parameters("SELECT :missing", &BTreeMap::new()).is_err());
+    assert!(
+        bind_sql_parameters(
+            "SELECT session_id FROM sessions",
+            &BTreeMap::from([("unused".to_string(), SqlParameter::Bool(true))]),
+        )
+        .is_err()
+    );
+    assert!(
+        bind_sql_parameters(
+            "SELECT session_id FROM :table",
+            &BTreeMap::from([(
+                "table".to_string(),
+                SqlParameter::Text("sessions".to_string())
+            )]),
+        )
+        .is_err()
+    );
+}
+
 struct SyntheticSessionAdapter {
     session: SessionRecord,
 }

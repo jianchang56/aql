@@ -187,6 +187,19 @@ aql query -d codex --file ./query.sql
 printf '%s\n' 'SELECT COUNT(*) FROM sessions' | aql query -d codex --stdin
 ```
 
+### 安全参数绑定
+
+使用可重复的 `--param NAME=VALUE` 为 `:name` value placeholder 绑定标量：
+
+```bash
+aql query -d codex \
+  --param project=demo \
+  --param minimum=10 \
+  'SELECT session_id FROM sessions WHERE project = :project AND message_count >= :minimum'
+```
+
+参数支持 `null`、布尔值、带符号 64 位整数和文本。绑定发生在 SQL AST 上，不能替换表名、列名、函数或 SQL 片段。缺失、重复、未使用参数以及 `$1`、`?` 等非命名 placeholder 会被拒绝。字符串值不需要自行添加 SQL 引号。
+
 非交互 Schema 和示例：
 
 ```bash

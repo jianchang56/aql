@@ -111,6 +111,9 @@ pub(super) enum Command {
         /// Grant access to sensitive column classes for this query only; repeat as needed.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
+        /// Bind a named scalar placeholder as NAME=VALUE; repeat as needed.
+        #[arg(long = "param", value_name = "NAME=VALUE")]
+        param: Vec<String>,
         #[command(flatten)]
         limits: ExecutionLimits,
         /// Print the authorized, redacted query plan without executing the query.
@@ -149,6 +152,9 @@ pub(super) enum Command {
         /// Grant access to sensitive column classes for this export only; repeat as needed.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
+        /// Bind a named scalar placeholder as NAME=VALUE; repeat as needed.
+        #[arg(long = "param", value_name = "NAME=VALUE")]
+        param: Vec<String>,
         #[command(flatten)]
         limits: ExecutionLimits,
         /// Atomically write the export to this new local file instead of stdout.

@@ -24,8 +24,8 @@ use aql_adapter_kimi_code::KimiCodeAdapter;
 use aql_adapter_opencode::OpenCodeAdapter;
 use aql_config::{CONFIG_SCHEMA_VERSION, ConfigError, ConfigStore, Profile, ProfileSource};
 use aql_engine_datafusion::{
-    FederatedSource, QUERY_SCHEMAS, QueryDataType, QueryMetadata, QueryOptions,
-    StreamingQueryResult, prepare_query, validate_read_only_sql,
+    FederatedSource, QUERY_SCHEMAS, QueryDataType, QueryMetadata, QueryOptions, SqlParameter,
+    StreamingQueryResult, bind_sql_parameters, prepare_query, validate_read_only_sql,
 };
 use aql_index::{
     INDEX_SCHEMA_VERSION, IndexFreshness, IndexGeneration, IndexPolicy, IndexStore, IndexWatermark,
@@ -284,6 +284,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             csv_formulas,
             acknowledge_raw_csv_formulas,
             access,
+            param,
             limits,
             plan,
             metadata,
@@ -302,6 +303,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     csv_formulas,
                     acknowledge_raw_csv_formulas,
                     access,
+                    param,
                     limits,
                     plan,
                     metadata,
@@ -320,6 +322,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             profile,
             database,
             access,
+            param,
             limits,
             file,
             sql,
@@ -331,6 +334,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     profile,
                     database,
                     access,
+                    param,
                     limits,
                     file,
                     sql,
@@ -715,6 +719,7 @@ struct QueryExecution {
     csv_formulas: CsvFormulaMode,
     acknowledge_raw_csv_formulas: bool,
     access: Vec<Access>,
+    param: Vec<String>,
     limits: ExecutionLimits,
     plan: bool,
     metadata: bool,
@@ -737,6 +742,7 @@ async fn execute_query(
         csv_formulas,
         acknowledge_raw_csv_formulas,
         access,
+        param,
         limits,
         plan,
         metadata,
@@ -761,7 +767,8 @@ async fn execute_query(
         Some(_) => return Err("EXPLAIN requires one SELECT or WITH query".into()),
         None => (sql.as_str(), false),
     };
-    let validated_sql = validate_read_only_sql(sql)?;
+    let bound_sql = bind_sql_parameters(sql, &parse_sql_parameters(&param)?)?;
+    let validated_sql = validate_read_only_sql(&bound_sql)?;
     let (query_budget, _) = execution_budget(
         max_records,
         max_bytes_read,
@@ -893,6 +900,7 @@ struct ExportExecution {
     profile: Option<String>,
     database: Option<String>,
     access: Vec<Access>,
+    param: Vec<String>,
     limits: ExecutionLimits,
     file: Option<PathBuf>,
     sql: String,
@@ -908,6 +916,7 @@ async fn execute_export(
         profile,
         database,
         access,
+        param,
         limits,
         file,
         sql,
@@ -920,7 +929,8 @@ async fn execute_export(
         max_memory_bytes,
         timeout,
     } = limits;
-    let validated_sql = validate_read_only_sql(&sql)?;
+    let bound_sql = bind_sql_parameters(&sql, &parse_sql_parameters(&param)?)?;
+    let validated_sql = validate_read_only_sql(&bound_sql)?;
     let (budget, deadline_at) = execution_budget(
         max_records,
         max_bytes_read,
@@ -1519,6 +1529,51 @@ fn execution_budget(
         },
         deadline,
     ))
+}
+
+fn parse_sql_parameters(
+    values: &[String],
+) -> Result<std::collections::BTreeMap<String, SqlParameter>, Box<dyn std::error::Error>> {
+    let mut parameters = std::collections::BTreeMap::new();
+    for value in values {
+        let (name, raw) = value
+            .split_once('=')
+            .ok_or("query parameters must use NAME=VALUE")?;
+        if name.is_empty()
+            || name.len() > 64
+            || !name.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_'
+                    || byte.is_ascii_alphanumeric() && (index > 0 || byte.is_ascii_alphabetic())
+            })
+        {
+            return Err("query parameter names must be ASCII identifiers".into());
+        }
+        if raw.len() > 16 * 1024 * 1024 {
+            return Err("query parameter value exceeds the fixed size limit".into());
+        }
+        let parameter = match raw {
+            "null" => SqlParameter::Null,
+            "true" => SqlParameter::Bool(true),
+            "false" => SqlParameter::Bool(false),
+            _ if integer_text(raw) => SqlParameter::Int64(
+                raw.parse()
+                    .map_err(|_| "query integer parameter is outside the i64 range")?,
+            ),
+            _ => SqlParameter::Text(raw.to_string()),
+        };
+        if parameters.insert(name.to_string(), parameter).is_some() {
+            return Err("query parameter names must be unique".into());
+        }
+    }
+    Ok(parameters)
+}
+
+fn integer_text(value: &str) -> bool {
+    let digits = value
+        .strip_prefix('-')
+        .or_else(|| value.strip_prefix('+'))
+        .unwrap_or(value);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {

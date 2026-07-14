@@ -186,6 +186,10 @@ aql query -d codex --metadata 'SELECT model FROM sessions LIMIT 10'
 aql query -d codex --file ./query.sql
 printf '%s\n' 'SELECT COUNT(*) FROM sessions' | aql query -d codex --stdin
 
+# AST 级命名标量参数绑定
+aql query -d codex --param project=demo \
+  'SELECT session_id FROM sessions WHERE project = :project'
+
 # 非交互 Schema 和纯 SQL 示例
 aql schema sessions
 aql schema --output json
@@ -200,6 +204,8 @@ aql report -d codex summary
 aql completions zsh > ./_aql
 aql man > ./aql.1
 ```
+
+`--param NAME=VALUE` 支持 `null`、布尔值、带符号 64 位整数和文本。参数只能替换 `:name` value placeholder，不能替换表名、列名、函数或 SQL 片段；缺失、重复和未使用参数都会被拒绝。
 
 命名数据库、自定义路径、索引、全文搜索、导出和故障排查见 [用户指南](docs/user-guide.md)。
 

@@ -1,5 +1,81 @@
 use super::*;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SqlParameter {
+    Null,
+    Bool(bool),
+    Int64(i64),
+    Text(String),
+}
+
+pub fn bind_sql_parameters(
+    sql: &str,
+    parameters: &BTreeMap<String, SqlParameter>,
+) -> std::result::Result<String, QueryError> {
+    use sqlparser::ast::{ValueWithSpan, VisitMut, VisitorMut};
+
+    struct Binder<'a> {
+        parameters: &'a BTreeMap<String, SqlParameter>,
+        used: BTreeSet<String>,
+    }
+
+    impl VisitorMut for Binder<'_> {
+        type Break = Box<QueryError>;
+
+        fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
+            let Value::Placeholder(placeholder) = &value.value else {
+                return ControlFlow::Continue(());
+            };
+            let Some(name) = placeholder.strip_prefix(':').map(str::to_string) else {
+                return ControlFlow::Break(Box::new(sql_rejected(
+                    "parameters",
+                    "only named :parameter placeholders are supported",
+                )));
+            };
+            let Some(parameter) = self.parameters.get(&name) else {
+                return ControlFlow::Break(Box::new(sql_rejected(
+                    "parameters",
+                    "query contains an unbound parameter",
+                )));
+            };
+            value.value = match parameter {
+                SqlParameter::Null => Value::Null,
+                SqlParameter::Bool(value) => Value::Boolean(*value),
+                SqlParameter::Int64(value) => Value::Number(value.to_string(), false),
+                SqlParameter::Text(value) => Value::SingleQuotedString(value.clone()),
+            };
+            self.used.insert(name);
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut statements = Parser::parse_sql(&GenericDialect, sql)
+        .map_err(|_| sql_rejected("parse", "query is not valid SQL"))?;
+    if statements.len() != 1 {
+        return Err(sql_rejected(
+            "parse",
+            "exactly one read-only query is required",
+        ));
+    }
+    let mut statement = statements
+        .pop()
+        .ok_or_else(|| sql_rejected("parse", "exactly one read-only query is required"))?;
+    let mut binder = Binder {
+        parameters,
+        used: BTreeSet::new(),
+    };
+    if let ControlFlow::Break(error) = VisitMut::visit(&mut statement, &mut binder) {
+        return Err(*error);
+    }
+    if binder.used.len() != parameters.len() {
+        return Err(sql_rejected(
+            "parameters",
+            "one or more supplied parameters are unused",
+        ));
+    }
+    Ok(statement.to_string())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
     #[error("SQL rejected at stage {stage}: {reason}")]

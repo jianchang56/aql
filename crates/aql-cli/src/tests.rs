@@ -1,6 +1,37 @@
 use super::*;
 
 #[test]
+fn named_query_parameters_are_scalar_and_unique() {
+    let parameters = parse_sql_parameters(&[
+        "name=example".to_string(),
+        "count=42".to_string(),
+        "enabled=true".to_string(),
+        "missing=null".to_string(),
+    ])
+    .expect("parameters parse");
+    assert_eq!(
+        parameters["name"],
+        SqlParameter::Text("example".to_string())
+    );
+    assert_eq!(parameters["count"], SqlParameter::Int64(42));
+    assert_eq!(parameters["enabled"], SqlParameter::Bool(true));
+    assert_eq!(parameters["missing"], SqlParameter::Null);
+    assert!(parse_sql_parameters(&["1bad=value".to_string()]).is_err());
+    assert!(parse_sql_parameters(&["x=1".to_string(), "x=2".to_string()]).is_err());
+
+    Cli::try_parse_from([
+        "aql",
+        "query",
+        "-d",
+        "codex",
+        "--param",
+        "project=demo",
+        "SELECT session_id FROM sessions WHERE project = :project",
+    ])
+    .expect("query parameter CLI parses");
+}
+
+#[test]
 fn database_cli_is_short_clear_and_mutually_exclusive() {
     let parsed = Cli::try_parse_from([
         "aql",

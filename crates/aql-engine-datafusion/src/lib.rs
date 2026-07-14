@@ -54,7 +54,9 @@ use arrays::{agent_array, record_array};
 use execution::expr_to_predicate;
 use execution::{Binding, DeferredTable};
 use sql_firewall::sql_rejected;
-pub use sql_firewall::{QueryError, ValidatedSql, validate_read_only_sql};
+pub use sql_firewall::{
+    QueryError, SqlParameter, ValidatedSql, bind_sql_parameters, validate_read_only_sql,
+};
 
 const MAX_SQL_BYTES: usize = 64 * 1024;
 const MAX_QUERY_DEPTH: usize = 64;
