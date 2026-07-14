@@ -41,15 +41,19 @@ struct DatabaseCandidate {
 }
 
 fn database_candidates() -> Result<Vec<DatabaseCandidate>, Box<dyn std::error::Error>> {
-    let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?);
+    let home = PathBuf::from(
+        std::env::var_os("HOME").ok_or_else(|| state_unavailable("HOME is not set"))?,
+    );
     if !home.is_absolute() {
-        return Err("HOME must be absolute for database discovery".into());
+        return Err(state_unavailable("HOME must be absolute for database discovery").into());
     }
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"));
     if !data_home.is_absolute() {
-        return Err("XDG_DATA_HOME must be absolute for database discovery".into());
+        return Err(
+            state_unavailable("XDG_DATA_HOME must be absolute for database discovery").into(),
+        );
     }
     Ok(vec![
         DatabaseCandidate {
@@ -84,7 +88,7 @@ pub(super) fn read_adapter(
         "codex" => Ok(Arc::new(CodexAdapter::new(installation_salt.to_vec()))),
         "kimi-code" => Ok(Arc::new(KimiCodeAdapter::new(installation_salt.to_vec()))),
         "opencode" => Ok(Arc::new(OpenCodeAdapter::new(installation_salt.to_vec()))),
-        _ => Err("unknown source adapter".into()),
+        _ => Err(invalid_argument("unknown source adapter").into()),
     }
 }
 
@@ -108,11 +112,11 @@ pub(super) fn bind_sources(
             if inputs.skip_unavailable {
                 continue;
             }
-            return Err("probe returned no compatible source".into());
+            return Err(source_unavailable("probe returned no compatible source").into());
         }
         for manifest in probe.manifests {
             if !source_ids.insert(manifest.source_id.clone()) {
-                return Err("duplicate source identity".into());
+                return Err(state_integrity("duplicate source identity").into());
             }
             bound.push(FederatedSource {
                 adapter: adapter.clone(),
@@ -121,7 +125,7 @@ pub(super) fn bind_sources(
         }
     }
     if bound.is_empty() {
-        return Err("probe returned no compatible source".into());
+        return Err(source_unavailable("probe returned no compatible source").into());
     }
     Ok(bound)
 }
@@ -137,24 +141,24 @@ fn parse_source_specs_with_policy(
     skip_unavailable: bool,
 ) -> Result<Vec<ParsedSource>, Box<dyn std::error::Error>> {
     if source_specs.is_empty() {
-        return Err("database must contain at least one member".into());
+        return Err(invalid_argument("database must contain at least one member").into());
     }
     if source_specs.len() > 16 {
-        return Err("database member count exceeds the supported limit".into());
+        return Err(invalid_argument("database member count exceeds the supported limit").into());
     }
     let mut raw = Vec::with_capacity(source_specs.len());
     for spec in source_specs {
-        let (adapter_id, root) = spec
-            .split_once('=')
-            .ok_or("database member must use adapter=/absolute/path syntax")?;
+        let (adapter_id, root) = spec.split_once('=').ok_or_else(|| {
+            invalid_argument("database member must use adapter=/absolute/path syntax")
+        })?;
         if !matches!(
             adapter_id,
             "claude-code" | "codex" | "kimi-code" | "opencode"
         ) {
-            return Err("unknown database member adapter".into());
+            return Err(invalid_argument("unknown database member adapter").into());
         }
         if root.is_empty() {
-            return Err("database member path cannot be empty".into());
+            return Err(invalid_argument("database member path cannot be empty").into());
         }
         raw.push((adapter_id.to_string(), PathBuf::from(root)));
     }
@@ -162,7 +166,7 @@ fn parse_source_specs_with_policy(
     let mut result = Vec::with_capacity(raw.len());
     for (adapter_id, root) in raw {
         if !root.is_absolute() {
-            return Err("database member path must be absolute".into());
+            return Err(invalid_argument("database member path must be absolute").into());
         }
         if skip_unavailable {
             match fs::symlink_metadata(&root) {
@@ -172,8 +176,8 @@ fn parse_source_specs_with_policy(
                 Err(_) => continue,
             }
         }
-        let canonical =
-            fs::canonicalize(&root).map_err(|_| "database member path is unavailable")?;
+        let canonical = fs::canonicalize(&root)
+            .map_err(|_| source_unavailable("database member path is unavailable"))?;
         result.push(ParsedSource {
             adapter_id,
             root,
@@ -186,7 +190,9 @@ fn parse_source_specs_with_policy(
                 || left.canonical_root.starts_with(&right.canonical_root)
                 || right.canonical_root.starts_with(&left.canonical_root)
             {
-                return Err("duplicate or overlapping database member roots".into());
+                return Err(
+                    invalid_argument("duplicate or overlapping database member roots").into(),
+                );
             }
         }
     }
@@ -222,7 +228,7 @@ fn candidate_is_compatible(
     salt: &[u8],
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if Instant::now() >= deadline {
-        return Err("database discovery timed out".into());
+        return Err(deadline_exceeded("database discovery timed out").into());
     }
     let metadata = match fs::symlink_metadata(&candidate.root) {
         Ok(metadata) => metadata,
@@ -249,7 +255,10 @@ pub(super) fn resolve_database_inputs(
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
-        return Err("database name must use lowercase ASCII letters, digits, '_' or '-'".into());
+        return Err(invalid_argument(
+            "database name must use lowercase ASCII letters, digits, '_' or '-'",
+        )
+        .into());
     }
     if let Some(inputs) = configured_database_inputs(name)? {
         return Ok(inputs);
@@ -273,7 +282,7 @@ pub(super) fn resolve_database_inputs(
     let candidate = candidates
         .into_iter()
         .find(|candidate| candidate.name == name)
-        .ok_or("unknown database; run SHOW DATABASES")?;
+        .ok_or_else(|| database_not_found("unknown database; run SHOW DATABASES"))?;
     Ok(SourceInputs {
         source_specs: vec![format!(
             "{}={}",
@@ -290,10 +299,11 @@ pub(super) fn aql_config_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     } else if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(path).join("aql")
     } else {
-        PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".config/aql")
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| state_unavailable("HOME is not set"))?)
+            .join(".config/aql")
     };
     if !root.is_absolute() {
-        return Err("AQL config root must be absolute".into());
+        return Err(invalid_argument("AQL config root must be absolute").into());
     }
     Ok(root)
 }
@@ -304,7 +314,7 @@ fn add_configured_database(
     acknowledge_persistent_path: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !acknowledge_persistent_path {
-        return Err("database add requires --acknowledge-persistent-path".into());
+        return Err(invalid_argument("database add requires --acknowledge-persistent-path").into());
     }
     aql_config::validate_database_name(&name)?;
     let config_root = aql_config_root()?;
@@ -391,11 +401,14 @@ pub(super) fn execute_database_command(
             let members = member
                 .into_iter()
                 .map(|member| {
-                    let (agent, path) = member
-                        .split_once('=')
-                        .ok_or("database member must use AGENT=/absolute/path syntax")?;
+                    let (agent, path) = member.split_once('=').ok_or_else(|| {
+                        invalid_argument("database member must use AGENT=/absolute/path syntax")
+                    })?;
                     if agent.is_empty() || path.is_empty() {
-                        return Err("database member agent and path cannot be empty".into());
+                        return Err(invalid_argument(
+                            "database member agent and path cannot be empty",
+                        )
+                        .into());
                     }
                     Ok((agent.to_string(), PathBuf::from(path)))
                 })
@@ -410,13 +423,15 @@ pub(super) fn execute_database_command(
                             "kimi" | "kimi-code" => "kimi-code",
                             "opencode" => "opencode",
                             _ => {
-                                return Err(
-                                    "unknown database agent; use claude, codex, kimi or opencode"
-                                        .into(),
-                                );
+                                return Err(invalid_argument(
+                                    "unknown database agent; use claude, codex, kimi or opencode",
+                                )
+                                .into());
                             }
                         };
-                        let path = path.to_str().ok_or("database path is not valid UTF-8")?;
+                        let path = path
+                            .to_str()
+                            .ok_or_else(|| invalid_argument("database path is not valid UTF-8"))?;
                         Ok(format!("{adapter}={path}"))
                     },
                 )
@@ -444,10 +459,10 @@ pub(super) fn execute_database_command(
             let candidate = database_candidates()?
                 .into_iter()
                 .find(|candidate| candidate.name == name)
-                .ok_or("unknown database")?;
+                .ok_or_else(|| database_not_found("unknown database"))?;
             let deadline = Instant::now()
                 .checked_add(Duration::from_secs(5))
-                .ok_or("database discovery timeout is invalid")?;
+                .ok_or_else(|| invalid_argument("database discovery timeout is invalid"))?;
             let salt: [u8; 32] = rand::random();
             println!("database={name}");
             println!("agent={}", candidate.adapter_id);
@@ -477,12 +492,12 @@ pub(super) fn discover_sources() -> Result<(), Box<dyn std::error::Error>> {
     let candidates = database_candidates()?;
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(5))
-        .ok_or("discovery timeout is invalid")?;
+        .ok_or_else(|| invalid_argument("discovery timeout is invalid"))?;
     let ephemeral_salt: [u8; 32] = rand::random();
     let mut results = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         if Instant::now() >= deadline {
-            return Err("source discovery timed out".into());
+            return Err(deadline_exceeded("source discovery timed out").into());
         }
         let status = match fs::symlink_metadata(&candidate.root) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => "missing",
@@ -503,7 +518,7 @@ pub(super) fn discover_sources() -> Result<(), Box<dyn std::error::Error>> {
         results.push((candidate.name, status));
     }
     if Instant::now() >= deadline {
-        return Err("source discovery timed out".into());
+        return Err(deadline_exceeded("source discovery timed out").into());
     }
     for (database, status) in results {
         println!("database={database} status={status}");
@@ -533,7 +548,7 @@ pub(super) fn configured_database_names() -> Result<Vec<String>, Box<dyn std::er
 pub(super) fn available_database_names() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(5))
-        .ok_or("database discovery timeout is invalid")?;
+        .ok_or_else(|| invalid_argument("database discovery timeout is invalid"))?;
     let salt: [u8; 32] = rand::random();
     let mut names = configured_database_names()?
         .into_iter()
@@ -558,7 +573,7 @@ pub(super) fn database_is_available(name: &str) -> Result<bool, Box<dyn std::err
     let candidates = database_candidates()?;
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(5))
-        .ok_or("database discovery timeout is invalid")?;
+        .ok_or_else(|| invalid_argument("database discovery timeout is invalid"))?;
     let salt: [u8; 32] = rand::random();
     if name == "all" {
         for candidate in &candidates {

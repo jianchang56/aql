@@ -359,13 +359,15 @@ pub(super) async fn run_shell(
     initial_database: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Err("interactive shell requires terminal stdin and stdout".into());
+        return Err(unsupported("interactive shell requires terminal stdin and stdout").into());
     }
     let mut selected_database = None;
     if let Some(database) = initial_database {
         let database = database.to_ascii_lowercase();
         if !database_is_available(&database)? {
-            return Err("unknown or unavailable database; run SHOW DATABASES".into());
+            return Err(
+                database_not_found("unknown or unavailable database; run SHOW DATABASES").into(),
+            );
         }
         selected_database = Some(database);
     }

@@ -48,23 +48,95 @@ use render::{
 };
 use shell::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliErrorKind {
+    InvalidRequest,
+    NotFound,
+    SourceUnavailable,
+    DeadlineExceeded,
+    Cancelled,
+    Unsupported,
+    AlreadyExists,
+    StateIntegrity,
+    StateUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CliErrorHint {
+    #[default]
+    None,
+    DatabaseSelection,
+    SqlInput,
+}
+
 #[derive(Debug)]
-enum CliError {
-    InvalidArgument(String),
+struct CliError {
+    kind: CliErrorKind,
+    message: String,
+    hint: CliErrorHint,
 }
 
 impl std::fmt::Display for CliError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidArgument(message) => formatter.write_str(message),
-        }
+        formatter.write_str(&self.message)
     }
 }
 
 impl std::error::Error for CliError {}
 
 fn invalid_argument(message: impl Into<String>) -> CliError {
-    CliError::InvalidArgument(message.into())
+    cli_error(CliErrorKind::InvalidRequest, message)
+}
+
+fn sql_input_error(message: impl Into<String>) -> CliError {
+    cli_error(CliErrorKind::InvalidRequest, message).with_hint(CliErrorHint::SqlInput)
+}
+
+fn database_not_found(message: impl Into<String>) -> CliError {
+    cli_error(CliErrorKind::NotFound, message).with_hint(CliErrorHint::DatabaseSelection)
+}
+
+fn source_unavailable(message: impl Into<String>) -> CliError {
+    cli_error(CliErrorKind::SourceUnavailable, message)
+}
+
+fn deadline_exceeded(message: impl Into<String>) -> CliError {
+    cli_error(CliErrorKind::DeadlineExceeded, message)
+}
+
+fn query_cancelled() -> CliError {
+    cli_error(CliErrorKind::Cancelled, "query cancelled")
+}
+
+fn unsupported(message: impl Into<String>) -> CliError {
+    cli_error(CliErrorKind::Unsupported, message)
+}
+
+fn already_exists(message: impl Into<String>) -> CliError {
+    cli_error(CliErrorKind::AlreadyExists, message)
+}
+
+fn state_integrity(message: impl Into<String>) -> CliError {
+    cli_error(CliErrorKind::StateIntegrity, message)
+}
+
+fn state_unavailable(message: impl Into<String>) -> CliError {
+    cli_error(CliErrorKind::StateUnavailable, message)
+}
+
+fn cli_error(kind: CliErrorKind, message: impl Into<String>) -> CliError {
+    CliError {
+        kind,
+        message: message.into(),
+        hint: CliErrorHint::None,
+    }
+}
+
+impl CliError {
+    fn with_hint(mut self, hint: CliErrorHint) -> Self {
+        self.hint = hint;
+        self
+    }
 }
 
 const MAX_SQL_INPUT_BYTES: u64 = 64 * 1024;
@@ -76,17 +148,17 @@ fn read_sql_input(
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(sql) = sql {
         if sql.len() as u64 > MAX_SQL_INPUT_BYTES {
-            return Err("SQL input exceeds the fixed 64 KiB limit".into());
+            return Err(sql_input_error("SQL input exceeds the fixed 64 KiB limit").into());
         }
         return Ok(sql);
     }
     if let Some(path) = file {
         if path.to_string_lossy().contains("://") || path.as_os_str() == "-" {
-            return Err("--file requires a local file path".into());
+            return Err(sql_input_error("--file requires a local file path").into());
         }
         let components = path.components().collect::<Vec<_>>();
         let Some(std::path::Component::Normal(file_name)) = components.last() else {
-            return Err("SQL file path must name one regular file".into());
+            return Err(sql_input_error("SQL file path must name one regular file").into());
         };
         let directory_flags = rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::DIRECTORY
@@ -109,7 +181,11 @@ fn read_sql_input(
                         rustix::fs::Mode::empty(),
                     )?;
                 }
-                _ => return Err("SQL file path must not contain parent traversal".into()),
+                _ => {
+                    return Err(
+                        sql_input_error("SQL file path must not contain parent traversal").into(),
+                    );
+                }
             }
         }
         let descriptor = rustix::fs::openat(
@@ -121,14 +197,14 @@ fn read_sql_input(
         let mut file = fs::File::from(descriptor);
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() > MAX_SQL_INPUT_BYTES {
-            return Err("SQL file must be a bounded regular file".into());
+            return Err(sql_input_error("SQL file must be a bounded regular file").into());
         }
         let mut input = String::new();
         Read::by_ref(&mut file)
             .take(MAX_SQL_INPUT_BYTES + 1)
             .read_to_string(&mut input)?;
         if input.len() as u64 != metadata.len() {
-            return Err("SQL file changed while it was being read".into());
+            return Err(sql_input_error("SQL file changed while it was being read").into());
         }
         return Ok(input);
     }
@@ -139,11 +215,11 @@ fn read_sql_input(
             .take(MAX_SQL_INPUT_BYTES + 1)
             .read_to_string(&mut input)?;
         if input.len() as u64 > MAX_SQL_INPUT_BYTES {
-            return Err("stdin SQL exceeds the fixed 64 KiB limit".into());
+            return Err(sql_input_error("stdin SQL exceeds the fixed 64 KiB limit").into());
         }
         return Ok(input);
     }
-    Err("one SQL input is required".into())
+    Err(sql_input_error("one SQL input is required").into())
 }
 
 fn explain_sql(sql: &str) -> Option<&str> {
@@ -204,9 +280,14 @@ async fn main() {
 }
 
 fn cli_parse_error_hint(error: &clap::Error) -> &'static str {
-    if error.kind() == clap::error::ErrorKind::MissingRequiredArgument
-        && error.to_string().contains("--database <DATABASE>")
-    {
+    use clap::error::{ContextKind, ContextValue};
+
+    let missing_database = matches!(
+        error.get(ContextKind::InvalidArg),
+        Some(ContextValue::Strings(arguments))
+            if arguments.iter().any(|argument| argument == "--database <DATABASE>")
+    );
+    if error.kind() == clap::error::ErrorKind::MissingRequiredArgument && missing_database {
         "run `aql database list`, then retry with `-d <database>`"
     } else {
         "run `aql --help` or `aql <command> --help`"
@@ -251,7 +332,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let sources = bind_sources(inputs, installation_salt)?;
             let deadline = Instant::now()
                 .checked_add(Duration::from_secs(30))
-                .ok_or("doctor deadline is invalid")?;
+                .ok_or_else(|| invalid_argument("doctor deadline is invalid"))?;
             let diagnostic_budget = ResourceBudget {
                 max_records: 100,
                 max_bytes_read: 16 * 1024 * 1024,
@@ -263,7 +344,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let cancellation = CancellationToken::default();
             let source_count = u64::try_from(sources.len())?;
             if source_count == 0 {
-                return Err("probe returned no compatible source".into());
+                return Err(source_unavailable("probe returned no compatible source").into());
             }
             let per_source_limit = (100_u64 / source_count).max(1);
             let mut report = String::new();
@@ -411,7 +492,9 @@ async fn execute_query(
     let query_started = Instant::now();
     let (sql, explain) = match explain_sql(&sql) {
         Some(inner) if !inner.is_empty() => (inner, true),
-        Some(_) => return Err("EXPLAIN requires one SELECT or WITH query".into()),
+        Some(_) => {
+            return Err(invalid_argument("EXPLAIN requires one SELECT or WITH query").into());
+        }
         None => (sql.as_str(), false),
     };
     let bound_sql = bind_sql_parameters(sql, &parse_sql_parameters(&param)?)?;
@@ -435,7 +518,7 @@ async fn execute_query(
         prepare_query(&validated_sql, options),
     )
     .await
-    .map_err(|_| "query timed out")??;
+    .map_err(|_| deadline_exceeded("query timed out"))??;
     diagnostic_timing(diagnostics, "authorize", authorize_started);
     let mut transactional_output = TransactionalOutput::create(output_file.as_deref())?;
     ensure_before_deadline(deadline)?;
@@ -446,11 +529,11 @@ async fn execute_query(
     ensure_before_deadline(deadline)?;
     diagnostic_timing(diagnostics, "probe", probe_started);
     if sources.is_empty() {
-        return Err("probe returned no compatible source".into());
+        return Err(source_unavailable("probe returned no compatible source").into());
     }
     if explain {
         if output != Output::Table {
-            return Err("EXPLAIN supports only the default table output".into());
+            return Err(invalid_argument("EXPLAIN supports only the default table output").into());
         }
         let summary = prepared.plan_summary();
         let mut rendered = String::new();
@@ -510,11 +593,11 @@ async fn execute_query(
         signal = tokio::signal::ctrl_c() => {
             signal?;
             cancellation.cancel();
-            return Err("query cancelled".into());
+            return Err(query_cancelled().into());
         }
         _ = &mut deadline_sleep => {
             cancellation.cancel();
-            return Err("query timed out".into());
+            return Err(deadline_exceeded("query timed out").into());
         }
     };
     let aql_engine_datafusion::StreamingQueryResult {
@@ -532,11 +615,11 @@ async fn execute_query(
             signal = tokio::signal::ctrl_c() => {
                 signal?;
                 cancellation.cancel();
-                return Err("query cancelled".into());
+                return Err(query_cancelled().into());
             }
             _ = &mut deadline_sleep => {
                 cancellation.cancel();
-                return Err("query timed out".into());
+                return Err(deadline_exceeded("query timed out").into());
             }
         };
         let Some(batch) = next else {
@@ -633,7 +716,7 @@ fn execution_budget(
 ) -> Result<(ResourceBudget, Instant), Box<dyn std::error::Error>> {
     let deadline = Instant::now()
         .checked_add(timeout)
-        .ok_or("timeout exceeds the supported range")?;
+        .ok_or_else(|| invalid_argument("timeout exceeds the supported range"))?;
     Ok((
         ResourceBudget {
             max_records,
@@ -650,12 +733,12 @@ fn execution_budget(
 fn remaining_timeout(deadline: Instant) -> Result<Duration, Box<dyn std::error::Error>> {
     deadline
         .checked_duration_since(Instant::now())
-        .ok_or_else(|| "query timed out".into())
+        .ok_or_else(|| deadline_exceeded("query timed out").into())
 }
 
 fn ensure_before_deadline(deadline: Instant) -> Result<(), Box<dyn std::error::Error>> {
     if Instant::now() >= deadline {
-        Err("query timed out".into())
+        Err(deadline_exceeded("query timed out").into())
     } else {
         Ok(())
     }
@@ -742,6 +825,17 @@ fn source_supports_table(capabilities: &[String], table: &str) -> bool {
 }
 
 fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+    if let Some(cli) = error.downcast_ref::<CliError>() {
+        return match cli.hint {
+            CliErrorHint::None => None,
+            CliErrorHint::DatabaseSelection => {
+                Some("run `aql database list`, then select one with `-d <database>`".to_string())
+            }
+            CliErrorHint::SqlInput => {
+                Some("pass SQL directly, with `--file query.sql`, or with `--stdin`".to_string())
+            }
+        };
+    }
     if let Some(aql_engine_datafusion::QueryError::AccessDenied(access)) =
         error.downcast_ref::<aql_engine_datafusion::QueryError>()
     {
@@ -756,6 +850,17 @@ fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
             ),
         };
     }
+    if let Some(aql_engine_datafusion::QueryError::Engine(engine)) =
+        error.downcast_ref::<aql_engine_datafusion::QueryError>()
+        && matches!(
+            datafusion_adapter_error(engine),
+            Some(aql_adapter_api::AdapterError::AccessDenied { .. })
+        )
+    {
+        return Some(
+            "run `aql schema <table>` and add only the required temporary access grant".to_string(),
+        );
+    }
     if matches!(
         error.downcast_ref::<aql_adapter_api::AdapterError>(),
         Some(aql_adapter_api::AdapterError::AccessDenied { .. })
@@ -764,22 +869,7 @@ fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
             "run `aql schema <table>` and add only the required temporary access grant".to_string(),
         );
     }
-    let message = error.to_string().to_ascii_lowercase();
-    if message.contains("no database selected")
-        || message.contains("requires -d <database>")
-        || message.contains("unknown database")
-        || message.contains("unknown or unavailable database")
-    {
-        Some("run `aql database list`, then select one with `-d <database>`".to_string())
-    } else if message.contains("requires --access content") {
-        Some(access_retry_hint("content", "Content"))
-    } else if message.contains("requires --access path") {
-        Some(access_retry_hint("path", "Path"))
-    } else if message.contains("sql input") || message.contains("one sql input") {
-        Some("pass SQL directly, with `--file query.sql`, or with `--stdin`".to_string())
-    } else {
-        None
-    }
+    None
 }
 
 fn access_retry_hint(access: &str, label: &str) -> String {
@@ -853,8 +943,16 @@ fn render_error(error: &(dyn std::error::Error + 'static), format: ErrorFormat) 
 
 fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
     if let Some(cli) = error.downcast_ref::<CliError>() {
-        return match cli {
-            CliError::InvalidArgument(_) => 2,
+        return match cli.kind {
+            CliErrorKind::InvalidRequest => 2,
+            CliErrorKind::NotFound
+            | CliErrorKind::SourceUnavailable
+            | CliErrorKind::Unsupported
+            | CliErrorKind::AlreadyExists
+            | CliErrorKind::StateIntegrity
+            | CliErrorKind::StateUnavailable => 4,
+            CliErrorKind::DeadlineExceeded => 5,
+            CliErrorKind::Cancelled => 130,
         };
     }
     if let Some(query) = error.downcast_ref::<aql_engine_datafusion::QueryError>() {
@@ -862,27 +960,17 @@ fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
             aql_engine_datafusion::QueryError::SqlRejected { .. } => 2,
             aql_engine_datafusion::QueryError::AccessDenied(_) => 3,
             aql_engine_datafusion::QueryError::Engine(engine)
-                if engine.to_string().contains("resource budget exceeded")
-                    || engine.to_string().contains("Resources exhausted")
-                    || engine.to_string().contains("Not enough memory") =>
+                if datafusion_resource_limited(engine) =>
             {
                 5
             }
-            aql_engine_datafusion::QueryError::Engine(_) => 1,
+            aql_engine_datafusion::QueryError::Engine(engine) => {
+                datafusion_adapter_error(engine).map_or(1, adapter_error_exit_code)
+            }
         };
     }
     if let Some(adapter) = error.downcast_ref::<aql_adapter_api::AdapterError>() {
-        return match adapter {
-            aql_adapter_api::AdapterError::AccessDenied { .. } => 3,
-            aql_adapter_api::AdapterError::BudgetExceeded { .. }
-            | aql_adapter_api::AdapterError::Cancelled => 5,
-            aql_adapter_api::AdapterError::NotFound { .. }
-            | aql_adapter_api::AdapterError::PermissionDenied { .. }
-            | aql_adapter_api::AdapterError::UnsupportedFormat { .. }
-            | aql_adapter_api::AdapterError::CorruptSource { .. }
-            | aql_adapter_api::AdapterError::SnapshotUnavailable => 4,
-            aql_adapter_api::AdapterError::Internal { .. } => 1,
-        };
+        return adapter_error_exit_code(adapter);
     }
     if let Some(config) = error.downcast_ref::<ConfigError>() {
         return match config {
@@ -902,54 +990,39 @@ fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
             | ConfigError::Platform(_) => 4,
         };
     }
-    let message = error.to_string();
-    if message == "query cancelled" {
-        130
-    } else if message.contains("timed out") || message.contains("resource budget exceeded") {
-        5
-    } else if message.contains("unknown database")
-        || message.contains("unknown or unavailable database")
-    {
-        4
-    } else if message.contains("requires --access") {
-        3
-    } else if message.contains("unsupported") {
-        4
-    } else if message.contains("invalid")
-        || message.contains("No database selected")
-        || message.contains("requires --acknowledge")
-    {
-        2
-    } else {
-        1
-    }
+    1
 }
 
 fn error_category(error: &(dyn std::error::Error + 'static)) -> &'static str {
     if let Some(cli) = error.downcast_ref::<CliError>() {
-        return match cli {
-            CliError::InvalidArgument(_) => "invalid_request",
+        return match cli.kind {
+            CliErrorKind::InvalidRequest => "invalid_request",
+            CliErrorKind::NotFound => "not_found",
+            CliErrorKind::SourceUnavailable => "source_unavailable",
+            CliErrorKind::DeadlineExceeded => "deadline_exceeded",
+            CliErrorKind::Cancelled => "cancelled",
+            CliErrorKind::Unsupported => "unsupported",
+            CliErrorKind::AlreadyExists => "already_exists",
+            CliErrorKind::StateIntegrity => "state_integrity",
+            CliErrorKind::StateUnavailable => "state_unavailable",
         };
     }
     if let Some(query) = error.downcast_ref::<aql_engine_datafusion::QueryError>() {
         return match query {
             aql_engine_datafusion::QueryError::SqlRejected { .. } => "invalid_request",
             aql_engine_datafusion::QueryError::AccessDenied(_) => "access_denied",
-            aql_engine_datafusion::QueryError::Engine(_) => "execution_failed",
+            aql_engine_datafusion::QueryError::Engine(engine)
+                if datafusion_resource_limited(engine) =>
+            {
+                "resource_limit"
+            }
+            aql_engine_datafusion::QueryError::Engine(engine) => {
+                datafusion_adapter_error(engine).map_or("execution_failed", adapter_error_category)
+            }
         };
     }
     if let Some(adapter) = error.downcast_ref::<aql_adapter_api::AdapterError>() {
-        return match adapter {
-            aql_adapter_api::AdapterError::AccessDenied { .. } => "access_denied",
-            aql_adapter_api::AdapterError::BudgetExceeded { .. } => "resource_limit",
-            aql_adapter_api::AdapterError::Cancelled => "cancelled",
-            aql_adapter_api::AdapterError::NotFound { .. }
-            | aql_adapter_api::AdapterError::PermissionDenied { .. }
-            | aql_adapter_api::AdapterError::UnsupportedFormat { .. }
-            | aql_adapter_api::AdapterError::CorruptSource { .. }
-            | aql_adapter_api::AdapterError::SnapshotUnavailable => "source_unavailable",
-            aql_adapter_api::AdapterError::Internal { .. } => "internal",
-        };
+        return adapter_error_category(adapter);
     }
     if let Some(config) = error.downcast_ref::<ConfigError>() {
         return match config {
@@ -967,28 +1040,69 @@ fn error_category(error: &(dyn std::error::Error + 'static)) -> &'static str {
             ConfigError::Io(_) | ConfigError::Platform(_) => "state_unavailable",
         };
     }
-    let message = error.to_string();
-    if message == "query cancelled" {
-        "cancelled"
-    } else if message.contains("timed out") {
-        "deadline_exceeded"
-    } else if message.contains("resource budget exceeded") {
-        "resource_limit"
-    } else if message.contains("unknown database")
-        || message.contains("unknown or unavailable database")
-    {
-        "not_found"
-    } else if message.contains("requires --access") {
-        "access_denied"
-    } else if message.contains("unsupported") {
-        "unsupported"
-    } else if message.contains("invalid")
-        || message.contains("No database selected")
-        || message.contains("requires --acknowledge")
-    {
-        "invalid_request"
-    } else {
-        "internal"
+    "internal"
+}
+
+fn datafusion_resource_limited(error: &datafusion::error::DataFusionError) -> bool {
+    use datafusion::error::DataFusionError;
+
+    match error {
+        DataFusionError::ResourcesExhausted(_) => true,
+        DataFusionError::External(error) => error
+            .downcast_ref::<aql_adapter_api::AdapterError>()
+            .is_some_and(|error| {
+                matches!(error, aql_adapter_api::AdapterError::BudgetExceeded { .. })
+            }),
+        DataFusionError::Context(_, error) | DataFusionError::Diagnostic(_, error) => {
+            datafusion_resource_limited(error)
+        }
+        DataFusionError::Collection(errors) => errors.iter().any(datafusion_resource_limited),
+        DataFusionError::Shared(error) => datafusion_resource_limited(error),
+        _ => false,
+    }
+}
+
+fn datafusion_adapter_error(
+    error: &datafusion::error::DataFusionError,
+) -> Option<&aql_adapter_api::AdapterError> {
+    use datafusion::error::DataFusionError;
+
+    match error {
+        DataFusionError::External(error) => error.downcast_ref::<aql_adapter_api::AdapterError>(),
+        DataFusionError::Context(_, error) | DataFusionError::Diagnostic(_, error) => {
+            datafusion_adapter_error(error)
+        }
+        DataFusionError::Collection(errors) => errors.iter().find_map(datafusion_adapter_error),
+        DataFusionError::Shared(error) => datafusion_adapter_error(error),
+        _ => None,
+    }
+}
+
+fn adapter_error_exit_code(error: &aql_adapter_api::AdapterError) -> i32 {
+    match error {
+        aql_adapter_api::AdapterError::AccessDenied { .. } => 3,
+        aql_adapter_api::AdapterError::BudgetExceeded { .. }
+        | aql_adapter_api::AdapterError::Cancelled => 5,
+        aql_adapter_api::AdapterError::NotFound { .. }
+        | aql_adapter_api::AdapterError::PermissionDenied { .. }
+        | aql_adapter_api::AdapterError::UnsupportedFormat { .. }
+        | aql_adapter_api::AdapterError::CorruptSource { .. }
+        | aql_adapter_api::AdapterError::SnapshotUnavailable => 4,
+        aql_adapter_api::AdapterError::Internal { .. } => 1,
+    }
+}
+
+fn adapter_error_category(error: &aql_adapter_api::AdapterError) -> &'static str {
+    match error {
+        aql_adapter_api::AdapterError::AccessDenied { .. } => "access_denied",
+        aql_adapter_api::AdapterError::BudgetExceeded { .. } => "resource_limit",
+        aql_adapter_api::AdapterError::Cancelled => "cancelled",
+        aql_adapter_api::AdapterError::NotFound { .. }
+        | aql_adapter_api::AdapterError::PermissionDenied { .. }
+        | aql_adapter_api::AdapterError::UnsupportedFormat { .. }
+        | aql_adapter_api::AdapterError::CorruptSource { .. }
+        | aql_adapter_api::AdapterError::SnapshotUnavailable => "source_unavailable",
+        aql_adapter_api::AdapterError::Internal { .. } => "internal",
     }
 }
 
@@ -1096,7 +1210,7 @@ fn load_or_create_installation_salt(
         != rustix::fs::FileType::Directory
         || directory_stat.st_mode & 0o077 != 0
     {
-        return Err("AQL state root has unsafe permissions or type".into());
+        return Err(state_integrity("AQL state root has unsafe permissions or type").into());
     }
 
     match rustix::fs::openat(
@@ -1150,7 +1264,7 @@ fn open_or_create_private_state_root(
             )
         })
     {
-        return Err("AQL state root must be normalized and absolute".into());
+        return Err(state_integrity("AQL state root must be normalized and absolute").into());
     }
     let components = state_root
         .components()
@@ -1160,7 +1274,7 @@ fn open_or_create_private_state_root(
         })
         .collect::<Vec<_>>();
     if components.is_empty() {
-        return Err("AQL state root cannot be the filesystem root".into());
+        return Err(state_integrity("AQL state root cannot be the filesystem root").into());
     }
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut directory = rustix::fs::openat(rustix::fs::CWD, "/", flags, Mode::empty())?;
@@ -1189,13 +1303,13 @@ fn read_private_installation_salt(
     if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
         || stat.st_mode & 0o077 != 0
     {
-        return Err("installation salt has unsafe permissions or type".into());
+        return Err(state_integrity("installation salt has unsafe permissions or type").into());
     }
     let mut salt = Vec::with_capacity(32);
     let mut file: fs::File = descriptor.into();
     file.read_to_end(&mut salt)?;
     if salt.len() != 32 {
-        return Err("installation salt has an invalid length".into());
+        return Err(state_integrity("installation salt has an invalid length").into());
     }
     Ok(salt)
 }
@@ -1208,7 +1322,7 @@ fn load_or_create_installation_salt(
     let salt_path = state_root.join("installation.key");
     match fs::read(&salt_path) {
         Ok(salt) if salt.len() == 32 => Ok(salt),
-        Ok(_) => Err("installation salt has an invalid length".into()),
+        Ok(_) => Err(state_integrity("installation salt has an invalid length").into()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let salt: [u8; 32] = rand::random();
             let mut file = fs::OpenOptions::new()
@@ -1227,12 +1341,13 @@ fn aql_state_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(if let Some(path) = std::env::var_os("AQL_HOME") {
         PathBuf::from(path)
     } else if cfg!(target_os = "macos") {
-        PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?)
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| state_unavailable("HOME is not set"))?)
             .join("Library/Application Support/aql")
     } else if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
         PathBuf::from(path).join("aql")
     } else {
-        PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".local/share/aql")
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| state_unavailable("HOME is not set"))?)
+            .join(".local/share/aql")
     })
 }
 

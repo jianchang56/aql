@@ -89,14 +89,14 @@ impl SecureOutputFile {
         let target_name = path
             .file_name()
             .filter(|name| !name.is_empty())
-            .ok_or("output target must have a file name")?
+            .ok_or_else(|| invalid_argument("output target must have a file name"))?
             .to_os_string();
         let directory_path = output_directory_path(path);
         let directory = open_output_directory(directory_path)?;
         let directory_stat = rustix::fs::fstat(&directory)?;
         let directory_identity = identity(&directory_stat);
         match rustix::fs::statat(&directory, &target_name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(_) => return Err("output target already exists".into()),
+            Ok(_) => return Err(already_exists("output target already exists").into()),
             Err(error) if error == rustix::io::Errno::NOENT => {}
             Err(error) => return Err(error.into()),
         }
@@ -133,14 +133,14 @@ impl SecureOutputFile {
             rustix::fs::fstat(&directory)?
         };
         if identity(&current_directory) != self.directory_identity {
-            return Err("output target directory changed during write".into());
+            return Err(state_integrity("output target directory changed during write").into());
         }
         match rustix::fs::statat(
             &self.directory,
             &self.target_name,
             AtFlags::SYMLINK_NOFOLLOW,
         ) {
-            Ok(_) => return Err("output target appeared during write".into()),
+            Ok(_) => return Err(already_exists("output target appeared during write").into()),
             Err(error) if error == rustix::io::Errno::NOENT => {}
             Err(error) => return Err(error.into()),
         }
@@ -185,7 +185,9 @@ fn open_output_directory(
                 directory = openat(&directory, name, flags, Mode::empty())?;
             }
             Component::ParentDir | Component::Prefix(_) => {
-                return Err("output path must not contain parent traversal".into());
+                return Err(
+                    invalid_argument("output path must not contain parent traversal").into(),
+                );
             }
         }
     }
@@ -251,7 +253,7 @@ pub(super) struct SecureOutputFile;
 #[cfg(not(unix))]
 impl SecureOutputFile {
     pub(super) fn create(_path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
-        Err("secure file output is not supported on this platform".into())
+        Err(unsupported("secure file output is not supported on this platform").into())
     }
 
     pub(super) fn writer(&mut self) -> &mut fs::File {

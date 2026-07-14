@@ -268,10 +268,15 @@ fn sql_file_input_is_bounded_regular_and_no_follow() {
 
 #[test]
 fn errors_have_stable_hints_for_database_workflows() {
-    let database = io::Error::other("unknown database; run SHOW DATABASES");
+    let database = database_not_found("unknown database; run SHOW DATABASES");
     assert_eq!(error_category(&database), "not_found");
     assert_eq!(error_exit_code(&database), 4);
     assert!(error_hint(&database).is_some());
+
+    let misleading = io::Error::other("unknown database; query timed out; invalid");
+    assert_eq!(error_category(&misleading), "internal");
+    assert_eq!(error_exit_code(&misleading), 1);
+    assert!(error_hint(&misleading).is_none());
     assert_eq!(shell_quote("SELECT 1"), "'SELECT 1'");
     assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
 }
@@ -790,6 +795,40 @@ fn stable_error_categories_have_stable_exit_codes() {
         }),
         5
     );
+    let memory = aql_engine_datafusion::QueryError::Engine(
+        datafusion::error::DataFusionError::ResourcesExhausted("synthetic".to_string()),
+    );
+    assert_eq!(error_category(&memory), "resource_limit");
+    assert_eq!(error_exit_code(&memory), 5);
+
+    let nested_budget =
+        aql_engine_datafusion::QueryError::Engine(datafusion::error::DataFusionError::Context(
+            "synthetic context".to_string(),
+            Box::new(datafusion::error::DataFusionError::External(Box::new(
+                aql_adapter_api::AdapterError::BudgetExceeded {
+                    resource: "bytes_read".to_string(),
+                    actual: 2,
+                },
+            ))),
+        ));
+    assert_eq!(error_category(&nested_budget), "resource_limit");
+    assert_eq!(error_exit_code(&nested_budget), 5);
+
+    let nested_source =
+        aql_engine_datafusion::QueryError::Engine(datafusion::error::DataFusionError::External(
+            Box::new(aql_adapter_api::AdapterError::UnsupportedFormat {
+                stage: "synthetic".to_string(),
+            }),
+        ));
+    assert_eq!(error_category(&nested_source), "source_unavailable");
+    assert_eq!(error_exit_code(&nested_source), 4);
+
+    let timeout = deadline_exceeded("synthetic deadline");
+    assert_eq!(error_category(&timeout), "deadline_exceeded");
+    assert_eq!(error_exit_code(&timeout), 5);
+    let cancelled = query_cancelled();
+    assert_eq!(error_category(&cancelled), "cancelled");
+    assert_eq!(error_exit_code(&cancelled), 130);
 }
 
 #[test]
