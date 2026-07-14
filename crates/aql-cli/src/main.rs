@@ -245,7 +245,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Doctor { database } => {
             let inputs = resolve_database_inputs(&database)?;
             let installation_salt = installation_salt()?;
-            let sources = bind_sources(inputs.source_specs, installation_salt)?;
+            let sources = bind_sources(inputs, installation_salt)?;
             let deadline = Instant::now()
                 .checked_add(Duration::from_secs(30))
                 .ok_or("doctor deadline is invalid")?;
@@ -421,11 +421,15 @@ async fn execute_query(
         max_memory_bytes,
         ..QueryOptions::default()
     };
+    let installation_salt = installation_salt()?;
+    options.redaction_salt = installation_salt.clone();
+    let cancellation = options.cancellation.clone();
+    let budget = options.budget.clone();
     let authorize_started = Instant::now();
     let authorization_timeout = remaining_timeout(deadline)?;
-    tokio::time::timeout(
+    let prepared = tokio::time::timeout(
         authorization_timeout,
-        prepare_query(&validated_sql, options.clone()),
+        prepare_query(&validated_sql, options),
     )
     .await
     .map_err(|_| "query timed out")??;
@@ -437,16 +441,8 @@ async fn execute_query(
     ensure_before_deadline(deadline)?;
     let inputs = resolve_database_inputs(&database)?;
     ensure_before_deadline(deadline)?;
-    let installation_salt = installation_salt()?;
-    options.redaction_salt = installation_salt.clone();
-    let cancellation = options.cancellation.clone();
-    let budget = options.budget.clone();
-    let prepare_timeout = remaining_timeout(deadline)?;
-    let prepared = tokio::time::timeout(prepare_timeout, prepare_query(&validated_sql, options))
-        .await
-        .map_err(|_| "query timed out")??;
     let probe_started = Instant::now();
-    let sources = bind_sources(inputs.source_specs, installation_salt)?;
+    let sources = bind_sources(inputs, installation_salt)?;
     ensure_before_deadline(deadline)?;
     diagnostic_timing(diagnostics, "probe", probe_started);
     if sources.is_empty() {

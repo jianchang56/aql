@@ -28,7 +28,10 @@ pub(super) fn configured_database_to_inputs(
             Ok(format!("{}={root}", source.adapter_id))
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-    Ok(SourceInputs { source_specs })
+    Ok(SourceInputs {
+        source_specs,
+        skip_unavailable: false,
+    })
 }
 
 struct DatabaseCandidate {
@@ -86,18 +89,25 @@ pub(super) fn read_adapter(
 }
 
 pub(super) fn bind_sources(
-    source_specs: Vec<String>,
+    inputs: SourceInputs,
     installation_salt: Vec<u8>,
 ) -> Result<Vec<FederatedSource>, Box<dyn std::error::Error>> {
-    let parsed = parse_source_specs(source_specs)?;
+    let parsed = parse_source_specs_with_policy(inputs.source_specs, inputs.skip_unavailable)?;
     let mut bound = Vec::new();
     let mut source_ids = std::collections::BTreeSet::new();
     for source in parsed {
         let adapter = read_adapter(&source.adapter_id, &installation_salt)?;
-        let probe = adapter.probe(&ProbeRequest {
+        let probe = match adapter.probe(&ProbeRequest {
             data_root: source.root.to_string_lossy().into_owned(),
-        })?;
+        }) {
+            Ok(probe) => probe,
+            Err(_) if inputs.skip_unavailable => continue,
+            Err(error) => return Err(error.into()),
+        };
         if probe.manifests.is_empty() {
+            if inputs.skip_unavailable {
+                continue;
+            }
             return Err("probe returned no compatible source".into());
         }
         for manifest in probe.manifests {
@@ -110,11 +120,21 @@ pub(super) fn bind_sources(
             });
         }
     }
+    if bound.is_empty() {
+        return Err("probe returned no compatible source".into());
+    }
     Ok(bound)
 }
 
 pub(super) fn parse_source_specs(
     source_specs: Vec<String>,
+) -> Result<Vec<ParsedSource>, Box<dyn std::error::Error>> {
+    parse_source_specs_with_policy(source_specs, false)
+}
+
+fn parse_source_specs_with_policy(
+    source_specs: Vec<String>,
+    skip_unavailable: bool,
 ) -> Result<Vec<ParsedSource>, Box<dyn std::error::Error>> {
     if source_specs.is_empty() {
         return Err("database must contain at least one member".into());
@@ -143,6 +163,14 @@ pub(super) fn parse_source_specs(
     for (adapter_id, root) in raw {
         if !root.is_absolute() {
             return Err("database member path must be absolute".into());
+        }
+        if skip_unavailable {
+            match fs::symlink_metadata(&root) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => continue,
+            }
         }
         let canonical =
             fs::canonicalize(&root).map_err(|_| "database member path is unavailable")?;
@@ -228,24 +256,19 @@ pub(super) fn resolve_database_inputs(
     }
     let candidates = database_candidates()?;
     if name == "all" {
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(5))
-            .ok_or("database discovery timeout is invalid")?;
-        let salt: [u8; 32] = rand::random();
-        let mut source_specs = Vec::new();
-        for candidate in &candidates {
-            if candidate_is_compatible(candidate, deadline, &salt)? {
-                source_specs.push(format!(
-                    "{}={}",
-                    candidate.adapter_id,
-                    candidate.root.to_string_lossy()
-                ));
-            }
-        }
-        if source_specs.is_empty() {
-            return Err("database 'all' has no compatible local Agent data".into());
-        }
-        return Ok(SourceInputs { source_specs });
+        return Ok(SourceInputs {
+            source_specs: candidates
+                .iter()
+                .map(|candidate| {
+                    format!(
+                        "{}={}",
+                        candidate.adapter_id,
+                        candidate.root.to_string_lossy()
+                    )
+                })
+                .collect(),
+            skip_unavailable: true,
+        });
     }
     let candidate = candidates
         .into_iter()
@@ -257,6 +280,7 @@ pub(super) fn resolve_database_inputs(
             candidate.adapter_id,
             candidate.root.to_string_lossy()
         )],
+        skip_unavailable: false,
     })
 }
 
@@ -551,4 +575,22 @@ pub(super) fn database_is_available(name: &str) -> Result<bool, Box<dyn std::err
         return Ok(false);
     };
     candidate_is_compatible(&candidate, deadline, &salt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_federation_members_skip_missing_roots() {
+        let missing =
+            std::env::temp_dir().join(format!("aql-missing-source-{:016x}", rand::random::<u64>()));
+        let spec = format!("codex={}", missing.to_string_lossy());
+        assert!(parse_source_specs(vec![spec.clone()]).is_err());
+        assert!(
+            parse_source_specs_with_policy(vec![spec], true)
+                .expect("optional members parse")
+                .is_empty()
+        );
+    }
 }

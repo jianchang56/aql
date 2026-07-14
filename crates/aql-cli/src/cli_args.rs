@@ -204,4 +204,5 @@ pub(super) struct ParsedSource {
 
 pub(super) struct SourceInputs {
     pub(super) source_specs: Vec<String>,
+    pub(super) skip_unavailable: bool,
 }
