@@ -458,7 +458,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let search_options = SearchOptions {
                 source_id,
                 session_id,
-                document_kind,
+                document_kind: document_kind.map(|kind| kind.as_str().to_string()),
                 context_tokens,
             };
             for (store, generations) in &stores {

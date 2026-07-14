@@ -27,22 +27,22 @@ pub(super) struct Cli {
 #[derive(Args, Clone)]
 pub(super) struct ExecutionLimits {
     /// Stop after scanning this many canonical records across the complete operation.
-    #[arg(long, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
+    #[arg(long, global = true, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
     pub(super) max_records: u64,
     /// Maximum source bytes that all adapters may read.
-    #[arg(long, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
+    #[arg(long, global = true, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
     pub(super) max_bytes_read: u64,
     /// Maximum bytes that may be published.
-    #[arg(long, env = "AQL_MAX_OUTPUT_BYTES", default_value = "64MiB", value_parser = parse_byte_size)]
+    #[arg(long, global = true, env = "AQL_MAX_OUTPUT_BYTES", default_value = "64MiB", value_parser = parse_byte_size)]
     pub(super) max_output_bytes: u64,
     /// Reject any single sensitive value larger than this limit.
-    #[arg(long, env = "AQL_MAX_SINGLE_VALUE_BYTES", default_value = "16MiB", value_parser = parse_byte_size)]
+    #[arg(long, global = true, env = "AQL_MAX_SINGLE_VALUE_BYTES", default_value = "16MiB", value_parser = parse_byte_size)]
     pub(super) max_single_value_bytes: u64,
     /// Maximum in-memory execution working set.
-    #[arg(long, env = "AQL_MAX_MEMORY_BYTES", default_value = "256MiB", value_parser = parse_usize_byte_size)]
+    #[arg(long, global = true, env = "AQL_MAX_MEMORY_BYTES", default_value = "256MiB", value_parser = parse_usize_byte_size)]
     pub(super) max_memory_bytes: usize,
     /// Cancel the complete operation when this duration elapses.
-    #[arg(long, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
+    #[arg(long, global = true, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
     pub(super) timeout: Duration,
 }
 
@@ -167,33 +167,33 @@ pub(super) enum Command {
     },
     /// Render a predefined read-only Markdown report.
     Report {
-        #[arg(long, hide = true, conflicts_with_all = ["source", "profile", "database"])]
+        #[arg(long, global = true, hide = true, conflicts_with_all = ["source", "profile", "database"])]
         data_root: Option<PathBuf>,
-        #[arg(long = "source", hide = true, conflicts_with_all = ["profile", "database"])]
+        #[arg(long = "source", global = true, hide = true, conflicts_with_all = ["profile", "database"])]
         source: Vec<String>,
-        #[arg(long, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
+        #[arg(long, global = true, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
         /// Select the database used by the report.
         #[arg(
             short = 'd',
             long,
-            conflicts_with_all = ["data_root", "source", "profile"],
-            required_unless_present_any = ["data_root", "source", "profile"]
+            global = true,
+            conflicts_with_all = ["data_root", "source", "profile"]
         )]
         database: Option<String>,
         /// Grant access to sensitive column classes for this report only; repeat as needed.
-        #[arg(long = "access", value_enum)]
+        #[arg(long = "access", global = true, value_enum)]
         access: Vec<Access>,
         #[command(flatten)]
         limits: ExecutionLimits,
         /// Restrict the project report to one displayed masked project value.
-        #[arg(long)]
+        #[arg(long, global = true)]
         project: Option<String>,
         /// Include activity at or after this RFC 3339 timestamp.
-        #[arg(long)]
+        #[arg(long, global = true)]
         since: Option<String>,
         /// Include activity before this RFC 3339 timestamp.
-        #[arg(long)]
+        #[arg(long, global = true)]
         until: Option<String>,
         #[command(subcommand)]
         report: ReportKind,
@@ -227,8 +227,8 @@ pub(super) enum Command {
         #[arg(long)]
         session_id: Option<String>,
         /// Restrict matches to session_title, session_preview or message_content.
-        #[arg(long)]
-        document_kind: Option<String>,
+        #[arg(long, value_enum)]
+        document_kind: Option<SearchDocumentKindArg>,
         /// Include a bounded FTS excerpt with this many tokens; zero omits Content.
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=64))]
         context_tokens: u8,
@@ -686,6 +686,26 @@ pub(super) enum ReportKind {
     Summary,
     /// Render activity grouped by canonical project.
     Project,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(super) enum SearchDocumentKindArg {
+    #[value(name = "session_title")]
+    SessionTitle,
+    #[value(name = "session_preview")]
+    SessionPreview,
+    #[value(name = "message_content")]
+    MessageContent,
+}
+
+impl SearchDocumentKindArg {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionTitle => "session_title",
+            Self::SessionPreview => "session_preview",
+            Self::MessageContent => "message_content",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, ValueEnum)]

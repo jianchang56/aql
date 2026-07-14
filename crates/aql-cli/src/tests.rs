@@ -165,6 +165,16 @@ fn data_commands_accept_one_consistent_database_option() {
             "SELECT 1",
         ],
         vec!["aql", "report", "-d", "codex", "summary"],
+        vec!["aql", "report", "summary", "-d", "codex"],
+        vec![
+            "aql",
+            "report",
+            "summary",
+            "-d",
+            "codex",
+            "--since",
+            "2026-01-01T00:00:00Z",
+        ],
         vec!["aql", "search", "-d", "codex", "synthetic"],
         vec!["aql", "index", "status", "-d", "codex"],
         vec!["aql", "index", "build", "-d", "codex"],
@@ -177,12 +187,38 @@ fn data_commands_accept_one_consistent_database_option() {
         vec!["aql", "doctor"],
         vec!["aql", "query", "SELECT 1"],
         vec!["aql", "export", "SELECT 1"],
-        vec!["aql", "report", "summary"],
         vec!["aql", "search", "synthetic"],
         vec!["aql", "index", "status"],
     ] {
         assert!(Cli::try_parse_from(arguments).is_err());
     }
+    assert!(resolve_source_inputs(None, Vec::new(), None, None).is_err());
+}
+
+#[test]
+fn search_document_kind_is_validated_by_clap() {
+    Cli::try_parse_from([
+        "aql",
+        "search",
+        "-d",
+        "codex",
+        "--document-kind",
+        "message_content",
+        "synthetic",
+    ])
+    .expect("document kind parses");
+    assert!(
+        Cli::try_parse_from([
+            "aql",
+            "search",
+            "-d",
+            "codex",
+            "--document-kind",
+            "typo",
+            "synthetic",
+        ])
+        .is_err()
+    );
 }
 
 #[test]
