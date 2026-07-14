@@ -1,4 +1,3 @@
-
 use super::*;
 use aql_adapter_api::{
     AdapterError, AdapterSchema, Capabilities, ColumnCapability, ProbeRequest, ProbeResult,
