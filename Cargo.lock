@@ -97,64 +97,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aql-action-claude-code"
-version = "0.1.0"
-dependencies = [
- "aql-actions",
- "aql-model",
-]
-
-[[package]]
-name = "aql-action-codex"
-version = "0.1.0"
-dependencies = [
- "aql-actions",
- "aql-model",
-]
-
-[[package]]
-name = "aql-action-kimi-code"
-version = "0.1.0"
-dependencies = [
- "aql-actions",
- "aql-model",
-]
-
-[[package]]
-name = "aql-action-opencode"
-version = "0.1.0"
-dependencies = [
- "aql-actions",
- "aql-model",
-]
-
-[[package]]
-name = "aql-action-synthetic"
-version = "0.1.0"
-dependencies = [
- "aql-actions",
- "aql-model",
- "rand",
- "rustix",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "aql-actions"
-version = "0.1.0"
-dependencies = [
- "aql-model",
- "hmac",
- "rand",
- "rustix",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
-]
-
-[[package]]
 name = "aql-adapter-api"
 version = "0.1.0"
 dependencies = [
@@ -281,18 +223,6 @@ dependencies = [
  "sqlparser",
  "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "aql-index"
-version = "0.1.0"
-dependencies = [
- "rand",
- "rusqlite",
- "rustix",
- "serde",
- "serde_json",
- "thiserror",
 ]
 
 [[package]]

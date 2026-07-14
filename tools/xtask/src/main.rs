@@ -21,7 +21,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask fixture KIND OUTPUT [COUNT]\n       KIND: claude|codex|kimi|opencode|actions\n       cargo xtask verify [workspace|cli|adapters|actions|release|performance|docs]\n       cargo xtask real-smoke"
+    "usage: cargo xtask fixture KIND OUTPUT [COUNT]\n       KIND: claude|codex|kimi|opencode\n       cargo xtask verify [workspace|cli|adapters|release|performance|docs]\n       cargo xtask real-smoke"
 }
 
 fn fixture(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -39,7 +39,6 @@ fn fixture(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn std::e
         "claude" | "claude-code" => aql_test_support::generate_claude(Path::new(&output))?,
         "kimi" | "kimi-code" => aql_test_support::generate_kimi(Path::new(&output))?,
         "opencode" => aql_test_support::generate_opencode(Path::new(&output))?,
-        "actions" => aql_test_support::generate_actions(Path::new(&output))?,
         _ => return Err("unknown fixture kind".into()),
     }
     Ok(())
@@ -71,24 +70,6 @@ fn verify(scope: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
                 "aql-adapter-opencode",
                 "-p",
                 "aql-catalog",
-            ])?;
-        }
-        Some("actions") => {
-            run_cargo(&[
-                "test",
-                "--locked",
-                "-p",
-                "aql-actions",
-                "-p",
-                "aql-action-codex",
-                "-p",
-                "aql-action-claude-code",
-                "-p",
-                "aql-action-kimi-code",
-                "-p",
-                "aql-action-opencode",
-                "-p",
-                "aql-action-synthetic",
             ])?;
         }
         Some("release") => verify_release()?,
@@ -161,13 +142,6 @@ fn verify_performance() -> Result<(), Box<dyn std::error::Error>> {
         "-p",
         "aql-adapter-codex",
         "single_sensitive_value_budget_is_enforced",
-    ])?;
-    run_cargo(&[
-        "test",
-        "--locked",
-        "-p",
-        "aql-cli",
-        "transactional_output_is_memory_bounded_and_publishes_only_complete_bytes",
     ])?;
     Ok(())
 }
@@ -271,32 +245,31 @@ fn real_smoke() -> Result<(), Box<dyn std::error::Error>> {
         .tempdir()?;
     let state = temporary.path().join("state");
     let config = temporary.path().join("config");
-    run_aql(&home, &state, &config, &["sources", "discover"])?;
+    run_aql(&home, &state, &config, &["database", "discover"])?;
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"));
     let candidates = [
-        ("claude-code", home.join(".claude")),
-        ("codex", home.join(".codex")),
-        ("kimi-code", home.join(".kimi-code")),
-        ("opencode", data.join("opencode")),
+        ("claude", "claude-code", home.join(".claude")),
+        ("codex", "codex", home.join(".codex")),
+        ("kimi", "kimi-code", home.join(".kimi-code")),
+        ("opencode", "opencode", data.join("opencode")),
     ];
     let mut checked = 0usize;
-    for (adapter, root) in candidates {
+    for (database, adapter, root) in candidates {
         if !root.is_dir() {
             continue;
         }
         let before = source_snapshot(adapter, &root)?;
-        let source = format!("{adapter}={}", root.to_string_lossy());
-        run_aql(&home, &state, &config, &["doctor", "--source", &source])?;
+        run_aql(&home, &state, &config, &["doctor", "-d", database])?;
         run_aql(
             &home,
             &state,
             &config,
             &[
                 "query",
-                "--source",
-                &source,
+                "-d",
+                database,
                 "--output",
                 "json",
                 "SELECT COUNT(*) AS sessions FROM sessions",
@@ -311,8 +284,8 @@ fn real_smoke() -> Result<(), Box<dyn std::error::Error>> {
     if checked == 0 {
         return Err("no installed Agent data root was available for real smoke".into());
     }
-    if config.exists() || state.join("actions").exists() || state.join("index").exists() {
-        return Err("real smoke created forbidden config, Action or index state".into());
+    if config.exists() {
+        return Err("real smoke created forbidden configured-database state".into());
     }
     println!("status=real-safe-smoke-passed");
     Ok(())

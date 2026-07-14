@@ -67,12 +67,8 @@ fn fail<T>(value: impl Into<String>) -> Result<T> {
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct Metadata {
-    action_audit_schema: String,
-    action_plan_schema: String,
-    action_store_schema: String,
     canonical_schema: String,
     config_schema: String,
-    index_schema: String,
     package: String,
     target: String,
     version: String,
@@ -132,12 +128,8 @@ pub fn validate_target(value: &str) -> Result<()> {
 }
 fn metadata(version: &str, target: &str) -> Metadata {
     Metadata {
-        action_audit_schema: "aql-action-audit-v1".into(),
-        action_plan_schema: "aql-action-plan-v1".into(),
-        action_store_schema: "aql-action-store-v1".into(),
         canonical_schema: "aql-canonical-v0".into(),
-        config_schema: "aql-config-v1".into(),
-        index_schema: "aql-index-v1".into(),
+        config_schema: "aql-databases-v1".into(),
         package: BUILD_PACKAGE.into(),
         target: target.into(),
         version: version.into(),

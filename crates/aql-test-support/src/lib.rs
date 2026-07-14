@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-mod actions;
 mod claude;
 mod codex;
 mod kimi;
@@ -9,7 +8,6 @@ mod opencode;
 use std::fs;
 use std::path::Path;
 
-pub use actions::generate_actions;
 pub use claude::generate_claude;
 pub use codex::generate_codex;
 pub use kimi::generate_kimi;

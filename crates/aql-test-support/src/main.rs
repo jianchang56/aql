@@ -11,7 +11,7 @@ fn run() -> aql_test_support::TestResult {
     let mut arguments = std::env::args().skip(1);
     let kind = arguments
         .next()
-        .ok_or("usage: aql-test-support <claude|codex|kimi|opencode|actions> <output> [count]")?;
+        .ok_or("usage: aql-test-support <claude|codex|kimi|opencode> <output> [count]")?;
     let output = arguments.next().ok_or("fixture output is required")?;
     match kind.as_str() {
         "codex" => {
@@ -25,7 +25,6 @@ fn run() -> aql_test_support::TestResult {
         "claude" | "claude-code" => aql_test_support::generate_claude(Path::new(&output))?,
         "kimi" | "kimi-code" => aql_test_support::generate_kimi(Path::new(&output))?,
         "opencode" => aql_test_support::generate_opencode(Path::new(&output))?,
-        "actions" => aql_test_support::generate_actions(Path::new(&output))?,
         _ => return Err("unknown fixture kind".into()),
     }
     println!("generated=complete");
