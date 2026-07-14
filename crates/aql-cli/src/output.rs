@@ -1,4 +1,67 @@
 use super::*;
+use std::io::{Seek, SeekFrom};
+
+pub(super) enum TransactionalOutput {
+    File(SecureOutputFile),
+    Stdout(fs::File),
+}
+
+impl TransactionalOutput {
+    pub(super) fn create(
+        path: Option<&std::path::Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        match path {
+            Some(path) => Ok(Self::File(SecureOutputFile::create(path)?)),
+            None => Ok(Self::Stdout(tempfile::tempfile()?)),
+        }
+    }
+
+    pub(super) fn writer(&mut self) -> &mut fs::File {
+        match self {
+            Self::File(output) => output.writer(),
+            Self::Stdout(output) => output,
+        }
+    }
+
+    pub(super) fn publish(
+        mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match &mut self {
+            Self::File(_) => {}
+            Self::Stdout(spool) => {
+                spool.flush()?;
+                spool.seek(SeekFrom::Start(0))?;
+                let mut stdout = io::stdout().lock();
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let count = spool.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    if let Err(error) = stdout.write_all(&buffer[..count]) {
+                        if error.kind() == io::ErrorKind::BrokenPipe {
+                            cancellation.cancel();
+                            return Ok(());
+                        }
+                        return Err(error.into());
+                    }
+                }
+                if let Err(error) = stdout.flush() {
+                    if error.kind() == io::ErrorKind::BrokenPipe {
+                        cancellation.cancel();
+                        return Ok(());
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        if let Self::File(output) = self {
+            output.commit()?;
+        }
+        Ok(())
+    }
+}
 
 #[cfg(unix)]
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -84,7 +84,7 @@ Shell 的 SHOW/USE/DESCRIBE/GRANT 控制语句由 CLI 处理；SELECT 进入同�
 
 ## 输出
 
-查询先完整执行并渲染，再发布 stdout。`--output-file` 使用同目录 private 临时文件、fsync 和 no-replace rename。目标已存在、目录被替换或写入失败时，不发布目标文件。
+查询批次流式渲染到匿名、无路径的 private 临时文件，只有数据流完整到达 EOF、元数据完成且渲染成功后才顺序发布 stdout。表格渲染使用第二个匿名行缓冲完成全局列宽计算，不保留全部 Arrow 批次。`--output-file` 直接流式写入同目录 private 临时文件，完成后 fsync 并通过 no-replace rename 发布。目标已存在、目录被替换或任一步失败时，不发布结果。
 
 CSV 只有安全模式，公式形状文本始终转义。
 

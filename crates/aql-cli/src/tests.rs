@@ -453,6 +453,112 @@ fn structured_renderers_stop_at_the_output_limit() {
 }
 
 #[test]
+fn streaming_renderers_preserve_multi_batch_format_boundaries() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Utf8,
+        false,
+    )]));
+    let first = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["one", "two"]))],
+    )
+    .expect("first synthetic batch");
+    let second = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["three"]))])
+        .expect("second synthetic batch");
+    let batches = vec![first, second];
+
+    let (json, json_summary) =
+        render_batches_for_test(Output::Json, &batches, u64::MAX).expect("streaming JSON");
+    assert_eq!(
+        json,
+        "[{\"value\":\"one\"},{\"value\":\"two\"},{\"value\":\"three\"}]\n"
+    );
+    assert_eq!(json_summary.returned_rows, 3);
+
+    let (jsonl, _) =
+        render_batches_for_test(Output::Jsonl, &batches, u64::MAX).expect("streaming JSONL");
+    assert_eq!(
+        jsonl,
+        "{\"value\":\"one\"}\n{\"value\":\"two\"}\n{\"value\":\"three\"}\n"
+    );
+
+    let (csv, _) = render_batches_for_test(Output::Csv, &batches, u64::MAX).expect("streaming CSV");
+    assert_eq!(csv, "value\r\none\r\ntwo\r\nthree\r\n");
+
+    let (table, _) =
+        render_batches_for_test(Output::Table, &batches, u64::MAX).expect("streaming table");
+    let expected = format!(
+        "{}\n",
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches).expect("reference table")
+    );
+    assert_eq!(table, expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn streaming_render_failure_never_publishes_the_output_target() {
+    let root =
+        std::env::temp_dir().join(format!("aql-stream-output-{:016x}", rand::random::<u64>()));
+    fs::create_dir(&root).expect("create synthetic output directory");
+
+    let first = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "first",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec!["one"]))],
+    )
+    .expect("first synthetic batch");
+    let second = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "second",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec!["two"]))],
+    )
+    .expect("second synthetic batch");
+
+    let inconsistent_target = root.join("inconsistent.csv");
+    {
+        let mut output = TransactionalOutput::create(Some(&inconsistent_target))
+            .expect("create transactional output");
+        let mut renderer = StreamingRenderer::new(Output::Csv, ResourceBudget::default())
+            .expect("create renderer");
+        renderer.start(output.writer()).expect("start renderer");
+        renderer
+            .write_batch(output.writer(), &first)
+            .expect("first batch renders");
+        assert!(renderer.write_batch(output.writer(), &second).is_err());
+    }
+    assert!(!inconsistent_target.exists());
+
+    let budget_target = root.join("budget.json");
+    {
+        let mut output =
+            TransactionalOutput::create(Some(&budget_target)).expect("create budget output");
+        let budget = ResourceBudget {
+            max_output_bytes: 8,
+            ..ResourceBudget::default()
+        };
+        let mut renderer =
+            StreamingRenderer::new(Output::Json, budget).expect("create budget renderer");
+        renderer
+            .start(output.writer())
+            .expect("start JSON renderer");
+        assert!(renderer.write_batch(output.writer(), &first).is_err());
+    }
+    assert!(!budget_target.exists());
+    assert_eq!(
+        fs::read_dir(&root).expect("list output directory").count(),
+        0
+    );
+    fs::remove_dir_all(root).expect("clean synthetic output directory");
+}
+
+#[test]
 fn csv_output_preserves_null_empty_literal_and_rfc4180_text() {
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)])),

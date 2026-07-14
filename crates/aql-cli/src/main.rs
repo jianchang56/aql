@@ -21,6 +21,7 @@ use aql_engine_datafusion::{
 use aql_model::AccessClass;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use datafusion::arrow::record_batch::RecordBatch;
+use futures::StreamExt;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -36,12 +37,14 @@ mod shell;
 
 use cli_args::*;
 use database::*;
-use output::SecureOutputFile;
 #[cfg(test)]
-use render::{batches_to_csv, batches_to_values};
+use output::SecureOutputFile;
+use output::TransactionalOutput;
+use render::StreamingRenderer;
+#[cfg(test)]
 use render::{
-    batches_to_csv_limited, batches_to_json_limited, batches_to_jsonl_limited,
-    batches_to_table_limited,
+    batches_to_csv, batches_to_csv_limited, batches_to_json_limited, batches_to_jsonl_limited,
+    batches_to_table_limited, batches_to_values, render_batches_for_test,
 };
 use shell::*;
 
@@ -434,10 +437,7 @@ async fn execute_query(
     .await
     .map_err(|_| "query timed out")??;
     diagnostic_timing(diagnostics, "authorize", authorize_started);
-    let mut secure_output = output_file
-        .as_deref()
-        .map(SecureOutputFile::create)
-        .transpose()?;
+    let mut transactional_output = TransactionalOutput::create(output_file.as_deref())?;
     ensure_before_deadline(deadline)?;
     let inputs = resolve_database_inputs(&database)?;
     ensure_before_deadline(deadline)?;
@@ -497,65 +497,91 @@ async fn execute_query(
             }
         }
         budget.charge_output_bytes(rendered_publication_len(&rendered) as u64)?;
-        if let Some(output) = secure_output.as_mut() {
-            write_rendered(output.writer(), &rendered, &cancellation)?;
-        } else {
-            write_rendered(&mut io::stdout().lock(), &rendered, &cancellation)?;
-        }
-        if let Some(output) = secure_output {
-            output.commit()?;
-        }
+        write_rendered(transactional_output.writer(), &rendered, &cancellation)?;
+        transactional_output.publish(&cancellation)?;
         return Ok(());
     }
     let execute_started = Instant::now();
-    let mut query_task = tokio::spawn(async move { prepared.execute(sources).await });
     let execution_timeout = remaining_timeout(deadline)?;
     let deadline_sleep = tokio::time::sleep(execution_timeout);
     tokio::pin!(deadline_sleep);
-    let result = tokio::select! {
-        result = &mut query_task => result??,
+    let streaming = tokio::select! {
+        result = prepared.execute_stream(sources) => result?,
         signal = tokio::signal::ctrl_c() => {
             signal?;
             cancellation.cancel();
-            if tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                &mut query_task,
-            )
-            .await
-            .is_err()
-            {
-                return Err("query cancellation did not stop within three seconds".into());
-            }
             return Err("query cancelled".into());
         }
         _ = &mut deadline_sleep => {
             cancellation.cancel();
-            if tokio::time::timeout(
-                Duration::from_secs(3),
-                &mut query_task,
-            )
-            .await
-            .is_err()
-            {
-                return Err("query timeout did not stop within three seconds".into());
-            }
             return Err("query timed out".into());
         }
     };
+    let aql_engine_datafusion::StreamingQueryResult {
+        mut stream,
+        metadata,
+    } = streaming;
+    let mut renderer = StreamingRenderer::new(output, budget.clone())?;
+    let mut render_duration = Duration::ZERO;
+    let render_started = Instant::now();
+    renderer.start(transactional_output.writer())?;
+    render_duration += render_started.elapsed();
+    loop {
+        let next = tokio::select! {
+            next = stream.next() => next,
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                cancellation.cancel();
+                return Err("query cancelled".into());
+            }
+            _ = &mut deadline_sleep => {
+                cancellation.cancel();
+                return Err("query timed out".into());
+            }
+        };
+        let Some(batch) = next else {
+            break;
+        };
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => {
+                cancellation.cancel();
+                return Err(error.into());
+            }
+        };
+        ensure_before_deadline(deadline)?;
+        let render_started = Instant::now();
+        if let Err(error) = renderer.write_batch(transactional_output.writer(), &batch) {
+            cancellation.cancel();
+            return Err(error);
+        }
+        render_duration += render_started.elapsed();
+        if let Err(error) = ensure_before_deadline(deadline) {
+            cancellation.cancel();
+            return Err(error);
+        }
+    }
     diagnostic_timing(diagnostics, "execute", execute_started);
+    if let Err(error) = ensure_before_deadline(deadline) {
+        cancellation.cancel();
+        return Err(error);
+    }
+    let render_started = Instant::now();
+    let summary = renderer.finish(transactional_output.writer())?;
+    render_duration += render_started.elapsed();
+    let metadata = metadata.finish()?;
+    ensure_before_deadline(deadline)?;
+    transactional_output.publish(&cancellation)?;
     if !quiet {
-        for warning in &result.metadata.warnings {
+        for warning in &metadata.warnings {
             eprintln!("warning={warning}");
         }
     }
     if diagnostics {
-        eprintln!("metadata.sources={}", result.metadata.source_ids.join(","));
-        eprintln!(
-            "metadata.records_scanned={}",
-            result.metadata.records_scanned
-        );
-        eprintln!("metadata.bytes_read={}", result.metadata.bytes_read);
-        for scan in &result.metadata.scans {
+        eprintln!("metadata.sources={}", metadata.source_ids.join(","));
+        eprintln!("metadata.records_scanned={}", metadata.records_scanned);
+        eprintln!("metadata.bytes_read={}", metadata.bytes_read);
+        for scan in &metadata.scans {
             eprintln!(
                 "metadata.scan=table:{},source:{},predicates:{},limit:{},ordering:{},snapshot:{},stale:{}",
                 scan.table,
@@ -568,40 +594,17 @@ async fn execute_query(
             );
         }
     }
-    let render_started = Instant::now();
-    let batches = result.batches;
-    let returned_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
-    let render_limit = max_output_bytes
-        .checked_sub(1)
-        .ok_or("max output bytes must be greater than zero")?;
-    let (rendered, formula_escaped) = match output {
-        Output::Table => (batches_to_table_limited(&batches, render_limit)?, false),
-        Output::Json => (batches_to_json_limited(&batches, render_limit)?, false),
-        Output::Jsonl => (batches_to_jsonl_limited(&batches, render_limit)?, false),
-        Output::Csv => {
-            let csv = batches_to_csv_limited(&batches, render_limit)?;
-            (csv.rendered, csv.formula_escaped)
-        }
-    };
-    budget.charge_output_bytes(rendered_publication_len(&rendered) as u64)?;
-    if formula_escaped && !quiet {
+    if summary.formula_escaped && !quiet {
         eprintln!("warning=CSV formula-like text was escaped");
     }
-    if !access.is_empty() && (secure_output.is_some() || !io::stdout().is_terminal()) && !quiet {
+    if !access.is_empty() && (output_file.is_some() || !io::stdout().is_terminal()) && !quiet {
         eprintln!("warning=sensitive access was granted for non-terminal output");
     }
-    if let Some(output) = secure_output.as_mut() {
-        write_rendered(output.writer(), &rendered, &cancellation)?;
-    } else {
-        write_rendered(&mut io::stdout().lock(), &rendered, &cancellation)?;
-    }
-    if let Some(output) = secure_output {
-        output.commit()?;
-    }
-    diagnostic_timing(diagnostics, "render", render_started);
+    diagnostic_duration(diagnostics, "render", render_duration);
     if shell_summary && !quiet {
         eprintln!(
-            "({returned_rows} rows, {} ms)",
+            "({} rows, {} ms)",
+            summary.returned_rows,
             query_started.elapsed().as_millis()
         );
     }
@@ -722,10 +725,14 @@ fn integer_text(value: &str) -> bool {
 }
 
 fn diagnostic_timing(enabled: bool, stage: &str, started: Instant) {
+    diagnostic_duration(enabled, stage, started.elapsed());
+}
+
+fn diagnostic_duration(enabled: bool, stage: &str, duration: Duration) {
     if enabled {
         eprintln!(
             "diagnostic.stage={stage},elapsed_ms={}",
-            started.elapsed().as_millis()
+            duration.as_millis()
         );
     }
 }

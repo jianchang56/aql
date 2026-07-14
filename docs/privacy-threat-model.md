@@ -81,11 +81,11 @@ Agent auth、配置、日志、插件、项目树和未声明 sibling 文件不�
 | execution memory | 256 MiB |
 | timeout | 30 秒 |
 
-disk spill 禁用。timeout、Ctrl-C、budget error 和 broken stdout 传播 cancellation。
+查询引擎的执行 disk spill 禁用。事务输出只使用无路径、进程退出即关闭的 private 匿名临时文件，不创建可持久引用的查询结果；表格格式另用同类匿名行缓冲计算全局列宽。timeout、Ctrl-C、budget error 和 broken stdout 传播 cancellation。
 
 ## 结果发布
 
-stdout 查询先完成执行和渲染，再发布结果；任一来源失败时没有部分结果。
+stdout 查询按批流式渲染到匿名事务缓冲，只有执行到 EOF、元数据完成且渲染成功后才发布结果；任一来源失败时没有部分结果。
 
 `--output-file`：
 

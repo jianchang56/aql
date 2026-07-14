@@ -1,60 +1,395 @@
 use super::*;
+use std::io::{Seek, SeekFrom};
+use unicode_width::UnicodeWidthStr;
 
-pub(super) fn batches_to_json_limited(
-    batches: &[RecordBatch],
-    max_bytes: u64,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut rendered = LimitedString::new(max_bytes);
-    rendered.push_str("[")?;
-    let mut first = true;
-    for batch in batches {
-        for row_index in 0..batch.num_rows() {
-            if !first {
-                rendered.push_str(",")?;
+pub(super) struct RenderSummary {
+    pub(super) returned_rows: usize,
+    pub(super) formula_escaped: bool,
+}
+
+pub(super) struct StreamingRenderer {
+    state: RendererState,
+    budget: ResourceBudget,
+    returned_rows: usize,
+}
+
+enum RendererState {
+    Table(TableSpool),
+    Json {
+        first: bool,
+    },
+    Jsonl {
+        first: bool,
+    },
+    Csv {
+        schema: Option<datafusion::arrow::datatypes::SchemaRef>,
+        formula_escaped: bool,
+    },
+}
+
+impl StreamingRenderer {
+    pub(super) fn new(
+        output: Output,
+        budget: ResourceBudget,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let state = match output {
+            Output::Table => RendererState::Table(TableSpool::new()?),
+            Output::Json => RendererState::Json { first: true },
+            Output::Jsonl => RendererState::Jsonl { first: true },
+            Output::Csv => RendererState::Csv {
+                schema: None,
+                formula_escaped: false,
+            },
+        };
+        Ok(Self {
+            state,
+            budget,
+            returned_rows: 0,
+        })
+    }
+
+    pub(super) fn start(
+        &mut self,
+        writer: &mut impl Write,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if matches!(self.state, RendererState::Json { .. }) {
+            write_budgeted(writer, b"[", &self.budget)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn write_batch(
+        &mut self,
+        writer: &mut impl Write,
+        batch: &RecordBatch,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.returned_rows = self
+            .returned_rows
+            .checked_add(batch.num_rows())
+            .ok_or("returned row count overflow")?;
+        match &mut self.state {
+            RendererState::Table(table) => table.append_batch(batch, &self.budget)?,
+            RendererState::Json { first } => {
+                for row_index in 0..batch.num_rows() {
+                    if !*first {
+                        write_budgeted(writer, b",", &self.budget)?;
+                    }
+                    let row = serde_json::to_vec(&batch_row_to_value(batch, row_index)?)?;
+                    write_budgeted(writer, &row, &self.budget)?;
+                    *first = false;
+                }
             }
-            let row = serde_json::to_string(&batch_row_to_value(batch, row_index)?)?;
-            rendered.push_str(&row)?;
-            first = false;
-        }
-    }
-    rendered.push_str("]")?;
-    Ok(rendered.finish())
-}
-
-pub(super) fn batches_to_table_limited(
-    batches: &[RecordBatch],
-    max_bytes: u64,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut rendered = LimitedString::new(max_bytes);
-    let pretty = datafusion::arrow::util::pretty::pretty_format_batches(batches)?;
-    if std::fmt::Write::write_fmt(&mut rendered, format_args!("{pretty}")).is_err() {
-        if rendered.overflowed {
-            return Err("resource budget exceeded: output_bytes".into());
-        }
-        return Err("table rendering failed".into());
-    }
-    Ok(rendered.finish())
-}
-
-pub(super) fn batches_to_jsonl_limited(
-    batches: &[RecordBatch],
-    max_bytes: u64,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut rendered = LimitedString::new(max_bytes);
-    let mut first = true;
-    for batch in batches {
-        for row_index in 0..batch.num_rows() {
-            if !first {
-                rendered.push_str("\n")?;
+            RendererState::Jsonl { first } => {
+                for row_index in 0..batch.num_rows() {
+                    if !*first {
+                        write_budgeted(writer, b"\n", &self.budget)?;
+                    }
+                    let row = serde_json::to_vec(&batch_row_to_value(batch, row_index)?)?;
+                    write_budgeted(writer, &row, &self.budget)?;
+                    *first = false;
+                }
             }
-            let row = serde_json::to_string(&batch_row_to_value(batch, row_index)?)?;
-            rendered.push_str(&row)?;
-            first = false;
+            RendererState::Csv {
+                schema,
+                formula_escaped,
+            } => {
+                if let Some(expected) = schema {
+                    if batch.schema() != *expected {
+                        return Err("CSV batches have inconsistent schemas".into());
+                    }
+                } else {
+                    *schema = Some(batch.schema());
+                    for (index, field) in batch.schema().fields().iter().enumerate() {
+                        if index > 0 {
+                            write_budgeted(writer, b",", &self.budget)?;
+                        }
+                        let header = csv_quote(field.name(), false)?;
+                        write_budgeted(writer, header.as_bytes(), &self.budget)?;
+                    }
+                    write_budgeted(writer, b"\r\n", &self.budget)?;
+                }
+                for row_index in 0..batch.num_rows() {
+                    for column_index in 0..batch.num_columns() {
+                        if column_index > 0 {
+                            write_budgeted(writer, b",", &self.budget)?;
+                        }
+                        let cell = csv_arrow_cell(batch, column_index, row_index, formula_escaped)?;
+                        write_budgeted(writer, cell.as_bytes(), &self.budget)?;
+                    }
+                    write_budgeted(writer, b"\r\n", &self.budget)?;
+                }
+            }
         }
+        Ok(())
     }
-    Ok(rendered.finish())
+
+    pub(super) fn finish(
+        mut self,
+        writer: &mut impl Write,
+    ) -> Result<RenderSummary, Box<dyn std::error::Error>> {
+        let formula_escaped = match &mut self.state {
+            RendererState::Table(table) => {
+                table.render(writer, &self.budget)?;
+                false
+            }
+            RendererState::Json { .. } => {
+                write_budgeted(writer, b"]\n", &self.budget)?;
+                false
+            }
+            RendererState::Jsonl { .. } => {
+                write_budgeted(writer, b"\n", &self.budget)?;
+                false
+            }
+            RendererState::Csv {
+                schema,
+                formula_escaped,
+            } => {
+                if schema.is_none() {
+                    write_budgeted(writer, b"\n", &self.budget)?;
+                }
+                *formula_escaped
+            }
+        };
+        Ok(RenderSummary {
+            returned_rows: self.returned_rows,
+            formula_escaped,
+        })
+    }
 }
 
+fn write_budgeted(
+    writer: &mut impl Write,
+    bytes: &[u8],
+    budget: &ResourceBudget,
+) -> Result<(), Box<dyn std::error::Error>> {
+    budget.charge_output_bytes(bytes.len() as u64)?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
+
+struct TableSpool {
+    file: fs::File,
+    schema: Option<datafusion::arrow::datatypes::SchemaRef>,
+    widths: Vec<usize>,
+    rows: usize,
+    data_lines: u64,
+    data_extra_bytes: u64,
+}
+
+impl TableSpool {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            file: tempfile::tempfile()?,
+            schema: None,
+            widths: Vec::new(),
+            rows: 0,
+            data_lines: 0,
+            data_extra_bytes: 0,
+        })
+    }
+
+    fn append_batch(
+        &mut self,
+        batch: &RecordBatch,
+        budget: &ResourceBudget,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(schema) = &self.schema {
+            if batch.schema() != *schema {
+                return Err("table batches have inconsistent schemas".into());
+            }
+        } else {
+            self.schema = Some(batch.schema());
+            self.widths = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| max_line_width(field.name()))
+                .collect();
+        }
+        let options =
+            datafusion::arrow::util::display::FormatOptions::default().with_display_error(true);
+        let formatters = batch
+            .columns()
+            .iter()
+            .map(|column| {
+                datafusion::arrow::util::display::ArrayFormatter::try_new(column.as_ref(), &options)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for row_index in 0..batch.num_rows() {
+            let cells = formatters
+                .iter()
+                .map(|formatter| formatter.value(row_index).to_string())
+                .collect::<Vec<_>>();
+            let height = cells
+                .iter()
+                .map(|cell| cell.split('\n').count())
+                .max()
+                .unwrap_or(1);
+            self.data_lines = self
+                .data_lines
+                .checked_add(height as u64)
+                .ok_or("table output size overflow")?;
+            for (column_index, cell) in cells.iter().enumerate() {
+                for line in cell.split('\n') {
+                    let width = UnicodeWidthStr::width(line);
+                    self.widths[column_index] = self.widths[column_index].max(width);
+                    self.data_extra_bytes = self
+                        .data_extra_bytes
+                        .checked_add((line.len() - width) as u64)
+                        .ok_or("table output size overflow")?;
+                }
+                let bytes = cell.as_bytes();
+                self.file.write_all(&(bytes.len() as u64).to_le_bytes())?;
+                self.file.write_all(bytes)?;
+            }
+            self.rows = self.rows.checked_add(1).ok_or("table row count overflow")?;
+            self.ensure_within_budget(budget)?;
+        }
+        self.ensure_within_budget(budget)?;
+        Ok(())
+    }
+
+    fn ensure_within_budget(
+        &self,
+        budget: &ResourceBudget,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let estimated = self.estimated_output_bytes()?;
+        let available = budget
+            .max_output_bytes
+            .saturating_sub(budget.output_bytes_used());
+        if estimated > available {
+            return Err(aql_adapter_api::AdapterError::BudgetExceeded {
+                resource: "output_bytes".to_string(),
+                actual: budget.output_bytes_used().saturating_add(estimated),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn estimated_output_bytes(&self) -> Result<u64, Box<dyn std::error::Error>> {
+        let Some(schema) = &self.schema else {
+            return Ok(1);
+        };
+        let header_lines = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().split('\n').count())
+            .max()
+            .unwrap_or(1) as u64;
+        let header_extra = schema
+            .fields()
+            .iter()
+            .flat_map(|field| field.name().split('\n'))
+            .try_fold(0_u64, |total, line| {
+                total
+                    .checked_add((line.len() - UnicodeWidthStr::width(line)) as u64)
+                    .ok_or("table output size overflow")
+            })?;
+        let line_width = self.widths.iter().try_fold(1_u64, |total, width| {
+            total
+                .checked_add(*width as u64 + 3)
+                .ok_or("table output size overflow")
+        })?;
+        let lines = 3_u64
+            .checked_add(header_lines)
+            .and_then(|value| value.checked_add(self.data_lines))
+            .ok_or("table output size overflow")?;
+        line_width
+            .checked_add(1)
+            .and_then(|width| width.checked_mul(lines))
+            .and_then(|value| value.checked_add(header_extra))
+            .and_then(|value| value.checked_add(self.data_extra_bytes))
+            .ok_or_else(|| "table output size overflow".into())
+    }
+
+    fn render(
+        &mut self,
+        writer: &mut impl Write,
+        budget: &ResourceBudget,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(schema) = self.schema.clone() else {
+            write_budgeted(writer, b"\n", budget)?;
+            return Ok(());
+        };
+        self.ensure_within_budget(budget)?;
+        write_separator(writer, &self.widths, budget)?;
+        let headers = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>();
+        write_table_row(writer, &headers, &self.widths, budget)?;
+        write_separator(writer, &self.widths, budget)?;
+        self.file.flush()?;
+        self.file.seek(SeekFrom::Start(0))?;
+        for _ in 0..self.rows {
+            let mut cells = Vec::with_capacity(self.widths.len());
+            for _ in &self.widths {
+                let mut length = [0_u8; 8];
+                self.file.read_exact(&mut length)?;
+                let length = usize::try_from(u64::from_le_bytes(length))
+                    .map_err(|_| "table cell is too large")?;
+                let mut bytes = vec![0_u8; length];
+                self.file.read_exact(&mut bytes)?;
+                cells.push(String::from_utf8(bytes)?);
+            }
+            write_table_row(writer, &cells, &self.widths, budget)?;
+        }
+        write_separator(writer, &self.widths, budget)?;
+        Ok(())
+    }
+}
+
+fn max_line_width(value: &str) -> usize {
+    value
+        .split('\n')
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0)
+}
+
+fn write_separator(
+    writer: &mut impl Write,
+    widths: &[usize],
+    budget: &ResourceBudget,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_budgeted(writer, b"+", budget)?;
+    for width in widths {
+        write_budgeted(writer, vec![b'-'; width + 2].as_slice(), budget)?;
+        write_budgeted(writer, b"+", budget)?;
+    }
+    write_budgeted(writer, b"\n", budget)?;
+    Ok(())
+}
+
+fn write_table_row(
+    writer: &mut impl Write,
+    cells: &[String],
+    widths: &[usize],
+    budget: &ResourceBudget,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let lines = cells
+        .iter()
+        .map(|cell| cell.split('\n').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let height = lines.iter().map(Vec::len).max().unwrap_or(1);
+    for line_index in 0..height {
+        write_budgeted(writer, b"|", budget)?;
+        for (column_index, width) in widths.iter().enumerate() {
+            let value = lines[column_index].get(line_index).copied().unwrap_or("");
+            write_budgeted(writer, b" ", budget)?;
+            write_budgeted(writer, value.as_bytes(), budget)?;
+            let padding = width.saturating_sub(UnicodeWidthStr::width(value));
+            write_budgeted(writer, vec![b' '; padding + 1].as_slice(), budget)?;
+            write_budgeted(writer, b"|", budget)?;
+        }
+        write_budgeted(writer, b"\n", budget)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) struct CsvRendering {
     pub(super) rendered: String,
     pub(super) formula_escaped: bool,
@@ -64,93 +399,71 @@ pub(super) struct CsvRendering {
 pub(super) fn batches_to_csv(
     batches: &[RecordBatch],
 ) -> Result<CsvRendering, Box<dyn std::error::Error>> {
-    batches_to_csv_limited(batches, u64::MAX)
+    let (rendered, summary) = render_batches_for_test(Output::Csv, batches, u64::MAX)?;
+    Ok(CsvRendering {
+        rendered: if batches.is_empty() {
+            String::new()
+        } else {
+            rendered
+        },
+        formula_escaped: summary.formula_escaped,
+    })
 }
 
+#[cfg(test)]
+pub(super) fn render_batches_for_test(
+    output: Output,
+    batches: &[RecordBatch],
+    max_bytes: u64,
+) -> Result<(String, RenderSummary), Box<dyn std::error::Error>> {
+    let budget = ResourceBudget {
+        max_output_bytes: max_bytes,
+        ..ResourceBudget::default()
+    };
+    let mut writer = Vec::new();
+    let mut renderer = StreamingRenderer::new(output, budget)?;
+    renderer.start(&mut writer)?;
+    for batch in batches {
+        renderer.write_batch(&mut writer, batch)?;
+    }
+    let summary = renderer.finish(&mut writer)?;
+    Ok((String::from_utf8(writer)?, summary))
+}
+
+#[cfg(test)]
+pub(super) fn batches_to_json_limited(
+    batches: &[RecordBatch],
+    max_bytes: u64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(render_batches_for_test(Output::Json, batches, max_bytes)?.0)
+}
+
+#[cfg(test)]
+pub(super) fn batches_to_jsonl_limited(
+    batches: &[RecordBatch],
+    max_bytes: u64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(render_batches_for_test(Output::Jsonl, batches, max_bytes)?.0)
+}
+
+#[cfg(test)]
 pub(super) fn batches_to_csv_limited(
     batches: &[RecordBatch],
     max_bytes: u64,
 ) -> Result<CsvRendering, Box<dyn std::error::Error>> {
-    let Some(first) = batches.first() else {
-        return Ok(CsvRendering {
-            rendered: String::new(),
-            formula_escaped: false,
-        });
-    };
-    let schema = first.schema();
-    let mut rendered = LimitedString::new(max_bytes);
-    for (index, field) in schema.fields().iter().enumerate() {
-        if index > 0 {
-            rendered.push_str(",")?;
-        }
-        rendered.push_str(&csv_quote(field.name(), false)?)?;
-    }
-    rendered.push_str("\r\n")?;
-    let mut formula_escaped = false;
-    for batch in batches {
-        if batch.schema() != schema {
-            return Err("CSV batches have inconsistent schemas".into());
-        }
-        for row_index in 0..batch.num_rows() {
-            for column_index in 0..batch.num_columns() {
-                if column_index > 0 {
-                    rendered.push_str(",")?;
-                }
-                let cell = csv_arrow_cell(batch, column_index, row_index, &mut formula_escaped)?;
-                rendered.push_str(&cell)?;
-            }
-            rendered.push_str("\r\n")?;
-        }
-    }
+    let (rendered, summary) = render_batches_for_test(Output::Csv, batches, max_bytes)?;
     Ok(CsvRendering {
-        rendered: rendered.finish(),
-        formula_escaped,
+        rendered,
+        formula_escaped: summary.formula_escaped,
     })
 }
 
-struct LimitedString {
-    value: String,
+#[cfg(test)]
+pub(super) fn batches_to_table_limited(
+    batches: &[RecordBatch],
     max_bytes: u64,
-    overflowed: bool,
-}
-
-impl LimitedString {
-    fn new(max_bytes: u64) -> Self {
-        Self {
-            value: String::new(),
-            max_bytes,
-            overflowed: false,
-        }
-    }
-
-    fn push_str(&mut self, value: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let next = (self.value.len() as u64)
-            .checked_add(value.len() as u64)
-            .ok_or("rendered output size overflow")?;
-        if next > self.max_bytes {
-            return Err("resource budget exceeded: output_bytes".into());
-        }
-        self.value.push_str(value);
-        Ok(())
-    }
-
-    fn finish(self) -> String {
-        self.value
-    }
-}
-
-impl std::fmt::Write for LimitedString {
-    fn write_str(&mut self, value: &str) -> std::fmt::Result {
-        let next = (self.value.len() as u64)
-            .checked_add(value.len() as u64)
-            .ok_or(std::fmt::Error)?;
-        if next > self.max_bytes {
-            self.overflowed = true;
-            return Err(std::fmt::Error);
-        }
-        self.value.push_str(value);
-        Ok(())
-    }
+) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(render_batches_for_test(Output::Table, batches, max_bytes)?.0)
 }
 
 fn csv_arrow_cell(

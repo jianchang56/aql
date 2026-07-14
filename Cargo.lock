@@ -188,6 +188,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "datafusion",
+ "futures",
  "humantime",
  "rand",
  "rustix",
@@ -195,6 +196,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]
