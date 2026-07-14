@@ -295,13 +295,13 @@ mod tests {
     #[test]
     fn same_entity_is_reconciled_and_database_title_wins() {
         let index = session(
-            "codex:profile-a",
+            "codex:root-a",
             "session-1",
             "Synthetic index",
             "session_index",
         );
         let database = session(
-            "codex:profile-a",
+            "codex:root-a",
             "session-1",
             "Synthetic database",
             "state_database",
@@ -319,9 +319,9 @@ mod tests {
     }
 
     #[test]
-    fn matching_native_ids_in_different_profiles_remain_distinct() {
-        let first = session("codex:profile-a", "same", "Synthetic A", "state_database");
-        let second = session("codex:profile-b", "same", "Synthetic B", "state_database");
+    fn matching_native_ids_in_different_roots_remain_distinct() {
+        let first = session("codex:root-a", "same", "Synthetic A", "state_database");
+        let second = session("codex:root-b", "same", "Synthetic B", "state_database");
         let result = Catalog.reconcile_sessions(vec![
             CanonicalRecord::Session(first),
             CanonicalRecord::Session(second),
@@ -331,12 +331,7 @@ mod tests {
 
     #[test]
     fn stale_snapshot_is_preserved_and_reported() {
-        let mut stale = session(
-            "codex:profile-a",
-            "session-1",
-            "Synthetic",
-            "state_database",
-        );
+        let mut stale = session("codex:root-a", "session-1", "Synthetic", "state_database");
         stale.snapshot_state = SnapshotState::Stale;
         let result = Catalog.reconcile_sessions(vec![CanonicalRecord::Session(stale)]);
         assert_eq!(result.records[0].snapshot_state, SnapshotState::Stale);
@@ -345,7 +340,7 @@ mod tests {
 
     #[test]
     fn reconciliation_merges_every_public_session_field() {
-        let mut sparse = session("codex:profile-a", "session-1", "Synthetic", "session_index");
+        let mut sparse = session("codex:root-a", "session-1", "Synthetic", "session_index");
         sparse.project = None;
         sparse.status = None;
         sparse.message_count = None;
@@ -372,9 +367,9 @@ mod tests {
 
     #[test]
     fn merged_authority_uses_the_highest_observed_provenance() {
-        let index = session("codex:profile-a", "session-1", "Index", "session_index");
-        let database = session("codex:profile-a", "session-1", "Database", "state_database");
-        let rollout = session("codex:profile-a", "session-1", "Rollout", "rollout");
+        let index = session("codex:root-a", "session-1", "Index", "session_index");
+        let database = session("codex:root-a", "session-1", "Database", "state_database");
+        let rollout = session("codex:root-a", "session-1", "Rollout", "rollout");
 
         let result = Catalog.reconcile_sessions(vec![
             CanonicalRecord::Session(index),

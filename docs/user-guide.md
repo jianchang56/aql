@@ -1,6 +1,6 @@
 # AQL 用户指南
 
-本指南覆盖日常查询、命名数据库、输出、导出、索引和排障。首次使用可以先阅读根目录 [README](../README.md)。
+AQL 的完整用户模型只有一条路径：选择数据库，查询 canonical tables，输出结果。
 
 ## 交互式 Shell
 
@@ -10,25 +10,22 @@ aql shell
 aql shell -d codex
 ```
 
-无参数启动只接受真实终端。stdin 或 stdout 被重定向时会立即失败；自动化任务请使用 `query`。
-
-常用 Shell 命令：
+无参数启动只接受真实终端；自动化任务使用 `aql query`。
 
 | 命令 | 作用 |
 |---|---|
-| `SHOW DATABASES;` | 列出可用数据库，不显示路径 |
+| `SHOW DATABASES;` | 列出数据库，不显示路径 |
 | `USE name;` | 显式选择数据库 |
 | `SHOW TABLES;` | 列出 canonical tables |
-| `DESCRIBE table;` | 显示字段、类型、nullable 和访问级别 |
-| `SHOW ACCESS;` | 显示当前进程内授权 |
-| `SHOW STATUS;` | 显示数据库、授权、预算和 history 状态 |
-| `HELP;` | 显示 Shell 命令摘要 |
-| `GRANT ... FOR SESSION;` | 临时授予敏感字段访问 |
+| `DESCRIBE table;` | 显示字段、类型和访问级别 |
+| `SHOW ACCESS;` | 显示当前临时授权 |
+| `SHOW STATUS;` | 显示数据库、授权和预算状态 |
+| `GRANT ... FOR SESSION;` | 授予当前进程内敏感访问 |
 | `REVOKE ALL FOR SESSION;` | 清除临时授权 |
-| `SELECT ...;` | 执行只读 SQL |
-| `EXIT;` / `QUIT;` | 退出并清除进程内状态 |
+| `HELP;` | 显示 Shell 命令摘要 |
+| `EXIT;` / `QUIT;` | 退出 Shell |
 
-Shell 支持多行 SELECT/CTE、`EXPLAIN SELECT`、表/字段/数据库补全，以及仅在当前进程内存在的方向键 history。prompt 显示当前数据库，查询结束显示返回行数和耗时。`Ctrl-C` 清空未完成语句或取消当前查询，但不退出 Shell。语句最大 64 KiB；退出后 history、结果、授权和当前数据库全部丢弃。
+Shell 支持多行 SELECT/CTE、`EXPLAIN SELECT`、表/字段/数据库补全和进程内方向键 history。退出后 history、结果、授权和数据库选择全部丢弃。
 
 ## 数据库选择
 
@@ -40,312 +37,169 @@ Shell 支持多行 SELECT/CTE、`EXPLAIN SELECT`、表/字段/数据库补全，
 - `opencode`：`${XDG_DATA_HOME:-$HOME/.local/share}/opencode`
 - `all`：显式联合当前兼容的内置数据库
 
-`SHOW DATABASES` 只检查这些固定候选，不递归扫描 HOME、不调用 Agent 程序、不输出路径。选择单个数据库只探测对应候选；只有 `SHOW DATABASES` 和显式 `all` 会检查全部候选。
+```bash
+aql database list
+aql database discover
+aql doctor -d codex
+```
 
-### 自定义路径和命名数据库
+`database discover` 只检查四个固定候选位置，不递归扫描 HOME、不调用 Agent 程序、不输出路径。
 
-保存命名数据库需要明确确认持久化路径：
-
-确认后只会保存 adapter ID 与精确绝对路径；SQL、查询结果、访问授权和凭据不会保存。
+### 命名数据库
 
 ```bash
 aql database add work \
   --member claude=/absolute/path/to/.claude \
   --member codex=/absolute/path/to/.codex \
-  --member opencode=/absolute/path/to/opencode \
   --acknowledge-persistent-path
 
-aql database list
 aql database show work
-aql query -d work 'SELECT COUNT(*) FROM sessions'
-```
-
-保存后可以在 Shell 中直接选择：
-
-```sql
-USE work;
-```
-
-命名数据库只保存名称、Adapter 类型和绝对路径，不保存授权、SQL、正文、凭据或 installation salt。删除数据库配置不会删除 Agent 数据、索引或 Action audit：
-
-```bash
+aql database show work --access path
 aql database remove work
 ```
 
-旧 `profile`、`--profile`、`--source` 和 `--data-root` 暂时保留为隐藏兼容入口，新用法统一使用 database 和 `-d`。
+配置格式为 `aql-databases-v1`，只保存名称、Adapter ID 和绝对路径。它不保存 SQL、结果、授权、凭据或 installation salt。名称冲突时，配置数据库优先于同名内置数据库。
 
-## SQL 能力
-
-AQL 支持受限的只读 SQL，包括：
-
-- `SELECT`、CTE
-- `WHERE`
-- `JOIN`
-- `GROUP BY`、聚合函数
-- `ORDER BY`
-- `LIMIT`
-- 固定白名单函数和隐私函数
-
-AQL 拒绝多条 SQL、DML、DDL、`COPY`、`ATTACH`、unsafe pragma、外部表、文件/URL、任意 catalog、table function 和 shell 插值。
-
-示例：
-
-```sql
-SELECT agent_id, model, COUNT(*) AS sessions
-FROM sessions
-WHERE archived = false
-GROUP BY agent_id, model
-ORDER BY sessions DESC;
-```
-
-```sql
-WITH recent AS (
-  SELECT session_id, agent_id, updated_at
-  FROM sessions
-  WHERE updated_at IS NOT NULL
-)
-SELECT agent_id, COUNT(*)
-FROM recent
-GROUP BY agent_id;
-```
-
-## 敏感字段
-
-访问类别：
-
-| 授权 | 示例字段 |
-|---|---|
-| `path` | cwd、artifact path |
-| `content` | title、preview、message content、artifact payload |
-| `tool-input` | 工具参数 |
-| `tool-output` | 工具结果 |
-
-交互模式：
-
-```sql
-GRANT CONTENT FOR SESSION;
-GRANT TOOL OUTPUT FOR SESSION;
-
-SELECT tool_name, output
-FROM tool_calls
-LIMIT 10;
-
-REVOKE ALL FOR SESSION;
-```
-
-非交互模式：
+## 查询
 
 ```bash
 aql query -d codex \
-  --access content \
-  --access tool-output \
-  'SELECT tool_name, output FROM tool_calls LIMIT 10'
+  'SELECT model, COUNT(*) AS sessions FROM sessions GROUP BY model'
 ```
 
-授权仅对当前进程或当前命令有效。Secret 永远不可授权。敏感输出被重定向时，AQL 会向 stderr 写 warning，不污染结构化 stdout。
+AQL 支持受限的只读 SQL：
 
-## 输出、计划和元数据
+- SELECT、CTE、WHERE、JOIN、GROUP BY、ORDER BY、LIMIT
+- 固定聚合函数、标量函数和隐私函数
+- `EXPLAIN SELECT ...`
 
-输出格式：
+AQL 拒绝多条 SQL、DML、DDL、COPY、ATTACH、外部文件或 URL、任意 catalog、table function 和 shell 插值。
 
-```bash
-aql query -d codex --output table 'SELECT model FROM sessions'
-aql query -d codex --output json  'SELECT model FROM sessions'
-aql query -d codex --output jsonl 'SELECT model FROM sessions'
-aql query -d codex --output csv   'SELECT model FROM sessions'
-```
-
-JSON/JSONL/CSV 保留类型和 RFC 3339 时间。CSV 默认转义 `= + - @ TAB CR` 公式前缀；raw 模式必须明确确认：
-
-```bash
-aql query -d codex --output csv \
-  --csv-formulas raw \
-  --acknowledge-raw-csv-formulas \
-  'SELECT model FROM sessions'
-```
-
-查看安全化查询计划和执行元数据：
-
-```bash
-aql query -d codex --plan \
-  'SELECT session_id FROM sessions WHERE updated_at IS NOT NULL'
-
-aql query -d codex --metadata \
-  'SELECT session_id FROM sessions LIMIT 10'
-```
-
-`--diagnose` 仅向 stderr 输出已实际发生阶段的耗时。普通查询包括 `parse`、`authorize`、`probe`、`execute` 和 `render`；与 `--plan`/`EXPLAIN` 合用时在 `probe` 后结束，不输出未执行的 `execute`/`render`。诊断不包含 SQL、参数、授权值、真实路径或查询结果：
-
-```bash
-aql query -d codex --diagnose 'SELECT session_id FROM sessions LIMIT 10'
-```
-
-计划输出还会逐项说明敏感字段对应的临时授权、predicate/limit 的候选下推状态，以及每个脱敏 source ID 是否声明目标 canonical table capability。计划不会输出真实 source path。
-
-也可以使用标准只读 `EXPLAIN`，它只生成脱敏计划而不执行查询：
-
-```bash
-aql query -d codex 'EXPLAIN SELECT session_id FROM sessions LIMIT 10'
-```
-
-复杂 SQL 可以从有界本地 regular file 或 stdin 读取；三种输入方式互斥：
+SQL 可以来自一个有界 regular file 或 stdin：
 
 ```bash
 aql query -d codex --file ./query.sql
 printf '%s\n' 'SELECT COUNT(*) FROM sessions' | aql query -d codex --stdin
 ```
 
-### 安全参数绑定
+直接参数、`--file` 和 `--stdin` 三者互斥；输入最大 64 KiB。
 
-使用可重复的 `--param NAME=VALUE` 为 `:name` value placeholder 绑定标量：
-
-```bash
-aql query -d codex \
-  --param project=demo \
-  --param minimum=10 \
-  'SELECT session_id FROM sessions WHERE project = :project AND message_count >= :minimum'
-```
-
-参数支持 `null`、布尔值、带符号 64 位整数和文本。`text:`、`int:` 和 `bool:` 可以消除类型歧义，例如 `--param value=text:true` 会绑定文本 `true`。绑定发生在 SQL AST 上，不能替换表名、列名、函数或 SQL 片段。缺失、重复、未使用参数以及 `$1`、`?` 等非命名 placeholder 会被拒绝。`export` 使用相同的 `--param` 语法。
-
-非交互 Schema 和示例：
+## Schema 和示例
 
 ```bash
 aql schema --list
 aql schema sessions
+aql schema --output json sessions
 aql schema
-aql schema --output json
-aql examples
+
 aql examples --list
 aql examples sessions-by-model
+aql examples token-usage
 ```
 
-首次查看建议使用 `schema --list`，再用 `schema <table>` 查看单表；不带参数的 `schema` 会输出全部字段。
+首次查看建议先 `schema --list`，再查看单表。不带表名的 `schema` 输出全部字段。
 
-计划和元数据写入 stderr，不包含 SQL literal 或原始路径。
+## 敏感字段
 
-## 导出和报告
+| 授权 | 示例字段 |
+|---|---|
+| `path` | cwd、project、artifact path |
+| `content` | title、preview、message content、artifact payload |
+| `tool-input` | 工具参数 |
+| `tool-output` | 工具结果 |
 
-portable JSON 导出：
+Safe 字段无需授权；Secret 永远不可授权。
 
 ```bash
-aql export -d work \
-  'SELECT agent_id, model, SUM(total_tokens) FROM usage GROUP BY agent_id, model'
+aql query -d codex --access content \
+  'SELECT role, content FROM messages LIMIT 10'
 
-aql export -d work --output-file ./usage.json \
+aql query -d codex \
+  --access tool-input \
+  --access tool-output \
+  'SELECT tool_name, arguments, output FROM tool_calls LIMIT 10'
+```
+
+授权只对当前查询有效，不支持环境默认，也不会持久化。
+
+## 参数绑定
+
+```bash
+aql query -d codex \
+  --param project=text:demo \
+  --param minimum=int:10 \
+  --param active=bool:true \
+  'SELECT session_id FROM sessions WHERE project = :project AND message_count >= :minimum AND archived != :active'
+```
+
+未加前缀时，`null`、`true`、`false` 和整数形状会自动绑定对应类型，其余值为文本。显式 `text:` 可绑定文本 `true` 或 `42`。缺失、重复、未使用参数和非命名 placeholder 都会被拒绝。
+
+## 输出
+
+```bash
+aql query -d codex --output table 'SELECT model FROM sessions LIMIT 10'
+aql query -d codex --output json  'SELECT model FROM sessions LIMIT 10'
+aql query -d codex --output jsonl 'SELECT model FROM sessions LIMIT 10'
+aql query -d codex --output csv   'SELECT model FROM sessions LIMIT 10'
+```
+
+JSON 保留 null、布尔、整数、timestamp 和 JSON 列类型。CSV 使用 RFC 4180，并始终转义电子表格公式形状文本；不存在 raw 模式。
+
+原子文件输出：
+
+```bash
+aql query -d codex \
+  --output json \
+  --output-file ./result.json \
   'SELECT * FROM usage'
 ```
 
-文件目标必须不存在。AQL 使用同目录 private 临时文件和 atomic no-replace 发布，不提供 overwrite/force。
+目标必须不存在。AQL 在同目录创建 mode `0600` 的临时文件，完成后 fsync 并 no-replace rename；失败不会留下目标文件或部分成功输出。
 
-预定义 Markdown 报告：
-
-```bash
-aql report summary -d work
-aql report project -d work --access path
-aql report summary -d work \
-  --since 2026-01-01T00:00:00Z \
-  --until 2026-02-01T00:00:00Z
-aql report project -d work --access path \
-  --project '…/demo'
-```
-
-`--since` 和 `--until` 接受 RFC 3339 时间；`--project` 只适用于 project report，并匹配报告中显示的 masked project 值。参数绑定到固定的 `aql-reports-v1` 报告 SQL，不能提供 SQL 片段。
-
-stdout export/report 会在全部来源成功后一次发布，避免部分成功结果。
-
-## 可选索引和全文搜索
-
-Safe metadata 索引：
+## EXPLAIN 和诊断
 
 ```bash
-aql index build -d codex --policy metadata
-aql index update -d codex --policy metadata
-aql index status -d codex
+aql query -d codex \
+  'EXPLAIN SELECT session_id FROM sessions WHERE model = '\''gpt-5'\'''
+
+aql query -d codex --diagnostics \
+  'SELECT session_id FROM sessions LIMIT 10'
 ```
 
-Content 索引是 AQL state 中的本机明文副本，必须同时授权并确认：
-
-```bash
-aql index build -d codex \
-  --policy content \
-  --access content \
-  --acknowledge-persistent-sensitive-copy
-
-aql search -d codex \
-  --access content \
-  '"connection timeout"'
-
-aql search -d codex \
-  --access content \
-  --session-id session_opaque_id \
-  --document-kind message_content \
-  --context-tokens 16 \
-  timeout
-```
-
-搜索可通过查询结果中的 `source_id`、`session_id` 和三个固定文本字段进行过滤。AQL 只在内存中把 `session_id` 转换为当前安装的私有索引 ID，不保存原始 ID 与索引 ID 的映射。`--context-tokens 1..64` 返回有界 Content 摘录并将结果标记为 `access_class=content`；默认值 0 省略 `context` 字段并标记为 `content_derived`。所有过滤条件使用绑定参数，不能注入搜索表达式或 SQL 片段。
-
-Content 索引不包含工具输入/输出、reasoning、permission/share/account/credential、日志、配置或项目文件。`index clear` 和 `index repair` 只操作 marker/catalog 验证后的 AQL-owned state，不承诺法证擦除。
+`EXPLAIN` 输出授权后的表、列、访问需求、pushdown、预算和来源能力，不执行查询。`--diagnostics` 向 stderr 输出实际发生阶段的耗时、来源 ID、扫描 pushdown、读取量和 warning；不包含 SQL literal、参数值、真实路径或结果。
 
 ## 资源预算
 
-默认值：
-
-| 资源 | 默认限制 |
-|---|---:|
-| timeout | 30 秒 |
-| records | 100,000 |
-| source bytes | 256 MiB |
-| output | 64 MiB |
-| single sensitive value | 16 MiB |
-| DataFusion memory | 256 MiB |
-| disk spill | 禁用 |
-
-对应参数：
+公开参数：
 
 ```text
---timeout
---max-records
---max-bytes-read
---max-output-bytes
---max-single-value-bytes
---max-memory-bytes
+--timeout              默认 30s
+--max-output-bytes     默认 64MiB
 ```
 
-预算、超时、Ctrl-C 或 broken stdout 会传播 cancellation。失败不会返回看似成功的部分结果。
+内部安全预算始终启用：
 
-## 排障
+| 环境变量 | 默认值 |
+|---|---:|
+| `AQL_MAX_RECORDS` | 100,000 |
+| `AQL_MAX_BYTES_READ` | 256 MiB |
+| `AQL_MAX_SINGLE_VALUE_BYTES` | 16 MiB |
+| `AQL_MAX_MEMORY_BYTES` | 256 MiB |
 
-- `No database selected`：运行 `SHOW DATABASES;` 和 `USE <name>;`。
-- `unknown or unavailable database`：运行 `aql database discover` 和 `aql database list`；确认 Agent 使用默认位置，或创建命名数据库。
-- `requires --access ...`：只在确实需要该字段时添加相应临时授权。
-- `source path is unavailable`：确认路径存在、为绝对路径且没有 symlink/type/permission 问题。
-- `future migration` / `protocol drift`：当前 Agent 格式超出兼容范围；不要绕过 schema 校验，参阅 [兼容性矩阵](compatibility.md)。
-- `query timed out` / budget exceeded：增加过滤和 LIMIT；确认后再有界提高对应预算。
-- `raw CSV formulas require ...`：保留默认 safe 模式，或同时传入 raw acknowledgement。
-- `install prefix already exists`：升级应使用新的版本化 prefix，不要覆盖。
+这些环境变量只调整上限，不选择数据库、不授予敏感访问。命令行仍可设置 `AQL_TIMEOUT` 和 `AQL_MAX_OUTPUT_BYTES` 对应参数。
 
-仍无法判断时先运行有界诊断：
+## 错误和排障
 
-```bash
-aql doctor -d codex
-```
+- 缺少数据库：运行 `aql database list`，然后使用 `-d <database>`。
+- 数据库不可用：运行 `aql database discover` 和 `aql doctor -d <database>`。
+- `requires --access ...`：先用 `aql schema <table>` 确认访问级别，再添加最小授权。
+- 格式漂移：参阅 [兼容性](compatibility.md)，不要绕过 schema 验证。
+- timeout 或 budget exceeded：增加 WHERE/LIMIT，确认后再提高对应上限。
 
-诊断输出包含 format/capability/warning，不输出消息或工具载荷。
-
-所有命令支持稳定文本错误；自动化可以请求单行 JSON 错误：
+自动化可以请求单行 JSON 错误：
 
 ```bash
 aql --error-format json query -d missing 'SELECT COUNT(*) FROM sessions'
 ```
 
-脚本可以增加全局 `--quiet` 抑制非必要 warning 和 Shell 摘要；错误仍使用统一的
-`--error-format json` 单行对象，显式请求的 `--plan` 与 `--metadata` 不会被隐藏。
-
-CI 也可以设置 `AQL_ERROR_FORMAT`、`AQL_TIMEOUT`、`AQL_MAX_RECORDS`、
-`AQL_MAX_BYTES_READ`、`AQL_MAX_OUTPUT_BYTES`、`AQL_MAX_SINGLE_VALUE_BYTES`、
-`AQL_MAX_MEMORY_BYTES` 和 `AQL_MAX_INDEX_BYTES`。命令行参数优先；数据库和敏感访问
-授权故意不支持环境默认。
-
-JSON 包含 `category`、`message`、`hint` 和 `exit_code`。
+JSON 包含 `category`、`message`、`hint` 和 `exit_code`。`--quiet` 只抑制非必要 warning 和 Shell 摘要，不隐藏错误或显式诊断。

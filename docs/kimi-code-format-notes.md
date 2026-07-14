@@ -2,7 +2,7 @@
 
 ## Status and pinned evidence
 
-Phase 6 read-only contract, recorded on 2026-07-12 (Asia/Shanghai). The installed CLI version `0.23.3` resolves to official tag `@moonshot-ai/kimi-code@0.23.3`, peeled commit `93c0b7bb7836fa990cd9cd35f6518ed55841d2fe`. The wire protocol emitted by that source is `1.4`.
+Read-only contract recorded on 2026-07-12 (Asia/Shanghai). The installed CLI version `0.23.3` resolves to official tag `@moonshot-ai/kimi-code@0.23.3`, peeled commit `93c0b7bb7836fa990cd9cd35f6518ed55841d2fe`. The wire protocol emitted by that source is `1.4`.
 
 Evidence was extracted from an unexecuted, dependency-free temporary clone of that exact commit. No package script, build, test, checked-in executable or plugin was run. No real `wire.jsonl`, plan, task, log, credential, OAuth or configuration payload was read. Real `state.json` inspection remained limited to structural key paths; session-tree inspection remained limited to names, types, permissions and sizes.
 
@@ -17,11 +17,11 @@ Evidence was extracted from an unexecuted, dependency-free temporary clone of th
 - Installed source commit: `93c0b7bb7836fa990cd9cd35f6518ed55841d2fe`.
 - Official repository package version separately observed during the survey: `0.23.5`; it is compatibility evidence only and cannot replace the pinned installed contract.
 
-The public CLI exposes session resume, `export`, ACP, a local REST/WebSocket server, visualizer and migration. `kimi export` copies the complete target session directory and includes the active global diagnostic log by default. It must not be used against a real user session for AQL fixture generation or acceptance.
+The public CLI exposes multiple local and network surfaces, but AQL uses none of them. It must not invoke the CLI, server or migration tools against a real user session for fixture generation or acceptance.
 
 ## Observed root structure
 
-The observed root is `~/.kimi-code`. Only these candidates are relevant to the Phase 6 read Adapter:
+The observed root is `~/.kimi-code`. Only these candidates are relevant to the read Adapter:
 
 ```text
 ~/.kimi-code/
@@ -82,7 +82,7 @@ Classification:
 - The work-directory bucket name is a locator, not session identity.
 - The session UUID is a native identity candidate, but the exact authority and migration behavior must be proven from pinned official source and fixtures.
 
-Official source comments state that `state.json` is self-describing and can recover sessions when `session_index.jsonl` is stale or relocated. Phase 6 must therefore treat the index as a discovery accelerator/hint and define `state.json` authority explicitly instead of silently dropping unindexed sessions.
+Official source comments state that `state.json` is self-describing and can recover sessions when `session_index.jsonl` is stale or relocated. The Adapter therefore treats the index as a discovery hint and `state.json` as the metadata authority instead of silently dropping unindexed sessions.
 
 Pinned sources: `packages/agent-core/src/session/index.ts`, `packages/agent-core/src/session/store/session-store.ts`, and the legacy migration writer.
 
@@ -123,7 +123,7 @@ The file is an ordered newline-delimited JSON event log. Its first record is:
 
 The fixed reader boundary is the byte length observed when a scan opens the regular file. Records after that boundary belong to a later scan. A complete malformed record is fatal. A final line without a newline is accepted only if it is complete valid JSON; an incomplete final JSON value is ignored for that scan while all prior records remain valid. Unknown well-formed record types are skipped with sanitized warnings.
 
-Official migrations form `1.0 -> 1.1 -> 1.2 -> 1.3 -> 1.4`. Version 1.1 flattens legacy tool calls from `function: {name, arguments}` to `{name, arguments}`; 1.2 is approval-record-only; 1.3 is a blob-reference bump; 1.4 changes goal records only. Phase 6 supports exact 1.4 and only the fixture-backed 1.0 message migration needed by the synthetic legacy fixture. Newer protocols fail closed. Missing metadata or an unrecognized older migration path is rejected.
+Official migrations form `1.0 -> 1.1 -> 1.2 -> 1.3 -> 1.4`. Version 1.1 flattens legacy tool calls from `function: {name, arguments}` to `{name, arguments}`; 1.2 is approval-record-only; 1.3 is a blob-reference bump; 1.4 changes goal records only. The Adapter supports exact 1.4 and only the fixture-backed 1.0 message migration needed by the synthetic legacy fixture. Newer protocols fail closed. Missing metadata or an unrecognized older migration path is rejected.
 
 ### Canonical record allowlist
 
@@ -146,9 +146,7 @@ It must not infer roles, tool pairing, session edges, timestamps or identities b
 
 ## Official server/API boundary
 
-The open-source Kimi server exposes read surfaces for sessions, messages, snapshots and status, and mutation surfaces including archive/restore and metadata/profile changes. AQL must not auto-start the server, read its token/configuration, rotate credentials or depend on a running daemon for normal local queries.
-
-Phase 6 includes a separate Action admission survey. Archive/restore/rename remain production-unsupported unless the current official request/response contract proves target binding, atomic expected revision/CAS, idempotency or authoritative outcome lookup, stable result mapping and disposable-profile acceptance. Endpoint existence alone is insufficient.
+The open-source Kimi server exposes network APIs, but AQL does not use them. AQL must not auto-start the server, read its token/configuration, rotate credentials or depend on a running daemon for local queries.
 
 ## Compatibility policy
 
@@ -168,4 +166,4 @@ The verifier scans fixture bytes for host home paths, emails and token/secret-sh
 - Active-file rotation/truncation and root replacement must be detected by file identity/size revalidation and cause a sanitized retry/failure; continuity must not be guessed.
 - Non-text media content and provider-specific extras remain unsupported canonical payloads until a separate schema/privacy mapping is required.
 
-No implementation may guess these semantics. The Phase 6 fixture/contract task must close them or mark the affected canonical capability unsupported.
+No implementation may guess these semantics. Fixture and contract tests must close them or mark the affected canonical capability unsupported.

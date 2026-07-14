@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for Phase 0/MVP.
+Accepted for the focused read-only product.
 
 ## Context
 
@@ -94,4 +94,3 @@ GitQL was not rejected for performance alone. It was rejected because cancellati
 ## Migration triggers
 
 Re-evaluate only if DataFusion prevents required source pushdown, cannot meet supported-platform packaging constraints, introduces an unfixable SQL correctness issue, or exceeds the documented resource budget on typical datasets.
-

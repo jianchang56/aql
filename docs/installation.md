@@ -1,151 +1,107 @@
-# AQL 安装、升级与卸载
-
-当前支持 macOS 和 Linux。Windows 暂缓。仓库没有远程自动安装器，也不会修改 shell 配置或调用 `sudo`。
-
-## GitHub Release 与 Homebrew
-
-推送经过验证的 `vMAJOR.MINOR.PATCH` tag 后，release workflow 会构建四个平台的确定性归档：
-
-```text
-aql-VERSION-aarch64-linux.tar.gz
-aql-VERSION-aarch64-macos.tar.gz
-aql-VERSION-x86_64-linux.tar.gz
-aql-VERSION-x86_64-macos.tar.gz
-```
-
-每个归档都有独立 `.sha256`，并附带按四个平台 checksum 生成的 `aql.rb`。Release 在全部归档、校验和与 Formula 完成前保持 draft。仓库发布后可以使用对应 Release 页面中的 Formula：
-
-```bash
-brew install --formula ./aql.rb
-```
-
-项目不提供 `curl | sh` 安装方式。
+# 安装、升级与卸载
 
 ## 从源码构建
 
-要求：
-
-- Rust `1.88.0`（仓库的 `rust-toolchain.toml` 会固定版本）
-- Git
-- macOS 或 Linux
+要求 Rust `1.88.0`：
 
 ```bash
-cd aql
 cargo build --locked --release -p aql-cli
-./target/release/aql --version
 ```
 
-也可以安装到 Cargo 的 bin 目录：
+二进制位于：
+
+```text
+target/release/aql
+```
+
+也可以安装到 Cargo bin：
 
 ```bash
 cargo install --locked --path crates/aql-cli
 ```
 
-将程序复制到现有 `PATH` 目录是用户自己的选择，例如：
+AQL 不自动使用 sudo、不修改 shell 配置、不从网络下载依赖外的可执行文件。
+
+## 验证源码工作区
 
 ```bash
-mkdir -p "$HOME/.local/bin"
-install -m 755 target/release/aql "$HOME/.local/bin/aql"
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo xtask verify
 ```
 
-AQL 不会自动编辑 `PATH`。确认 `$HOME/.local/bin` 已由你的 shell 配置管理。
+## 本地确定性 release
 
-## 自动补全和 man page
-
-```bash
-aql completions bash > ./aql.bash
-aql completions zsh > ./_aql
-aql completions fish > ./aql.fish
-aql man > ./aql.1
-man ./aql.1
-```
-
-生成物来自 public CLI tree，不包含隐藏测试参数、真实路径或 SQL history。
-
-## 构建可验证的本地 release
-
-Rust release 工具只处理本地文件，不下载或发布任何内容：
+`aql-release` 负责 build manifest、archive、验证、安装、卸载和 Formula 生成。发布内容只包含 allowlist 中的 AQL 文件。下面以 Apple Silicon macOS 和版本 `0.1.0` 为例；其他平台替换 `TARGET`。
 
 ```bash
-SOURCE_DATE_EPOCH=1 cargo build --locked --release -p aql-cli
-
-# macOS Apple Silicon；其他平台使用 version --output json 中的 target 值
+SOURCE_DATE_EPOCH=1 cargo build --locked --release -p aql-cli -p aql-release
 TARGET=aarch64-macos
 
-SOURCE_DATE_EPOCH=1 cargo run --locked -p aql-release -- build \
+target/release/aql-release -- build \
   --binary target/release/aql \
-  --output-dir ./target/local-release \
+  --output-dir ./dist \
   --version 0.1.0 \
   --target "$TARGET"
 
 SHA256=$(awk '{print $1}' \
-  "./target/local-release/aql-0.1.0-$TARGET.tar.gz.sha256")
+  "./dist/aql-0.1.0-$TARGET.tar.gz.sha256")
 
-cargo run --locked -p aql-release -- verify \
-  --archive "./target/local-release/aql-0.1.0-$TARGET.tar.gz" \
+target/release/aql-release -- verify \
+  --archive "./dist/aql-0.1.0-$TARGET.tar.gz" \
   --expected-sha256 "$SHA256" \
   --version 0.1.0 \
   --target "$TARGET"
 ```
 
-校验覆盖 SHA-256、target/version、manifest、entry allowlist、权限、traversal、symlink/hardlink、duplicate entry 和 gzip trailing data。
+Release workflow 使用固定 SHA 的 GitHub Actions、locked Cargo 构建、四个平台 target、独立 build/publish 权限和 draft=false 发布。
 
-## 从本地 release 安装
+## 安装 release archive
 
-安装 prefix 必须是新的绝对路径，父目录由当前用户拥有：
+先验证 archive，再安装到新的版本化 prefix。不要覆盖已有 prefix：
 
 ```bash
-mkdir -p "$HOME/.local/aql"
-chmod 700 "$HOME/.local/aql"
-
-cargo run --locked -p aql-release -- install \
-  --archive "./target/local-release/aql-0.1.0-$TARGET.tar.gz" \
-  --expected-sha256 "$SHA256" \
-  --version 0.1.0 \
-  --target "$TARGET" \
-  --prefix "$HOME/.local/aql/0.1.0" \
-  --plan
-
-cargo run --locked -p aql-release -- install \
-  --archive "./target/local-release/aql-0.1.0-$TARGET.tar.gz" \
+target/release/aql-release -- install \
+  --archive "./dist/aql-0.1.0-$TARGET.tar.gz" \
   --expected-sha256 "$SHA256" \
   --version 0.1.0 \
   --target "$TARGET" \
   --prefix "$HOME/.local/aql/0.1.0"
-
-"$HOME/.local/aql/0.1.0/bin/aql" --version
 ```
 
-installer 拒绝 URL、stdin archive、已有 prefix、symlink/unsafe parent、checksum mismatch 和 Agent/AQL data root overlap。
+把 `bin/aql` 链接或加入 PATH 的动作由用户明确执行。安装器不会写 Agent 数据、shell rc 或系统目录。
 
 ## 升级
 
-升级使用新的版本化 prefix，不覆盖旧安装：
+升级使用新 prefix：
 
-```bash
-cargo run --locked -p aql-release -- install \
-  --archive "/local/path/aql-0.2.0-$TARGET.tar.gz" \
-  --expected-sha256 "<64-lowercase-hex>" \
-  --version 0.2.0 \
-  --target "$TARGET" \
-  --prefix "$HOME/.local/aql/0.2.0"
+```text
+$HOME/.local/aql/0.1.0
+$HOME/.local/aql/0.2.0
 ```
 
-验证新版本后，由用户手动切换 launcher 或 PATH。旧版本不会自动删除。
+验证新版本后再切换用户自己管理的 PATH/symlink。配置数据库由 `aql database` 管理并使用私有 `aql-databases-v1` schema。
 
 ## 卸载
 
 ```bash
-cargo run --locked -p aql-release -- uninstall \
+target/release/aql-release -- uninstall \
   --prefix "$HOME/.local/aql/0.1.0"
 ```
 
-uninstaller 只删除安装 manifest 中的固定文件。它不会删除：
+卸载器只删除 manifest 中仍与安装 digest 匹配的文件；被替换的文件或 foreign files 会导致 fail closed。
 
-- AQL config/profile
-- AQL index
-- Action audit/state
-- Agent 数据
-- prefix 中的未知文件
+卸载二进制不会自动删除配置数据库和 installation salt。用户如需删除，应先确认目录是 AQL-owned 且不与任何 Agent root 重叠。
 
-存在未知文件时，prefix 会被保留并输出 warning。
+## Homebrew Formula
+
+```bash
+target/release/aql-release -- formula \
+  --version 0.1.0 \
+  --base-url https://github.com/OWNER/REPO/releases/download/v0.1.0 \
+  --dist ./dist \
+  --output ./dist/aql.rb
+```
+
+Formula 只引用已验证 archive 和固定 SHA256。

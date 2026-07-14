@@ -1,223 +1,103 @@
-# Codex 本地数据格式勘察笔记
+# Codex format notes
 
-## 1. 文档用途
+本文记录当前 Codex read Adapter 的格式证据和 fail-closed 边界。所有测试数据来自 `aql-test-support` 的确定性合成 fixture；不得把真实会话正文、工具载荷、路径、ID 或凭据复制到文档或测试。
 
-本文件是 `P0-T02` 的事实记录模板。它只记录格式结构、关联规则和兼容性结论，不提取、物化或记录任何真实会话正文或敏感字段值。结构 survey 可以流式跳过 value，但不得把完整事件解析为可 Debug/序列化的通用 JSON 对象。
+## Read allowlist
 
-状态标签：
-
-- `Observed`：已在本机只读验证。
-- `Fixture`：仅在合成 fixture 验证。
-- `Hypothesis`：待验证，不得据此实现破坏性行为。
-- `Unsupported`：Phase 0 明确不支持。
-
-## 2. 已观察的数据根结构
-
-当前本机环境观察到 Codex 数据根可能包含：
-
-| 类别 | 路径模式 | 状态 | 角色 |
-|---|---|---|---|
-| 主状态库 | `~/.codex/sqlite/state_*.sqlite` 或 `~/.codex/state_*.sqlite` | Observed | thread metadata、关系、jobs 等 |
-| WAL/SHM | 对应 `-wal`、`-shm` | Observed | SQLite 活跃事务视图 |
-| Session edges | SQLite `thread_spawn_edges` | Observed | `parent_thread_id TEXT NOT NULL`, `child_thread_id TEXT PRIMARY KEY`, `status TEXT NOT NULL`; no declared foreign keys or timestamp |
-| Session index | `~/.codex/session_index.jsonl` | Observed | session ID、名称、更新时间索引 |
-| Archived rollout | `~/.codex/archived_sessions/*.jsonl` | Observed | session 事件流 |
-| Active rollout | 待勘察 | Hypothesis | 活跃 session 事件流 |
-| Legacy history | `~/.codex/history.jsonl` | Observed | 旧/辅助历史，角色待确认 |
-| Auth/config | `~/.codex/auth.json`、`config.toml` | Observed / Unsupported | 禁止作为查询数据源 |
-
-注意：文件名和位置不是稳定 API。Adapter 必须以 probe 和格式指纹为依据，不能只按固定路径假定。
-
-## 3. 已观察 SQLite Schema
-
-在当前环境的 `state_5.sqlite` 中观察到以下表：
-
-| 表 | Phase 0 | 用途 |
-|---|---:|---|
-| `threads` | 是 | sessions metadata 主来源候选 |
-| `thread_dynamic_tools` | 否 | 后续工具定义能力 |
-| `thread_spawn_edges` | 否 | 后续 session edges |
-| `agent_jobs` | 否 | 后续 jobs |
-| `agent_job_items` | 否 | 后续 job items |
-| `backfill_state` | 只诊断 | 数据回填状态 |
-| `_sqlx_migrations` | 是 | format fingerprint 输入 |
-| `remote_control_enrollments` | Unsupported | 可能含账户/服务信息，不查询 |
-
-### 3.1 `threads` 已观察字段
-
-只记录字段名和类型，不记录真实值：
-
-| 字段 | SQLite 类型 | Canonical 候选 |
-|---|---|---|
-| `id` | TEXT | `native_id` |
-| `rollout_path` | TEXT | source locator，仅内部使用 |
-| `created_at` / `created_at_ms` | INTEGER | `created_at` |
-| `updated_at` / `updated_at_ms` | INTEGER | `updated_at` |
-| `source` / `thread_source` | TEXT | extension/source metadata |
-| `model_provider` | TEXT | `provider` |
-| `model` | TEXT | `model` |
-| `cwd` | TEXT | `cwd`，Access=Path |
-| `title` | TEXT | `title`，Access=Content |
-| `preview` | TEXT | `preview`，Access=Content |
-| `tokens_used` | INTEGER | `tokens_used` |
-| `archived` / `archived_at` | INTEGER | `archived` |
-| `first_user_message` | TEXT | Content，Phase 0 metadata 查询禁止读取 |
-| `cli_version` | TEXT | format/record provenance |
-| git 字段 | TEXT | Phase 0 可暂不暴露 |
-| sandbox/approval/memory 字段 | TEXT | extension，Phase 0 可暂不暴露 |
-
-### 3.2 SQLite Authority 初稿
-
-- `title`、`cwd`、`created_at`、`updated_at`、`archived`：`threads` 为首选 authority；authority 不改变 title/cwd 的访问等级。
-- `preview`、`first_user_message`：即使位于 metadata DB，也按 Content 分类。
-- `rollout_path`：仅用于定位对应事件流，不直接输出。
-- 重复秒/毫秒时间字段优先毫秒字段；需测试 migration 中 NULL/不一致情况。
-
-## 4. 已观察 JSONL 结构
-
-当前归档 rollout 中观察到的顶层事件类型：
-
-- `session_meta`
-- `turn_context`
-- `event_msg`
-- `response_item`
-- `compacted`
-
-这些枚举只说明类型存在，不说明其内部字段已完整稳定。
-
-### 4.1 安全勘察方法
-
-允许输出：
-
-- 顶层 key 集合。
-- `type` 枚举及计数。
-- 每个 type 的嵌套 key 路径集合。
-- JSON value 类型，如 string/object/array/null。
-- 字符串长度分布，不输出字符串值。
-
-禁止输出：
-
-- `content`、`text`、`message`、`arguments`、`output` 等值。
-- 命令、路径、URL、邮箱、token。
-- 任意“前 100 字符”采样。
-
-需要验证跨来源 ID 相等性时，只允许在进程内使用每次运行随机生成的 keyed hash 比较；输出仅包含 `matched_count`、`unmatched_count` 和布尔结论，禁止输出 ID、稳定 hash 或可跨运行关联的摘要。
-
-### 4.2 待建立映射
-
-| 原始事件 | Canonical | 状态 | 待确认 |
-|---|---|---|---|
-| `session_meta` | session metadata/provenance | Observed shape | `payload.id`、`payload.cwd`、`payload.cli_version`、timestamp |
-| `turn_context` | message/turn metadata | Observed shape | model/provider、时间及上下文字段 |
-| `event_msg` | message 或 usage event | Observed shape | `payload.type` 决定具体映射，值枚举仍待 fixture |
-| `response_item` | message/tool call | Observed shape | 可含 role/content 或 name/call_id/arguments/output |
-| `compacted` | session event | Hypothesis | 是否产生用户可查询 message |
-
-任何 Hypothesis 都必须通过合成 fixture 和安全 shape survey 后才能进入实现。
-
-## 5. Session Index
-
-观察到单行包含字段：
-
-- `id`
-- `thread_name`
-- `updated_at`
-
-初步规则：
-
-- `id` 可与 SQLite `threads.id` 关联。
-- `thread_name` 可能与 `title` 重叠，authority 低于 SQLite `threads.title`。
-- Index 可用于发现，但不能作为 messages 来源。
-- JSONL 重复 ID、旧 entry 和 append-only 更新语义需要 fixture 验证。
-
-## 6. Identity 与合并规则
-
-### 6.1 已知关联
-
-- SQLite `threads.id` ↔ session index `id`：Observed candidate，需自动化验证。
-- SQLite `threads.rollout_path` ↔ rollout 文件：Observed candidate，路径本身不得输出。
-- Rollout `session_meta.payload.id` 与 SQLite `threads.id` 使用同一 native-ID 候选空间；Phase 0 解析仍以 `threads.rollout_path` 作为权威定位关系，并在合成 fixture 中验证 ID 一致性。
-
-### 6.2 禁止猜测
-
-- 不按 title 合并。
-- 不按 cwd + 时间相近合并。
-- 不跨 data root/profile 合并。
-- 不按 rollout 文件名截取 ID，除非格式指纹证明该规则稳定。
-
-## 7. Format Fingerprint
-
-建议由以下非敏感信息构成：
-
-- SQLite `_sqlx_migrations` 成功版本列表的 hash。
-- 关键表及列名/类型的排序 hash。
-- JSONL 顶层 type 集合和必需 key shape 的 hash。
-- Session index key shape hash。
-
-不得使用：
-
-- 数据内容 hash。
-- 绝对 data root。
-- installation/account ID。
-
-示例标识：`codex-state-v5:<schema-hash>:<rollout-shape-hash>`。
-
-## 8. Probe 决策表
-
-| 情况 | 结果 |
-|---|---|
-| data root 不存在 | `NotFound` |
-| SQLite 存在且 schema 已知 | metadata capability 可用 |
-| SQLite schema 含新增 nullable 列 | warning，继续 |
-| 关键表/ID 列缺失 | `UnsupportedFormat` |
-| rollout 不存在 | messages/tool_calls capability 不可用，sessions 仍可查 |
-| rollout 有未知事件 | warning，跳过未知事件 |
-| JSONL 最后一行截断 | warning，保留此前记录 |
-| auth/config 存在 | 忽略，不报告具体内容 |
-
-已验证的 Phase 3 artifact 来源仅为 `event_msg.payload.type = patch_apply_end` 的 `payload.changes` object。object key 是 Path；value 仅按投影读取 `type`、`move_path`、`content`、`unified_diff`。未知 event/tool 参数不推断为 artifact，且 key 指向的文件永不打开。
-
-## 9. Fixture 映射要求
-
-每个 observed shape 必须有合成 fixture：
-
-- SQLite schema 与关键 index。
-- Session index append/重复行为。
-- 每个已支持 rollout event 的最小 JSON。
-- 未知 event 与新增字段。
-- 时间字段 NULL/冲突。
-- rollout path 不存在。
-- 相同 native ID 位于两个 profile。
-
-## 10. 待办清单（P0-T02）
-
-- [ ] 确认 active rollout 默认路径或发现机制。
-- [ ] 只读导出 `_sqlx_migrations` 版本，不导出其他值。
-- [ ] 生成关键 SQLite schema hash。
-- [x] 使用只保留 key/type 的流式 Shape Visitor 收集 rollout key path，不保留值。
-- [x] 确认 `session_meta.payload.id` 字段存在；真实来源间以 `threads.rollout_path` 定位，ID 一致性放入合成 fixture 验证，避免提取真实 ID。
-- [ ] 验证 session index 重复 ID 的最后写入/最新时间语义。
-- [ ] 确认 archived 与 active session 是否可能同时出现。
-- [ ] 记录未知/旧格式降级策略。
-- [ ] 将结论写入 `docs/compatibility.md`。
-
-## 11. 安全 Survey 输出示例
-
-允许：
+Adapter 只使用显式选择的 Codex root 中的以下来源：
 
 ```text
-source=state_sqlite
-tables=threads,_sqlx_migrations
-threads.columns=id:TEXT,title:TEXT,updated_at_ms:INTEGER
-threads.rows=123
-rollout.types=event_msg:42,response_item:105,session_meta:1
-rollout.paths.response_item=payload.type:string,payload.content:array
+sqlite/state_*.sqlite 或 root/state_*.sqlite
+session_index.jsonl（存在时）
+threads.rollout_path 明确指向的 rollout JSONL
 ```
 
-禁止：
+SQLite 以 read-only 方式打开。Adapter 不读取 auth、config、history、logs、skills、plugins、项目树或任意未声明 sibling 文件，也不创建 sidecar、checkpoint、migration 或缓存。
+
+## State database contract
+
+数据库必须包含 `threads`，且至少包含：
 
 ```text
-title=Fix production API key ...
-cwd=<USER_HOME>/company/secret-project
-content=...
+id
+rollout_path
 ```
+
+已支持的 optional session 字段包括 model/provider、created/updated time、title、preview、cwd、token count 和 archive state。新增未知列产生 sanitized warning；缺少 optional 列返回 NULL 并 warning。缺少 identity/locator authority 则拒绝格式。
+
+`thread_spawn_edges` 存在时，必须包含：
+
+```text
+parent_thread_id
+child_thread_id
+status
+```
+
+只有这些显式字段可生成 `session_edges`。循环和悬空 child 可以作为数据返回并产生 warning；不得按 title、path、时间或正文推断关系。
+
+Format fingerprint 由 SQLite user version、排序后的表/列 shape、session-index presence、rollout contract 和 edge contract 组成。普通 session 增删不改变 fingerprint。未识别 user version 或兼容 optional drift 产生 warning；缺少 required schema fail closed。
+
+## Identity and authority
+
+- `threads.id` 是 session native identity authority。
+- `threads.rollout_path` 是该 session rollout 的唯一 locator authority。
+- `session_index.jsonl` 只为 title reconciliation 提供 evidence，不是 session 或 message identity authority。
+- 不同 data root 产生不同 `source_id`；相同 native ID 不跨 root 合并。
+- source identity 使用 installation-scoped HMAC，不暴露绝对路径或 host identity。
+
+## Projection and access
+
+Safe session metadata 查询只选择所需 SQLite 列，不打开 rollout。
+
+- `title`、`preview` 和 message content 需要 Content grant。
+- `cwd`、project 和 artifact path 需要 Path grant。
+- tool arguments 需要 ToolInput grant。
+- tool result 需要 ToolOutput grant。
+- `artifacts` 整表需要 Path grant；读取 artifact payload 还需要 Content grant。
+
+未授权 projection 必须在 rollout 打开前失败。未投影的 sensitive JSON 字段通过流式 visitor 跳过，不物化为通用 JSON value。
+
+## Rollout contract
+
+支持的顶层 event family 为：
+
+```text
+session_meta
+turn_context
+event_msg
+response_item
+compacted
+```
+
+Canonical mapping 只使用明确字段：role、content、tool name、call ID、arguments、output、timestamp、model/provider 和显式 artifact changes。未知 event 产生 bounded warning，不按内容相似、时间邻近或文件名猜测语义。
+
+每次 scan 固定 rollout 打开时的 byte boundary。边界后的 append 留到下次查询；完整 malformed record 失败；不完整尾部产生 warning，同时保留此前完整记录。
+
+Artifact 只来自 `event_msg.payload.type = patch_apply_end` 的 `payload.changes`。object key 是 Path；Adapter 永不打开该路径指向的工作区文件。`type`、`move_path`、`content` 和 `unified_diff` 仅按 projection 与 grant 读取。
+
+## Resource and snapshot behavior
+
+- SQLite session scan 分页读取，不一次物化全部 metadata。
+- rollout stream 惰性消费，并在读取前检查共享 byte/value budget。
+- 安全 LIMIT 只在 predicate/order contract 允许时提前停止。
+- cancellation 优先于 budget error。
+- active WAL 查询不得改变 database 或 WAL business bytes，也不得 checkpoint、copy 或 repair source。
+- root、database 和 rollout identity 在关键边界重新验证；symlink、replacement 或 shrink fail closed。
+
+## Synthetic verification matrix
+
+Fixture 覆盖：
+
+- known schema、optional drift 和 missing required columns；
+- active WAL read-only snapshot；
+- metadata-only projection 不打开 rollout；
+- 未授权 Content/Path/ToolInput/ToolOutput 在读取前失败；
+- session index conflict；
+- known、unknown、malformed、truncated 和 appended rollout records；
+- byte budget、single-value budget、cancellation 和 safe LIMIT；
+- explicit session edges、cycle 和 dangling child；
+- artifact grants 与 payload projection；
+- 不同 data root 中相同 native ID 保持独立；
+- source tree 不可写时仍可查询。
+
+兼容行为的用户级摘要见 [compatibility.md](compatibility.md)，安全控制见 [privacy-threat-model.md](privacy-threat-model.md)。

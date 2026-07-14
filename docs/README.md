@@ -2,24 +2,24 @@
 
 ## 用户文档
 
-- [README：安装与快速开始](../README.md)
-- [完整用户指南](user-guide.md)
+- [用户指南](user-guide.md)
 - [安装、升级与卸载](installation.md)
-- [兼容性矩阵](compatibility.md)
+- [兼容性](compatibility.md)
+- [Canonical Schema](canonical-schema-v0.md)
 - [隐私与威胁模型](privacy-threat-model.md)
 
-## 维护者与 Agent 文档
+## 架构与契约
 
-- [AGENTS.md：Agent 工作约束](../AGENTS.md)
-- [架构概览](architecture.md)
-- [Canonical Schema v0](canonical-schema-v0.md)
-- [Adapter Contract v0](adapter-contract-v0.md)
-- [查询引擎 ADR](adr/0001-query-engine.md)
-- [查询引擎评分卡](engine-spike-scorecard.md)
+- [架构](architecture.md)
+- [Adapter Contract](adapter-contract-v0.md)
+- [Query Engine ADR](adr/0001-query-engine.md)
+- [Engine Spike Scorecard](engine-spike-scorecard.md)
 
-## Adapter 格式证据
+## Source format evidence
 
-- [Codex](codex-format-notes.md)
-- [Kimi Code](kimi-code-format-notes.md)
-- [OpenCode](opencode-format-notes.md)
-- [Claude Code](claude-code-format-notes.md)
+- [Claude Code format notes](claude-code-format-notes.md)
+- [Codex format notes](codex-format-notes.md)
+- [Kimi Code format notes](kimi-code-format-notes.md)
+- [OpenCode format notes](opencode-format-notes.md)
+
+README 负责快速开始；用户指南负责完整日常流程；架构和契约描述当前实现与安全边界；format notes 只记录已验证的只读 source shape。

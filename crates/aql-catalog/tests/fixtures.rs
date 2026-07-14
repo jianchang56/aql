@@ -63,11 +63,11 @@ fn multi_source_fixture_produces_one_logical_session() {
 }
 
 #[test]
-fn multi_profile_fixture_produces_distinct_entities() {
+fn separate_root_fixtures_produce_distinct_entities() {
     let fixtures = fixture_root();
     let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
-    let mut records = scan_sessions(&adapter, &fixtures.join("multi-profile-a"));
-    records.extend(scan_sessions(&adapter, &fixtures.join("multi-profile-b")));
+    let mut records = scan_sessions(&adapter, &fixtures.join("separate-root-a"));
+    records.extend(scan_sessions(&adapter, &fixtures.join("separate-root-b")));
     let result = Catalog.reconcile_sessions(records);
     assert_eq!(result.records.len(), 2);
     assert_ne!(result.records[0].session_id, result.records[1].session_id);

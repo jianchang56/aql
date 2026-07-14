@@ -169,14 +169,24 @@ fn verify_docs() -> Result<(), Box<dyn std::error::Error>> {
         "scripts/build_release",
         ".py",
     ];
-    for path in [
+    let current_docs = [
         "README.md",
         "AGENTS.md",
         "docs/README.md",
         "docs/user-guide.md",
         "docs/installation.md",
         "docs/architecture.md",
-    ] {
+        "docs/compatibility.md",
+        "docs/privacy-threat-model.md",
+        "docs/adapter-contract-v0.md",
+        "docs/canonical-schema-v0.md",
+        "docs/codex-format-notes.md",
+        "docs/kimi-code-format-notes.md",
+        "docs/opencode-format-notes.md",
+        "docs/adr/0001-query-engine.md",
+        "docs/engine-spike-scorecard.md",
+    ];
+    for path in current_docs.iter().copied() {
         let text = std::fs::read_to_string(path)?;
         if let Some(value) = forbidden.iter().find(|value| text.contains(**value)) {
             return Err(format!(
@@ -184,6 +194,27 @@ fn verify_docs() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
+    }
+    let removed_surface = [
+        "aql export",
+        "aql report",
+        "aql search",
+        "aql index",
+        "--profile",
+        "--source",
+        "--data-root",
+        "--metadata",
+        "--diagnose",
+        "--csv-formulas",
+    ];
+    for path in current_docs.iter().copied() {
+        let text = std::fs::read_to_string(path)?;
+        if let Some(value) = removed_surface.iter().find(|value| text.contains(**value)) {
+            return Err(
+                format!("current documentation {path} mentions removed surface {value}").into(),
+            );
+        }
+        verify_markdown_links(path, &text)?;
     }
     let release = std::fs::read_to_string(".github/workflows/release.yml")?;
     for required in [
@@ -226,6 +257,34 @@ fn verify_docs() -> Result<(), Box<dyn std::error::Error>> {
             if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 return Err("release workflow Action must use a full commit SHA".into());
             }
+        }
+    }
+    Ok(())
+}
+
+fn verify_markdown_links(path: &str, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let base = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+    for (offset, _) in text.match_indices("](") {
+        let remaining = &text[offset + 2..];
+        let Some(end) = remaining.find(')') else {
+            continue;
+        };
+        let mut target = remaining[..end].trim();
+        if target.starts_with('<') && target.ends_with('>') {
+            target = &target[1..target.len() - 1];
+        }
+        target = target.split_once('#').map_or(target, |(file, _)| file);
+        if target.is_empty()
+            || target.starts_with('#')
+            || target.starts_with("http://")
+            || target.starts_with("https://")
+            || target.starts_with("mailto:")
+        {
+            continue;
+        }
+        let resolved = base.join(target);
+        if !resolved.exists() {
+            return Err(format!("documentation link is broken: {path} -> {target}").into());
         }
     }
     Ok(())

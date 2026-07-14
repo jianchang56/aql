@@ -131,14 +131,14 @@ pub fn generate_codex(output: &Path, large_metadata_count: usize) -> TestResult 
 
     for (fixture, title, rollout) in [
         (
-            "multi-profile-a",
-            "Synthetic profile A",
-            "rollout-profile-a.jsonl",
+            "separate-root-a",
+            "Synthetic root A",
+            "rollout-root-a.jsonl",
         ),
         (
-            "multi-profile-b",
-            "Synthetic profile B",
-            "rollout-profile-b.jsonl",
+            "separate-root-b",
+            "Synthetic root B",
+            "rollout-root-b.jsonl",
         ),
     ] {
         create_standard_fixture(output, fixture, "session-duplicate", title, rollout)?;

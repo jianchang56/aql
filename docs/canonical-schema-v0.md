@@ -4,11 +4,11 @@
 
 Canonical Model 是 Adapter、Catalog 和查询引擎之间唯一稳定的数据边界。它不反映某个 Agent 的原始文件结构，也不依赖 GitQL、DataFusion、Arrow 或 SQLite。
 
-v0 覆盖 source、session、message、tool call，以及 Phase 3 新增的 usage、session edge 和 artifact。Phase 1 另外提供由 `SourceManifest` 派生的只读 `agents` 查询视图；它不是新的 canonical record。Job、action 等实体延后。
+当前 schema 覆盖 source、session、message、tool call、usage、session edge 和 artifact，并提供由 `SourceManifest` 派生的只读 `agents` 查询视图；它不是新的 canonical record。
 
 ### 1.1 `agents` 查询视图
 
-`agents` 每个 source profile 一行，以 `source_id` 唯一。多个 profile 可以拥有相同 `agent_id`。该视图不暴露 `data_root_token`、真实路径或 Adapter-private locator。
+`agents` 每个物理 source identity 一行，以 `source_id` 唯一。多个 source 可以拥有相同 `agent_id`。该视图不暴露 `data_root_token`、真实路径或 Adapter-private locator。
 
 | 字段 | 类型 | NULL | Access | 来源 |
 |---|---|---:|---|---|
@@ -23,7 +23,7 @@ v0 覆盖 source、session、message、tool call，以及 Phase 3 新增的 usag
 
 ### 2.1 标识符
 
-- `SourceId`：某个 Agent 的具体 data root/profile，稳定格式为 `<agent_id>:<source_fingerprint>`。
+- `SourceId`：某个 Agent 的具体 data root identity，稳定格式为 `<agent_id>:<source_fingerprint>`。
 - `NativeId`：来源内部 ID，不保证跨 source 唯一。
 - `EntityId`：AQL 逻辑 ID，稳定格式为 `<agent_id>:<source_fingerprint>:<native_id>`。
 - `source_fingerprint` 使用安装级随机盐对规范化 data root 身份做 HMAC 后截断生成；不得使用可被字典枚举的裸路径 hash，也不得直接包含绝对路径。测试通过注入固定盐保证确定性。
@@ -104,7 +104,7 @@ pub struct FieldValue<T> {
 }
 ```
 
-Phase 0 实现可为减少复杂度采用 record-level provenance 加字段映射，但必须能回答“该字段来自哪个 source”。
+实现可为减少复杂度采用 record-level provenance 加字段映射，但必须能回答“该字段来自哪个 source”。
 
 ### `SourceManifest`
 
@@ -145,7 +145,7 @@ Phase 0 实现可为减少复杂度采用 record-level provenance 加字段映�
 
 约束：
 
-- `title` 即使来源已作为 metadata 保存，仍可能包含用户正文，因此始终需要 Content 授权。Phase 0 禁止从首条消息派生 title。
+- `title` 即使来源已作为 metadata 保存，仍可能包含用户正文，因此始终需要 Content 授权。禁止从首条消息派生 title。
 - `project` 仅基于 cwd/path metadata 推导，不读取项目文件。
 - Count 字段不得为满足查询而无界扫描；预算不足时返回 resource error，而非错误计数。
 
@@ -215,10 +215,10 @@ Phase 0 实现可为减少复杂度采用 record-level provenance 加字段映�
 
 - 只接受来源明确声明的 native edge，不按标题、路径、时间或正文推断。
 - 循环和悬空边可以作为数据返回并产生 warning，但查询层不得递归展开。
-- 不同 profile/source 的 edge 默认拒绝，除非 Adapter contract 明确声明共享 identity namespace。
+- 不同 source 的 edge 默认拒绝，除非 Adapter contract 明确声明共享 identity namespace。
 - Kimi main/subagent 各自是 namespaced logical session；edge 两端必须能在 `sessions` 中解析，禁止用同一 session 的 self-edge 代替 parentage。
 - Claude Code main/direct-agent transcript 各自是 namespaced logical session；child 只接受同 project 目录中 `agentId`、`sessionId` 与 main UUID 明确一致的来源关系。
-- OpenCode parent edge 只接受 `session.parent_id`；不同 source/profile 即使 native ID 相同也不得连接或合并。
+- OpenCode parent edge 只接受 `session.parent_id`；不同 source 即使 native ID 相同也不得连接或合并。
 
 ## 7.3 `artifacts` 表
 
@@ -236,7 +236,7 @@ Phase 0 实现可为减少复杂度采用 record-level provenance 加字段映�
 2. 不同物理 source kind 只有在 Adapter 明确声明共享 native ID namespace 时才合并。
 3. Authority 表决定主值；非主值写入 conflicts，不静默丢弃。
 4. 两个同 authority 值冲突时选择更新 watermark/observed_at 更可信者，并产生 warning。
-5. 不同 profile/data root 永不自动合并。
+5. 不同物理 source identity 永不自动合并。
 6. identity 不确定时保留两个实体，优先重复而不是误合并。
 
 ## 9. Schema 演进
@@ -246,17 +246,9 @@ Phase 0 实现可为减少复杂度采用 record-level provenance 加字段映�
 - AccessClass 变得更严格属于安全修复，可立即应用。
 - Adapter extension 不改变 canonical schema version。
 
-### 9.1 Phase 5 Action identity binding
-
-- Action target 只使用 canonical `source_id + entity_id`，一份 plan 只能绑定一个 source/entity/operation。
-- CLI/plan/audit 不持久化或接受 native ID、rollout path、SQLite rowid 或任意文件系统路径作为写目标。
-- production Action Adapter 可在内存中把 canonical identity 解析到官方 channel target，但 native identity 不得写入 plan、audit、错误或 confirmation。
-- plan digest 同时绑定 adapter/capability version 和 expected revision；跨 profile、跨 source 或 capability 变化不能复用。
-- rename 参数属于 Content，只以 keyed commitment/长度进入 plan；canonical session title 字段本身不被降级为 Safe。
-
 ## 10. Contract Tests
 
-- ID 对 multi-profile 不碰撞。
+- ID 对 multi-source 不碰撞。
 - NULL 与空字符串区分。
 - 未授权 Path/Content/ToolInput/ToolOutput 拒绝。
 - `SELECT *` 展开列表不含敏感字段。

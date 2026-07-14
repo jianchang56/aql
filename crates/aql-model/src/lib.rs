@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn source_ids_do_not_collide_across_profiles() {
+    fn source_ids_do_not_collide_across_data_roots() {
         let first = SourceId::for_data_root("codex", "/synthetic/a", b"fixture-salt");
         let second = SourceId::for_data_root("codex", "/synthetic/b", b"fixture-salt");
         assert_ne!(first, second);
