@@ -46,6 +46,7 @@ fn scalar_parameters_bind_only_value_placeholders() {
         )
         .is_err()
     );
+    assert!(bind_sql_parameters(&"x".repeat(MAX_SQL_BYTES + 1), &BTreeMap::new()).is_err());
 }
 
 struct SyntheticSessionAdapter {

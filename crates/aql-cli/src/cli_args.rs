@@ -223,7 +223,7 @@ pub(super) enum Command {
         /// Restrict matches to one opaque source ID.
         #[arg(long)]
         source_id: Option<String>,
-        /// Restrict matches to one canonical session ID.
+        /// Restrict matches to one canonical session ID; AQL derives the private index ID.
         #[arg(long)]
         session_id: Option<String>,
         /// Restrict matches to session_title, session_preview or message_content.

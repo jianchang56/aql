@@ -64,6 +64,25 @@ use render::{
 };
 use shell::*;
 
+#[derive(Debug)]
+enum CliError {
+    InvalidArgument(String),
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidArgument(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CliError {}
+
+fn invalid_argument(message: impl Into<String>) -> CliError {
+    CliError::InvalidArgument(message.into())
+}
+
 fn read_sql_input(
     sql: Option<String>,
     file: Option<PathBuf>,
@@ -417,6 +436,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Err("search source count exceeds the supported limit".into());
             }
             let mut hits = Vec::new();
+            let session_id = session_id
+                .map(|session_id| private_search_session_id(&session_id))
+                .transpose()?;
             let search_options = SearchOptions {
                 source_id,
                 session_id,
@@ -448,16 +470,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if Instant::now() >= deadline {
                     return Err("search timed out".into());
                 }
-                let rendered = serde_json::to_string(&serde_json::json!({
-                    "document_id": hit.document_id,
-                    "source_id": hit.source_id,
-                    "session_id": hit.session_id,
-                    "message_id": hit.message_id,
-                    "document_kind": hit.document_kind,
-                    "rank": hit.rank,
-                    "access_class": "content_derived",
-                    "context": hit.context,
-                }))?;
+                let rendered = serde_json::to_string(&search_hit_json(hit))?;
                 written = written
                     .checked_add(rendered.len() as u64 + 1)
                     .ok_or("search output size overflow")?;
@@ -857,24 +870,10 @@ async fn execute_query(
             eprintln!("plan.source_id={}", source.manifest.source_id);
             eprintln!("plan.format={}", source.manifest.format_fingerprint);
             for table in &summary.tables {
-                let capability = match table.as_str() {
-                    "sessions" => "sessions",
-                    "messages" => "messages",
-                    "tool_calls" => "tool_calls",
-                    "usage" => "usage",
-                    "session_edges" => "session_edges",
-                    "artifacts" => "artifacts",
-                    "agents" => "sessions",
-                    _ => table,
-                };
+                let supported = source_supports_table(&source.manifest.capabilities, table);
                 eprintln!(
                     "plan.source_capability=source:{},table:{table},supported:{}",
-                    source.manifest.source_id,
-                    source
-                        .manifest
-                        .capabilities
-                        .iter()
-                        .any(|candidate| candidate == capability)
+                    source.manifest.source_id, supported
                 );
             }
         }
@@ -1385,29 +1384,37 @@ struct ReportSection {
     parameters: &'static [&'static str],
 }
 
+const REPORT_SCHEMA_VERSION: &str = "aql-reports-v1";
+
 fn report_parameters(
     report: ReportKind,
     project: Option<String>,
     since: Option<String>,
     until: Option<String>,
-) -> Result<std::collections::BTreeMap<String, SqlParameter>, Box<dyn std::error::Error>> {
+) -> Result<std::collections::BTreeMap<String, SqlParameter>, CliError> {
     if report == ReportKind::Summary && project.is_some() {
-        return Err("--project is only valid for the project report".into());
+        return Err(invalid_argument(
+            "--project is only valid for the project report",
+        ));
     }
     if project.as_ref().is_some_and(|value| {
         value.is_empty() || value.len() > 4_096 || value.chars().any(char::is_control)
     }) {
-        return Err("report project filter is invalid".into());
+        return Err(invalid_argument("report project filter is invalid"));
     }
     for value in [&since, &until].into_iter().flatten() {
         chrono::DateTime::parse_from_rfc3339(value)
-            .map_err(|_| "report time filters must be RFC 3339 timestamps")?;
+            .map_err(|_| invalid_argument("report time filters must be RFC 3339 timestamps"))?;
     }
     if let (Some(since), Some(until)) = (&since, &until)
-        && chrono::DateTime::parse_from_rfc3339(since)?
-            >= chrono::DateTime::parse_from_rfc3339(until)?
+        && chrono::DateTime::parse_from_rfc3339(since)
+            .map_err(|_| invalid_argument("report time filters must be RFC 3339 timestamps"))?
+            >= chrono::DateTime::parse_from_rfc3339(until)
+                .map_err(|_| invalid_argument("report time filters must be RFC 3339 timestamps"))?
     {
-        return Err("report --since must be earlier than --until".into());
+        return Err(invalid_argument(
+            "report --since must be earlier than --until",
+        ));
     }
     Ok(std::collections::BTreeMap::from([
         (
@@ -1655,12 +1662,12 @@ fn execution_budget(
 
 fn parse_sql_parameters(
     values: &[String],
-) -> Result<std::collections::BTreeMap<String, SqlParameter>, Box<dyn std::error::Error>> {
+) -> Result<std::collections::BTreeMap<String, SqlParameter>, CliError> {
     let mut parameters = std::collections::BTreeMap::new();
     for value in values {
         let (name, raw) = value
             .split_once('=')
-            .ok_or("query parameters must use NAME=VALUE")?;
+            .ok_or_else(|| invalid_argument("query parameters must use NAME=VALUE"))?;
         if name.is_empty()
             || name.len() > 64
             || !name.bytes().enumerate().all(|(index, byte)| {
@@ -1668,26 +1675,70 @@ fn parse_sql_parameters(
                     || byte.is_ascii_alphanumeric() && (index > 0 || byte.is_ascii_alphabetic())
             })
         {
-            return Err("query parameter names must be ASCII identifiers".into());
+            return Err(invalid_argument(
+                "query parameter names must be ASCII identifiers",
+            ));
         }
         if raw.len() > 16 * 1024 * 1024 {
-            return Err("query parameter value exceeds the fixed size limit".into());
+            return Err(invalid_argument(
+                "query parameter value exceeds the fixed size limit",
+            ));
         }
         let parameter = match raw {
+            value if value.starts_with("text:") => SqlParameter::Text(value[5..].to_string()),
+            value if value.starts_with("int:") => SqlParameter::Int64(
+                value[4..]
+                    .parse()
+                    .map_err(|_| invalid_argument("query int parameter must fit i64"))?,
+            ),
+            value if value.starts_with("bool:") => match &value[5..] {
+                "true" => SqlParameter::Bool(true),
+                "false" => SqlParameter::Bool(false),
+                _ => {
+                    return Err(invalid_argument(
+                        "query bool parameter must be true or false",
+                    ));
+                }
+            },
             "null" => SqlParameter::Null,
             "true" => SqlParameter::Bool(true),
             "false" => SqlParameter::Bool(false),
-            _ if integer_text(raw) => SqlParameter::Int64(
-                raw.parse()
-                    .map_err(|_| "query integer parameter is outside the i64 range")?,
-            ),
+            _ if integer_text(raw) => SqlParameter::Int64(raw.parse().map_err(|_| {
+                invalid_argument("query integer parameter is outside the i64 range")
+            })?),
             _ => SqlParameter::Text(raw.to_string()),
         };
         if parameters.insert(name.to_string(), parameter).is_some() {
-            return Err("query parameter names must be unique".into());
+            return Err(invalid_argument("query parameter names must be unique"));
         }
     }
     Ok(parameters)
+}
+
+fn private_search_session_id(
+    canonical_session_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(installation_scoped_hmac(
+        "aql-index-session-id-v1",
+        canonical_session_id,
+        &installation_salt()?,
+    ))
+}
+
+fn search_hit_json(hit: aql_index::SearchHit) -> serde_json::Value {
+    let mut rendered = serde_json::json!({
+        "document_id": hit.document_id,
+        "source_id": hit.source_id,
+        "session_id": hit.session_id,
+        "message_id": hit.message_id,
+        "document_kind": hit.document_kind,
+        "rank": hit.rank,
+        "access_class": if hit.context.is_some() { "content" } else { "content_derived" },
+    });
+    if let Some(context) = hit.context {
+        rendered["context"] = serde_json::Value::String(context);
+    }
+    rendered
 }
 
 fn integer_text(value: &str) -> bool {
@@ -1705,6 +1756,10 @@ fn diagnostic_timing(enabled: bool, stage: &str, started: Instant) {
             started.elapsed().as_millis()
         );
     }
+}
+
+fn source_supports_table(capabilities: &[String], table: &str) -> bool {
+    table == "agents" || capabilities.iter().any(|candidate| candidate == table)
 }
 
 fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
@@ -1822,6 +1877,9 @@ fn render_error(error: &(dyn std::error::Error + 'static), format: ErrorFormat) 
 }
 
 fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
+    if error.downcast_ref::<CliError>().is_some() {
+        return 2;
+    }
     if let Some(query) = error.downcast_ref::<aql_engine_datafusion::QueryError>() {
         return match query {
             aql_engine_datafusion::QueryError::SqlRejected { .. } => 2,
@@ -1927,6 +1985,9 @@ fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
 }
 
 fn error_category(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    if error.downcast_ref::<CliError>().is_some() {
+        return "invalid_request";
+    }
     if let Some(query) = error.downcast_ref::<aql_engine_datafusion::QueryError>() {
         return match query {
             aql_engine_datafusion::QueryError::SqlRejected { .. } => "invalid_request",
@@ -2346,6 +2407,7 @@ fn build_metadata() -> serde_json::Value {
         "canonical_schema": "aql-canonical-v0",
         "config_schema": CONFIG_SCHEMA_VERSION,
         "index_schema": INDEX_SCHEMA_VERSION,
+        "report_schema": REPORT_SCHEMA_VERSION,
         "package": env!("CARGO_PKG_NAME"),
         "target": format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
         "version": env!("CARGO_PKG_VERSION"),
@@ -2357,7 +2419,7 @@ fn render_version(output: VersionOutput) -> Result<String, Box<dyn std::error::E
     Ok(match output {
         VersionOutput::Json => serde_json::to_string(&metadata)?,
         VersionOutput::Text => format!(
-            "aql {}\ntarget={}\ncanonical_schema={}\nconfig_schema={}\nindex_schema={}\naction_plan_schema={}\naction_audit_schema={}\naction_store_schema={}",
+            "aql {}\ntarget={}\ncanonical_schema={}\nconfig_schema={}\nindex_schema={}\nreport_schema={}\naction_plan_schema={}\naction_audit_schema={}\naction_store_schema={}",
             metadata["version"]
                 .as_str()
                 .ok_or("missing build version")?,
@@ -2371,6 +2433,9 @@ fn render_version(output: VersionOutput) -> Result<String, Box<dyn std::error::E
             metadata["index_schema"]
                 .as_str()
                 .ok_or("missing index schema")?,
+            metadata["report_schema"]
+                .as_str()
+                .ok_or("missing report schema")?,
             metadata["action_plan_schema"]
                 .as_str()
                 .ok_or("missing Action plan schema")?,

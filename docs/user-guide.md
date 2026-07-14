@@ -174,7 +174,7 @@ aql query -d codex --metadata \
   'SELECT session_id FROM sessions LIMIT 10'
 ```
 
-`--diagnose` 仅向 stderr 输出 `parse`、`authorize`、`probe`、`execute` 和 `render` 的阶段耗时。诊断不包含 SQL、参数、授权值、真实路径或查询结果：
+`--diagnose` 仅向 stderr 输出已实际发生阶段的耗时。普通查询包括 `parse`、`authorize`、`probe`、`execute` 和 `render`；与 `--plan`/`EXPLAIN` 合用时在 `probe` 后结束，不输出未执行的 `execute`/`render`。诊断不包含 SQL、参数、授权值、真实路径或查询结果：
 
 ```bash
 aql query -d codex --diagnose 'SELECT session_id FROM sessions LIMIT 10'
@@ -206,7 +206,7 @@ aql query -d codex \
   'SELECT session_id FROM sessions WHERE project = :project AND message_count >= :minimum'
 ```
 
-参数支持 `null`、布尔值、带符号 64 位整数和文本。绑定发生在 SQL AST 上，不能替换表名、列名、函数或 SQL 片段。缺失、重复、未使用参数以及 `$1`、`?` 等非命名 placeholder 会被拒绝。字符串值不需要自行添加 SQL 引号。
+参数支持 `null`、布尔值、带符号 64 位整数和文本。`text:`、`int:` 和 `bool:` 可以消除类型歧义，例如 `--param value=text:true` 会绑定文本 `true`。绑定发生在 SQL AST 上，不能替换表名、列名、函数或 SQL 片段。缺失、重复、未使用参数以及 `$1`、`?` 等非命名 placeholder 会被拒绝。`export` 使用相同的 `--param` 语法。
 
 非交互 Schema 和示例：
 
@@ -250,7 +250,7 @@ aql report -d work --access path \
   project
 ```
 
-`--since` 和 `--until` 接受 RFC 3339 时间；`--project` 只适用于 project report，并匹配报告中显示的 masked project 值。参数绑定到固定、版本化的报告 SQL，不能提供 SQL 片段。
+`--since` 和 `--until` 接受 RFC 3339 时间；`--project` 只适用于 project report，并匹配报告中显示的 masked project 值。参数绑定到固定的 `aql-reports-v1` 报告 SQL，不能提供 SQL 片段。
 
 stdout export/report 会在全部来源成功后一次发布，避免部分成功结果。
 
@@ -284,7 +284,7 @@ aql search -d codex \
   timeout
 ```
 
-搜索可通过 `--source-id`、`--session-id` 和固定的 `--document-kind` 过滤。`--context-tokens 1..64` 返回 FTS 提供的有界命中摘录；默认值 0 不返回 Content。所有过滤条件使用 SQLite 绑定参数，不能注入 FTS 或 SQL 片段。
+搜索可通过 `--source-id`、canonical `--session-id` 和固定的 `--document-kind` 过滤。AQL 在内存中将 canonical session ID 转换为 installation-scoped private index ID，不持久化该映射。`--context-tokens 1..64` 返回 FTS 提供的有界 Content 摘录并将结果标记为 `access_class=content`；默认值 0 省略 `context` 字段并标记为 `content_derived`。所有过滤条件使用 SQLite 绑定参数，不能注入 FTS 或 SQL 片段。
 
 Content 索引不包含工具输入/输出、reasoning、permission/share/account/credential、日志、配置或项目文件。`index clear` 和 `index repair` 只操作 marker/catalog 验证后的 AQL-owned state，不承诺法证擦除。
 

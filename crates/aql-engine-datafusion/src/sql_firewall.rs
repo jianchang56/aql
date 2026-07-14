@@ -14,6 +14,13 @@ pub fn bind_sql_parameters(
 ) -> std::result::Result<String, QueryError> {
     use sqlparser::ast::{ValueWithSpan, VisitMut, VisitorMut};
 
+    if sql.len() > MAX_SQL_BYTES {
+        return Err(sql_rejected(
+            "parse",
+            "query exceeds the fixed length limit",
+        ));
+    }
+
     struct Binder<'a> {
         parameters: &'a BTreeMap<String, SqlParameter>,
         used: BTreeSet<String>,

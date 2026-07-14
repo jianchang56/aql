@@ -7,6 +7,8 @@ fn named_query_parameters_are_scalar_and_unique() {
         "count=42".to_string(),
         "enabled=true".to_string(),
         "missing=null".to_string(),
+        "reserved=text:true".to_string(),
+        "numeric_text=text:42".to_string(),
     ])
     .expect("parameters parse");
     assert_eq!(
@@ -16,8 +18,20 @@ fn named_query_parameters_are_scalar_and_unique() {
     assert_eq!(parameters["count"], SqlParameter::Int64(42));
     assert_eq!(parameters["enabled"], SqlParameter::Bool(true));
     assert_eq!(parameters["missing"], SqlParameter::Null);
+    assert_eq!(
+        parameters["reserved"],
+        SqlParameter::Text("true".to_string())
+    );
+    assert_eq!(
+        parameters["numeric_text"],
+        SqlParameter::Text("42".to_string())
+    );
     assert!(parse_sql_parameters(&["1bad=value".to_string()]).is_err());
     assert!(parse_sql_parameters(&["x=1".to_string(), "x=2".to_string()]).is_err());
+    let error = parse_sql_parameters(&["x=bool:yes".to_string()])
+        .expect_err("invalid explicit bool must fail");
+    assert_eq!(error_exit_code(&error), 2);
+    assert_eq!(error_category(&error), "invalid_request");
 
     Cli::try_parse_from([
         "aql",
@@ -654,9 +668,40 @@ fn version_metadata_is_stable_and_host_clean() {
     assert_eq!(metadata["canonical_schema"], "aql-canonical-v0");
     assert_eq!(metadata["config_schema"], CONFIG_SCHEMA_VERSION);
     assert_eq!(metadata["index_schema"], INDEX_SCHEMA_VERSION);
+    assert_eq!(metadata["report_schema"], REPORT_SCHEMA_VERSION);
     for forbidden in ["HOME", "USER", "workspace", "timestamp", "dirty", "secret"] {
         assert!(!first.contains(forbidden));
     }
+}
+
+#[test]
+fn agents_plan_capability_is_manifest_derived() {
+    assert!(source_supports_table(&[], "agents"));
+    assert!(!source_supports_table(&[], "sessions"));
+    assert!(source_supports_table(&["sessions".to_string()], "sessions"));
+}
+
+#[test]
+fn search_context_has_content_access_class() {
+    let base = aql_index::SearchHit {
+        document_id: "document".to_string(),
+        source_id: "source".to_string(),
+        session_id: "session".to_string(),
+        message_id: None,
+        document_kind: "message_content".to_string(),
+        rank: 1.0,
+        context: None,
+    };
+    let metadata = search_hit_json(base.clone());
+    assert_eq!(metadata["access_class"], "content_derived");
+    assert!(metadata.get("context").is_none());
+
+    let content = search_hit_json(aql_index::SearchHit {
+        context: Some("bounded excerpt".to_string()),
+        ..base
+    });
+    assert_eq!(content["access_class"], "content");
+    assert_eq!(content["context"], "bounded excerpt");
 }
 
 #[test]

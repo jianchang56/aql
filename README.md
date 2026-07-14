@@ -208,6 +208,8 @@ aql man > ./aql.1
 
 `--param NAME=VALUE` 支持 `null`、布尔值、带符号 64 位整数和文本。参数只能替换 `:name` value placeholder，不能替换表名、列名、函数或 SQL 片段；缺失、重复和未使用参数都会被拒绝。
 
+使用 `text:`、`int:` 或 `bool:` 可显式指定类型，例如 `--param value=text:true` 会绑定文本 `true`。`export` 使用相同的 `--param` 语法。
+
 命名数据库、自定义路径、索引、全文搜索、导出和故障排查见 [用户指南](docs/user-guide.md)。
 
 ## 安全边界
