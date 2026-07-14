@@ -685,7 +685,6 @@ fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
     }
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("no database selected")
-        || message.contains("at least one explicit source")
         || message.contains("requires -d <database>")
         || message.contains("unknown database")
         || message.contains("unknown or unavailable database")
@@ -837,7 +836,6 @@ fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
         4
     } else if message.contains("invalid")
         || message.contains("No database selected")
-        || message.contains("at least one explicit source")
         || message.contains("requires --acknowledge")
     {
         2
@@ -905,7 +903,6 @@ fn error_category(error: &(dyn std::error::Error + 'static)) -> &'static str {
         "unsupported"
     } else if message.contains("invalid")
         || message.contains("No database selected")
-        || message.contains("at least one explicit source")
         || message.contains("requires --acknowledge")
     {
         "invalid_request"
