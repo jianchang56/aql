@@ -266,7 +266,16 @@ aql index build -d codex \
 aql search -d codex \
   --access content \
   '"connection timeout"'
+
+aql search -d codex \
+  --access content \
+  --session-id session_opaque_id \
+  --document-kind message_content \
+  --context-tokens 16 \
+  timeout
 ```
+
+搜索可通过 `--source-id`、`--session-id` 和固定的 `--document-kind` 过滤。`--context-tokens 1..64` 返回 FTS 提供的有界命中摘录；默认值 0 不返回 Content。所有过滤条件使用 SQLite 绑定参数，不能注入 FTS 或 SQL 片段。
 
 Content 索引不包含工具输入/输出、reasoning、permission/share/account/credential、日志、配置或项目文件。`index clear` 和 `index repair` 只操作 marker/catalog 验证后的 AQL-owned state，不承诺法证擦除。
 

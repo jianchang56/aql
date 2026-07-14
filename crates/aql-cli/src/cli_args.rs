@@ -211,6 +211,18 @@ pub(super) enum Command {
         /// Maximum number of search matches to return.
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=1000))]
         limit: u64,
+        /// Restrict matches to one opaque source ID.
+        #[arg(long)]
+        source_id: Option<String>,
+        /// Restrict matches to one canonical session ID.
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Restrict matches to session_title, session_preview or message_content.
+        #[arg(long)]
+        document_kind: Option<String>,
+        /// Include a bounded FTS excerpt with this many tokens; zero omits Content.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=64))]
+        context_tokens: u8,
         /// Maximum rendered search-result bytes.
         #[arg(long, env = "AQL_MAX_OUTPUT_BYTES", default_value = "1MiB", value_parser = parse_byte_size)]
         max_output_bytes: u64,

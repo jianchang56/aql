@@ -189,6 +189,15 @@ pub struct SearchHit {
     pub message_id: Option<String>,
     pub document_kind: String,
     pub rank: f64,
+    pub context: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SearchOptions {
+    pub source_id: Option<String>,
+    pub session_id: Option<String>,
+    pub document_kind: Option<String>,
+    pub context_tokens: u8,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -504,6 +513,16 @@ impl IndexStore {
         query: &str,
         limit: u64,
     ) -> Result<Vec<SearchHit>, IndexError> {
+        self.search_generation_with_options(generation, query, limit, &SearchOptions::default())
+    }
+
+    pub fn search_generation_with_options(
+        &self,
+        generation: &IndexGeneration,
+        query: &str,
+        limit: u64,
+        options: &SearchOptions,
+    ) -> Result<Vec<SearchHit>, IndexError> {
         if generation.policy != IndexPolicy::Content
             || generation.freshness != IndexFreshness::Fresh
             || generation.schema_version != INDEX_SCHEMA_VERSION
@@ -511,6 +530,19 @@ impl IndexStore {
             || !generation.active
             || limit == 0
             || limit > 1_000
+            || options.context_tokens > 64
+            || options.document_kind.as_deref().is_some_and(|kind| {
+                !matches!(
+                    kind,
+                    "session_title" | "session_preview" | "message_content"
+                )
+            })
+            || [&options.source_id, &options.session_id]
+                .into_iter()
+                .flatten()
+                .any(|value| {
+                    value.is_empty() || value.len() > 512 || value.chars().any(char::is_control)
+                })
         {
             return Err(IndexError::InvalidSearch);
         }
@@ -547,19 +579,30 @@ impl IndexStore {
             return Err(IndexError::UnsupportedSchema);
         }
         let mut statement = connection.prepare(
-            "SELECT d.document_id, d.source_id, d.session_id, d.message_id, d.document_kind, bm25(content_fts) AS rank FROM content_fts JOIN content_documents d ON d.rowid = content_fts.rowid WHERE content_fts MATCH ?1 ORDER BY rank, d.document_id LIMIT ?2",
+            "SELECT d.document_id, d.source_id, d.session_id, d.message_id, d.document_kind, bm25(content_fts) AS rank, CASE WHEN ?6 = 0 THEN NULL ELSE snippet(content_fts, 0, '', '', '…', ?6) END FROM content_fts JOIN content_documents d ON d.rowid = content_fts.rowid WHERE content_fts MATCH ?1 AND (?3 IS NULL OR d.source_id = ?3) AND (?4 IS NULL OR d.session_id = ?4) AND (?5 IS NULL OR d.document_kind = ?5) ORDER BY rank, d.document_id LIMIT ?2",
         )?;
         let limit = i64::try_from(limit).map_err(|_| IndexError::InvalidSearch)?;
-        let rows = statement.query_map(rusqlite::params![fts_query, limit], |row| {
-            Ok(SearchHit {
-                document_id: row.get(0)?,
-                source_id: row.get(1)?,
-                session_id: row.get(2)?,
-                message_id: row.get(3)?,
-                document_kind: row.get(4)?,
-                rank: row.get(5)?,
-            })
-        })?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                fts_query,
+                limit,
+                options.source_id.as_deref(),
+                options.session_id.as_deref(),
+                options.document_kind.as_deref(),
+                i64::from(options.context_tokens),
+            ],
+            |row| {
+                Ok(SearchHit {
+                    document_id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    message_id: row.get(3)?,
+                    document_kind: row.get(4)?,
+                    rank: row.get(5)?,
+                    context: row.get(6)?,
+                })
+            },
+        )?;
         let hits = rows.collect::<Result<Vec<_>, _>>()?;
         if hits.iter().any(|hit| !hit.rank.is_finite()) {
             return Err(IndexError::InvalidSearch);
@@ -1572,6 +1615,40 @@ mod tests {
             assert_eq!(hits.len(), 1, "query must return one hit: {query}");
             assert_eq!(hits[0].document_kind, "message_content");
         }
+        let contextual = store
+            .search_generation_with_options(
+                &generation,
+                "coding",
+                10,
+                &SearchOptions {
+                    source_id: Some("source-one".to_string()),
+                    session_id: Some("session-one".to_string()),
+                    document_kind: Some("message_content".to_string()),
+                    context_tokens: 8,
+                },
+            )
+            .expect("filtered contextual search succeeds");
+        assert_eq!(contextual.len(), 1);
+        assert!(
+            contextual[0]
+                .context
+                .as_deref()
+                .is_some_and(|value| value.contains("coding"))
+        );
+        assert!(
+            store
+                .search_generation_with_options(
+                    &generation,
+                    "coding",
+                    10,
+                    &SearchOptions {
+                        session_id: Some("other".to_string()),
+                        ..SearchOptions::default()
+                    },
+                )
+                .expect("nonmatching filter is valid")
+                .is_empty()
+        );
         for invalid in ["", "*", "hello OR world", "field:value", "\"unterminated"] {
             assert!(matches!(
                 store.search_generation(&generation, invalid, 10),

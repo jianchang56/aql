@@ -29,7 +29,7 @@ use aql_engine_datafusion::{
 };
 use aql_index::{
     INDEX_SCHEMA_VERSION, IndexFreshness, IndexGeneration, IndexPolicy, IndexStore, IndexWatermark,
-    TOKENIZER_VERSION, WatermarkComponent, require_fts5,
+    SearchOptions, TOKENIZER_VERSION, WatermarkComponent, require_fts5,
 };
 use aql_model::{AccessClass, CanonicalRecord, EntityId, SourceId, installation_scoped_hmac};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -372,6 +372,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             database,
             access,
             limit,
+            source_id,
+            session_id,
+            document_kind,
+            context_tokens,
             max_output_bytes,
             timeout,
             query,
@@ -407,12 +411,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Err("search source count exceeds the supported limit".into());
             }
             let mut hits = Vec::new();
+            let search_options = SearchOptions {
+                source_id,
+                session_id,
+                document_kind,
+                context_tokens,
+            };
             for (store, generations) in &stores {
                 for generation in generations {
                     if Instant::now() >= deadline {
                         return Err("search timed out".into());
                     }
-                    hits.extend(store.search_generation(generation, &query, limit)?);
+                    hits.extend(store.search_generation_with_options(
+                        generation,
+                        &query,
+                        limit,
+                        &search_options,
+                    )?);
                 }
             }
             hits.sort_by(|left, right| {
@@ -435,6 +450,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     "document_kind": hit.document_kind,
                     "rank": hit.rank,
                     "access_class": "content_derived",
+                    "context": hit.context,
                 }))?;
                 written = written
                     .checked_add(rendered.len() as u64 + 1)
