@@ -364,13 +364,22 @@ async fn execute_query(
         stdin,
     } = request;
     let ExecutionLimits {
-        max_records,
-        max_bytes_read,
         max_output_bytes,
-        max_single_value_bytes,
-        max_memory_bytes,
         timeout,
     } = limits;
+    let max_records = environment_u64("AQL_MAX_RECORDS", 100_000, parse_count)?;
+    let max_bytes_read = environment_u64("AQL_MAX_BYTES_READ", 256 * 1024 * 1024, parse_byte_size)?;
+    let max_single_value_bytes = environment_u64(
+        "AQL_MAX_SINGLE_VALUE_BYTES",
+        16 * 1024 * 1024,
+        parse_byte_size,
+    )?;
+    let max_memory_bytes = usize::try_from(environment_u64(
+        "AQL_MAX_MEMORY_BYTES",
+        256 * 1024 * 1024,
+        parse_byte_size,
+    )?)
+    .map_err(|_| invalid_argument("AQL_MAX_MEMORY_BYTES is too large"))?;
     let parse_started = Instant::now();
     let sql = read_sql_input(sql, file, stdin)?;
     let query_started = Instant::now();
@@ -918,6 +927,20 @@ fn parse_count(value: &str) -> Result<u64, String> {
     parse_scaled_u64(value, &[("k", 1_000), ("m", 1_000_000)], "record count")
 }
 
+fn environment_u64(
+    name: &str,
+    default: u64,
+    parser: fn(&str) -> Result<u64, String>,
+) -> Result<u64, CliError> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| invalid_argument(format!("{name} must be valid UTF-8")))?;
+    parser(value).map_err(|reason| invalid_argument(format!("{name}: {reason}")))
+}
+
 fn parse_byte_size(value: &str) -> Result<u64, String> {
     parse_scaled_u64(
         value,
@@ -932,10 +955,6 @@ fn parse_byte_size(value: &str) -> Result<u64, String> {
         ],
         "byte size",
     )
-}
-
-fn parse_usize_byte_size(value: &str) -> Result<usize, String> {
-    usize::try_from(parse_byte_size(value)?).map_err(|_| "byte size is too large".to_string())
 }
 
 fn parse_scaled_u64(value: &str, suffixes: &[(&str, u64)], label: &str) -> Result<u64, String> {

@@ -179,13 +179,21 @@ fn human_readable_limits_parse_without_breaking_raw_integers() {
         "query",
         "-d",
         "codex",
-        "--max-records",
-        "10k",
-        "--max-memory-bytes",
+        "--max-output-bytes",
         "32MiB",
         "SELECT 1",
     ])
     .expect("human-readable CLI limits parse");
+    for removed in [
+        "--max-records",
+        "--max-bytes-read",
+        "--max-single-value-bytes",
+        "--max-memory-bytes",
+    ] {
+        assert!(
+            Cli::try_parse_from(["aql", "query", "-d", "codex", removed, "1", "SELECT 1"]).is_err()
+        );
+    }
 }
 
 #[test]
@@ -203,10 +211,7 @@ fn automation_environment_defaults_exclude_database_and_access() {
             .map(|value| value.to_string_lossy().into_owned())
     };
     assert_eq!(environment("timeout").as_deref(), Some("AQL_TIMEOUT"));
-    assert_eq!(
-        environment("max_records").as_deref(),
-        Some("AQL_MAX_RECORDS")
-    );
+    assert_eq!(environment("max_records"), None);
     assert_eq!(environment("database"), None);
     assert_eq!(environment("access"), None);
 }

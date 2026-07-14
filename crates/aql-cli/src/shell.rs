@@ -514,11 +514,7 @@ pub(super) async fn run_shell(
                             access: access.clone(),
                             param: Vec::new(),
                             limits: ExecutionLimits {
-                                max_records: 100_000,
-                                max_bytes_read: 256 * 1024 * 1024,
                                 max_output_bytes: 64 * 1024 * 1024,
-                                max_single_value_bytes: 16 * 1024 * 1024,
-                                max_memory_bytes: 256 * 1024 * 1024,
                                 timeout: Duration::from_secs(30),
                             },
                             diagnostics: false,

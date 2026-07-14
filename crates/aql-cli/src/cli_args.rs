@@ -26,21 +26,9 @@ pub(super) struct Cli {
 
 #[derive(Args, Clone)]
 pub(super) struct ExecutionLimits {
-    /// Stop after scanning this many canonical records across the complete operation.
-    #[arg(long, global = true, env = "AQL_MAX_RECORDS", default_value = "100k", value_parser = parse_count)]
-    pub(super) max_records: u64,
-    /// Maximum source bytes that all adapters may read.
-    #[arg(long, global = true, env = "AQL_MAX_BYTES_READ", default_value = "256MiB", value_parser = parse_byte_size)]
-    pub(super) max_bytes_read: u64,
     /// Maximum bytes that may be published.
     #[arg(long, global = true, env = "AQL_MAX_OUTPUT_BYTES", default_value = "64MiB", value_parser = parse_byte_size)]
     pub(super) max_output_bytes: u64,
-    /// Reject any single sensitive value larger than this limit.
-    #[arg(long, global = true, env = "AQL_MAX_SINGLE_VALUE_BYTES", default_value = "16MiB", value_parser = parse_byte_size)]
-    pub(super) max_single_value_bytes: u64,
-    /// Maximum in-memory execution working set.
-    #[arg(long, global = true, env = "AQL_MAX_MEMORY_BYTES", default_value = "256MiB", value_parser = parse_usize_byte_size)]
-    pub(super) max_memory_bytes: usize,
     /// Cancel the complete operation when this duration elapses.
     #[arg(long, global = true, env = "AQL_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
     pub(super) timeout: Duration,
