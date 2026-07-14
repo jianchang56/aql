@@ -232,12 +232,6 @@ dependencies = [
 name = "aql-cli"
 version = "0.1.0"
 dependencies = [
- "aql-action-claude-code",
- "aql-action-codex",
- "aql-action-kimi-code",
- "aql-action-opencode",
- "aql-action-synthetic",
- "aql-actions",
  "aql-adapter-api",
  "aql-adapter-claude-code",
  "aql-adapter-codex",
@@ -246,14 +240,12 @@ dependencies = [
  "aql-catalog",
  "aql-config",
  "aql-engine-datafusion",
- "aql-index",
  "aql-model",
  "chrono",
  "clap",
  "clap_complete",
  "clap_mangen",
  "datafusion",
- "futures",
  "humantime",
  "rand",
  "rustix",

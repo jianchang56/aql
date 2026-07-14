@@ -1,4 +1,18 @@
 use super::*;
+use datafusion::arrow::array::{BooleanArray, Int64Array, StringArray, TimestampMillisecondArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+struct BrokenWriter;
+
+impl Write for BrokenWriter {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(io::ErrorKind::BrokenPipe, "synthetic"))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[test]
 fn named_query_parameters_are_scalar_and_unique() {
@@ -46,36 +60,6 @@ fn named_query_parameters_are_scalar_and_unique() {
 }
 
 #[test]
-fn report_parameters_are_fixed_bounded_scalars() {
-    let parameters = report_parameters(
-        ReportKind::Project,
-        Some("…/demo".to_string()),
-        Some("2026-01-01T00:00:00Z".to_string()),
-        Some("2026-02-01T00:00:00Z".to_string()),
-    )
-    .expect("report parameters validate");
-    for section in report_sections(ReportKind::Project) {
-        let selected = section
-            .parameters
-            .iter()
-            .map(|name| ((*name).to_string(), parameters[*name].clone()))
-            .collect();
-        let bound = bind_sql_parameters(section.sql, &selected).expect("report SQL binds");
-        validate_read_only_sql(&bound).expect("bound report remains read only");
-    }
-    assert!(report_parameters(ReportKind::Summary, Some("demo".to_string()), None, None,).is_err());
-    assert!(
-        report_parameters(
-            ReportKind::Summary,
-            None,
-            Some("2026-02-01T00:00:00Z".to_string()),
-            Some("2026-01-01T00:00:00Z".to_string()),
-        )
-        .is_err()
-    );
-}
-
-#[test]
 fn database_cli_is_short_clear_and_mutually_exclusive() {
     let parsed = Cli::try_parse_from([
         "aql",
@@ -88,7 +72,7 @@ fn database_cli_is_short_clear_and_mutually_exclusive() {
     let Some(Command::Query { database, .. }) = parsed.command else {
         panic!("query command expected");
     };
-    assert_eq!(database.as_deref(), Some("codex"));
+    assert_eq!(database, "codex");
     assert!(
         Cli::try_parse_from([
             "aql",
@@ -113,7 +97,7 @@ fn database_cli_is_short_clear_and_mutually_exclusive() {
             "/synthetic/codex",
             "--acknowledge-persistent-path",
         ])
-        .is_ok()
+        .is_err()
     );
     assert!(
         Cli::try_parse_from([
@@ -130,7 +114,7 @@ fn database_cli_is_short_clear_and_mutually_exclusive() {
 }
 
 #[test]
-fn public_help_uses_database_model_and_hides_legacy_and_action_surfaces() {
+fn public_help_exposes_only_the_focused_command_surface() {
     let help = generated_command().render_long_help().to_string();
     assert!(help.contains("database"));
     assert!(help.contains("schema"));
@@ -138,6 +122,10 @@ fn public_help_uses_database_model_and_hides_legacy_and_action_surfaces() {
     assert!(!help.contains("profile"));
     assert!(!help.contains("sources"));
     assert!(!help.contains("action"));
+    assert!(!help.contains("export"));
+    assert!(!help.contains("report"));
+    assert!(!help.contains("search"));
+    assert!(!help.contains("index"));
     assert!(Cli::try_parse_from(["aql", "--quiet", "schema"]).is_ok());
 }
 
@@ -145,41 +133,15 @@ fn public_help_uses_database_model_and_hides_legacy_and_action_surfaces() {
 fn data_commands_accept_one_consistent_database_option() {
     for arguments in [
         vec!["aql", "doctor", "-d", "codex"],
-        vec!["aql", "export", "-d", "codex", "SELECT 1"],
         vec![
             "aql",
-            "export",
+            "query",
             "-d",
             "codex",
             "--output-file",
             "synthetic.json",
             "SELECT 1",
         ],
-        vec![
-            "aql",
-            "export",
-            "-d",
-            "codex",
-            "--file",
-            "synthetic.json",
-            "SELECT 1",
-        ],
-        vec!["aql", "report", "-d", "codex", "summary"],
-        vec!["aql", "report", "summary", "-d", "codex"],
-        vec![
-            "aql",
-            "report",
-            "summary",
-            "-d",
-            "codex",
-            "--since",
-            "2026-01-01T00:00:00Z",
-        ],
-        vec!["aql", "search", "-d", "codex", "synthetic"],
-        vec!["aql", "index", "status", "-d", "codex"],
-        vec!["aql", "index", "build", "-d", "codex"],
-        vec!["aql", "index", "update", "-d", "codex"],
-        vec!["aql", "index", "repair", "-d", "codex"],
     ] {
         Cli::try_parse_from(arguments).expect("database syntax must parse");
     }
@@ -187,38 +149,16 @@ fn data_commands_accept_one_consistent_database_option() {
         vec!["aql", "doctor"],
         vec!["aql", "query", "SELECT 1"],
         vec!["aql", "export", "SELECT 1"],
+        vec!["aql", "report", "summary"],
         vec!["aql", "search", "synthetic"],
         vec!["aql", "index", "status"],
+        vec!["aql", "profile", "list"],
+        vec!["aql", "sources", "discover"],
+        vec!["aql", "action", "capabilities"],
     ] {
         assert!(Cli::try_parse_from(arguments).is_err());
     }
     assert!(resolve_source_inputs(None, Vec::new(), None, None).is_err());
-}
-
-#[test]
-fn search_document_kind_is_validated_by_clap() {
-    Cli::try_parse_from([
-        "aql",
-        "search",
-        "-d",
-        "codex",
-        "--document-kind",
-        "message_content",
-        "synthetic",
-    ])
-    .expect("document kind parses");
-    assert!(
-        Cli::try_parse_from([
-            "aql",
-            "search",
-            "-d",
-            "codex",
-            "--document-kind",
-            "typo",
-            "synthetic",
-        ])
-        .is_err()
-    );
 }
 
 #[test]
@@ -284,6 +224,11 @@ fn query_sql_inputs_are_mutually_exclusive_and_explain_is_plan_only() {
         Some("ANALYZE SELECT 1")
     );
     assert_eq!(explain_sql("SELECT 1"), None);
+    Cli::try_parse_from(["aql", "query", "-d", "codex", "--diagnostics", "SELECT 1"])
+        .expect("focused diagnostics flag parses");
+    for removed in ["--plan", "--metadata", "--diagnose"] {
+        assert!(Cli::try_parse_from(["aql", "query", "-d", "codex", removed, "SELECT 1"]).is_err());
+    }
 }
 
 #[test]
@@ -318,22 +263,11 @@ fn sql_file_input_is_bounded_regular_and_no_follow() {
 }
 
 #[test]
-fn errors_have_stable_hints_for_database_and_index_workflows() {
+fn errors_have_stable_hints_for_database_workflows() {
     let database = io::Error::other("unknown database; run SHOW DATABASES");
     assert_eq!(error_category(&database), "not_found");
     assert_eq!(error_exit_code(&database), 4);
     assert!(error_hint(&database).is_some());
-    let index = io::Error::other("index rebuild required");
-    assert_eq!(error_category(&index), "index_missing");
-    assert!(error_hint(&index).is_some());
-    let content_index = CliError::ContentIndexRequired;
-    assert_eq!(error_category(&content_index), "index_missing");
-    assert_eq!(error_exit_code(&content_index), 4);
-    assert!(
-        error_hint(&content_index)
-            .expect("Content index hint")
-            .contains("--policy content")
-    );
     assert_eq!(shell_quote("SELECT 1"), "'SELECT 1'");
     assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
 }
@@ -345,13 +279,6 @@ fn command_line_and_shell_errors_offer_contextual_recovery() {
         Err(error) => error,
     };
     assert!(cli_parse_error_hint(&missing_database).contains("aql database list"));
-
-    let report_database = invalid_argument("report requires -d <database>");
-    assert!(
-        error_hint(&report_database)
-            .expect("report database hint")
-            .contains("aql database list")
-    );
 
     let access = aql_engine_datafusion::QueryError::AccessDenied("content");
     let rendered = shell_query_error(&access);
@@ -476,43 +403,6 @@ fn source_specs_reject_unknown_ambiguous_duplicate_and_overlap_before_probe() {
 }
 
 #[test]
-fn data_root_alias_accepts_relative_path_and_maps_to_codex() {
-    let parsed = parse_sources(Some(PathBuf::from(".")), Vec::new())
-        .expect("relative legacy data root remains accepted");
-    assert_eq!(parsed.len(), 1);
-    assert_eq!(parsed[0].adapter_id, "codex");
-    assert!(parsed[0].canonical_root.is_absolute());
-}
-
-#[test]
-fn transactional_output_is_memory_bounded_and_publishes_only_complete_bytes() {
-    let mut output = TransactionalOutput::new(4);
-    output.write_all(b"safe").expect("bounded write succeeds");
-    assert_eq!(output.as_bytes(), b"safe");
-    assert!(output.write_all(b"x").is_err());
-
-    let cancellation = CancellationToken::default();
-    let mut published = Vec::new();
-    publish_bytes(&mut published, output.as_bytes(), &cancellation)
-        .expect("complete transaction publishes");
-    assert_eq!(published, b"safe");
-}
-use datafusion::arrow::array::{BooleanArray, Int64Array, StringArray, TimestampMillisecondArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-
-struct BrokenWriter;
-
-impl Write for BrokenWriter {
-    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-        Err(io::Error::new(io::ErrorKind::BrokenPipe, "synthetic"))
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-#[test]
 fn broken_pipe_cancels_without_panicking() {
     let cancellation = CancellationToken::default();
     write_rendered(&mut BrokenWriter, "synthetic", &cancellation)
@@ -558,7 +448,7 @@ fn csv_output_preserves_null_empty_literal_and_rfc4180_text() {
     )
     .expect("synthetic batch must be valid");
 
-    let csv = batches_to_csv(&[batch], CsvFormulaMode::Safe).expect("CSV conversion must succeed");
+    let csv = batches_to_csv(&[batch]).expect("CSV conversion must succeed");
     assert_eq!(
         csv.rendered,
         "value\r\n\\N\r\n\"\"\r\n\"\\N\"\r\n\"comma,quote\"\"\nline\"\r\nUnicode-中文\r\n"
@@ -567,7 +457,7 @@ fn csv_output_preserves_null_empty_literal_and_rfc4180_text() {
 }
 
 #[test]
-fn csv_output_is_formula_safe_by_default_and_raw_is_explicit() {
+fn csv_output_is_always_formula_safe() {
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
             "title",
@@ -580,26 +470,25 @@ fn csv_output_is_formula_safe_by_default_and_raw_is_explicit() {
     )
     .expect("synthetic batch must be valid");
 
-    let safe = batches_to_csv(std::slice::from_ref(&batch), CsvFormulaMode::Safe)
-        .expect("safe CSV conversion must succeed");
+    let safe = batches_to_csv(&[batch]).expect("safe CSV conversion must succeed");
     assert_eq!(
         safe.rendered,
         "title\r\n'=cmd\r\n'+sum\r\n'-1+2\r\n'@name\r\n'\tcell\r\n\"'\rcell\"\r\nsafe\r\n"
     );
     assert!(safe.formula_escaped);
 
-    let raw = batches_to_csv(&[batch], CsvFormulaMode::Raw)
-        .expect("raw CSV conversion must succeed after CLI validation");
-    assert_eq!(
-        raw.rendered,
-        "title\r\n=cmd\r\n+sum\r\n-1+2\r\n@name\r\n\tcell\r\n\"\rcell\"\r\nsafe\r\n"
+    assert!(
+        Cli::try_parse_from([
+            "aql",
+            "query",
+            "-d",
+            "codex",
+            "--csv-formulas",
+            "raw",
+            "SELECT 1",
+        ])
+        .is_err()
     );
-    assert!(!raw.formula_escaped);
-
-    assert!(validate_csv_options(Output::Csv, CsvFormulaMode::Raw, false).is_err());
-    assert!(validate_csv_options(Output::Csv, CsvFormulaMode::Raw, true).is_ok());
-    assert!(validate_csv_options(Output::Json, CsvFormulaMode::Raw, true).is_err());
-    assert!(validate_csv_options(Output::Json, CsvFormulaMode::Safe, true).is_err());
 }
 
 #[test]
@@ -624,8 +513,7 @@ fn csv_output_preserves_typed_json_and_timestamp_values() {
     )
     .expect("synthetic batch must be valid");
 
-    let csv =
-        batches_to_csv(&[batch], CsvFormulaMode::Safe).expect("typed CSV conversion must succeed");
+    let csv = batches_to_csv(&[batch]).expect("typed CSV conversion must succeed");
     assert_eq!(
         csv.rendered,
         "count,ok,arguments,created_at\r\n7,true,\"{\"\"a\"\":2,\"\"z\"\":1}\",2026-01-01T00:00:00+00:00\r\n"
@@ -644,7 +532,7 @@ fn csv_output_rejects_controls_and_inconsistent_schemas() {
         vec![Arc::new(StringArray::from(vec!["bad\u{0007}value"]))],
     )
     .expect("synthetic batch must be valid");
-    assert!(batches_to_csv(&[control], CsvFormulaMode::Safe).is_err());
+    assert!(batches_to_csv(&[control]).is_err());
 
     let first = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
@@ -664,7 +552,7 @@ fn csv_output_rejects_controls_and_inconsistent_schemas() {
         vec![Arc::new(StringArray::from(vec!["two"]))],
     )
     .expect("second synthetic batch must be valid");
-    assert!(batches_to_csv(&[first, second], CsvFormulaMode::Safe).is_err());
+    assert!(batches_to_csv(&[first, second]).is_err());
 }
 
 #[test]
@@ -686,6 +574,10 @@ fn generated_release_docs_are_deterministic_and_exclude_internal_arguments() {
         let text = String::from_utf8(first).expect("completion output must be UTF-8");
         for internal in [
             "action",
+            "export",
+            "report",
+            "search",
+            "index",
             "profile",
             "sources",
             "--profile",
@@ -707,6 +599,10 @@ fn generated_release_docs_are_deterministic_and_exclude_internal_arguments() {
     let text = String::from_utf8(first).expect("man page must be UTF-8");
     for internal in [
         "ACTION",
+        "EXPORT",
+        "REPORT",
+        "SEARCH",
+        "INDEX",
         "PROFILE",
         "SOURCES",
         "--profile",
@@ -732,8 +628,6 @@ fn version_metadata_is_stable_and_host_clean() {
     assert_eq!(metadata["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(metadata["canonical_schema"], "aql-canonical-v0");
     assert_eq!(metadata["config_schema"], CONFIG_SCHEMA_VERSION);
-    assert_eq!(metadata["index_schema"], INDEX_SCHEMA_VERSION);
-    assert_eq!(metadata["report_schema"], REPORT_SCHEMA_VERSION);
     for forbidden in ["HOME", "USER", "workspace", "timestamp", "dirty", "secret"] {
         assert!(!first.contains(forbidden));
     }
@@ -744,42 +638,6 @@ fn agents_plan_capability_is_manifest_derived() {
     assert!(source_supports_table(&[], "agents"));
     assert!(!source_supports_table(&[], "sessions"));
     assert!(source_supports_table(&["sessions".to_string()], "sessions"));
-}
-
-#[test]
-fn search_context_has_content_access_class() {
-    let base = aql_index::SearchHit {
-        document_id: "document".to_string(),
-        source_id: "source".to_string(),
-        session_id: "session".to_string(),
-        message_id: None,
-        document_kind: "message_content".to_string(),
-        rank: 1.0,
-        context: None,
-    };
-    let metadata = search_hit_json(base.clone());
-    assert_eq!(metadata["access_class"], "content_derived");
-    assert!(metadata.get("context").is_none());
-
-    let content = search_hit_json(aql_index::SearchHit {
-        context: Some("bounded excerpt".to_string()),
-        ..base
-    });
-    assert_eq!(content["access_class"], "content");
-    assert_eq!(content["context"], "bounded excerpt");
-}
-
-#[test]
-fn markdown_cells_escape_tables_lines_controls_and_fences() {
-    assert_eq!(
-        markdown_escape("a|b\n```\r\u{0007}\\c"),
-        "a\\|b<br>\\`\\`\\`<br>�\\\\c"
-    );
-    assert_eq!(markdown_value(&serde_json::Value::Null), "unknown");
-    assert_eq!(
-        markdown_value(&serde_json::json!({"safe": true})),
-        "{\"safe\":true}"
-    );
 }
 
 #[test]
@@ -808,39 +666,8 @@ fn stable_error_categories_have_stable_exit_codes() {
         }),
         5
     );
-    assert_eq!(
-        error_exit_code(&aql_actions::ActionError::ConfirmationMismatch),
-        2
-    );
-    assert_eq!(
-        error_category(&aql_actions::ActionError::ConfirmationMismatch),
-        "invalid_request"
-    );
-    assert_eq!(
-        error_category(&aql_actions::ActionError::AuditTampered),
-        "state_integrity"
-    );
-    assert_eq!(
-        error_category(&io::Error::other(
-            "Action outcome is unknown because durable outcome recording failed"
-        )),
-        "unknown_outcome"
-    );
 }
 
-#[test]
-fn executing_is_externally_reported_as_unknown_outcome() {
-    assert_eq!(
-        externally_visible_action_state(ActionState::Executing),
-        ActionState::UnknownOutcome
-    );
-    assert_eq!(
-        externally_visible_action_state(ActionState::Succeeded),
-        ActionState::Succeeded
-    );
-}
-
-#[cfg(unix)]
 #[test]
 fn installation_salt_uses_private_no_follow_state() {
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -954,7 +781,7 @@ fn secure_output_rejects_symlinks_and_cleans_abandoned_temps() {
         fs::read_dir(&root)
             .expect("list output directory")
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().contains("aql-export"))
+            .filter(|entry| entry.file_name().to_string_lossy().contains("aql-output"))
             .count(),
         0
     );

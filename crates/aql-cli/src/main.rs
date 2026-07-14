@@ -3,17 +3,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{fs, io, io::IsTerminal, io::Read, io::Write};
 
-use aql_action_claude_code::ClaudeCodeActionAdapter;
-use aql_action_codex::CodexActionAdapter;
-use aql_action_kimi_code::KimiCodeActionAdapter;
-use aql_action_opencode::OpenCodeActionAdapter;
-use aql_action_synthetic::{SyntheticActionAdapter, SyntheticFault};
-use aql_actions::{
-    ACTION_AUDIT_SCHEMA_VERSION, ACTION_PLAN_SCHEMA_VERSION, ACTION_STORE_SCHEMA_VERSION,
-    ActionArguments, ActionCapability, ActionExecutionResult, ActionOperation, ActionPlan,
-    ActionReconciliation, ActionState, ActionStore, AgentActionAdapter, ApprovedAction,
-    CapabilityStatus, MAX_PLAN_TTL_MS, SanitizedResultCode, UnsignedActionPlan,
-};
 use aql_adapter_api::{
     AccessGrant, AgentAdapter, CancellationToken, ColumnName, ProbeRequest, ResourceBudget,
     ScanRequest, TableName,
@@ -24,18 +13,13 @@ use aql_adapter_kimi_code::KimiCodeAdapter;
 use aql_adapter_opencode::OpenCodeAdapter;
 use aql_config::{CONFIG_SCHEMA_VERSION, ConfigError, ConfigStore, Profile, ProfileSource};
 use aql_engine_datafusion::{
-    FederatedSource, QUERY_SCHEMAS, QueryDataType, QueryMetadata, QueryOptions, SqlParameter,
-    StreamingQueryResult, bind_sql_parameters, prepare_query, validate_read_only_sql,
+    FederatedSource, QUERY_SCHEMAS, QueryDataType, QueryOptions, SqlParameter, bind_sql_parameters,
+    prepare_query, validate_read_only_sql,
 };
-use aql_index::{
-    INDEX_SCHEMA_VERSION, IndexFreshness, IndexGeneration, IndexPolicy, IndexStore, IndexWatermark,
-    SearchOptions, TOKENIZER_VERSION, WatermarkComponent, require_fts5,
-};
-use aql_model::{AccessClass, CanonicalRecord, EntityId, SourceId, installation_scoped_hmac};
+use aql_model::AccessClass;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
-use futures::StreamExt;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -43,40 +27,29 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Helper};
 
-mod actions;
 mod cli_args;
 mod database;
 mod output;
 mod render;
 mod shell;
 
-use actions::*;
 use cli_args::*;
 use database::*;
-use output::{
-    SecureOutputFile, TransactionalOutput, portable_metadata, publish_bytes, write_export_chunk,
-};
+use output::SecureOutputFile;
 #[cfg(test)]
 use render::batches_to_values;
-use render::{
-    arrow_json_value, batch_row_to_value, batches_to_csv, batches_to_json, batches_to_jsonl,
-    validate_csv_options,
-};
+use render::{batches_to_csv, batches_to_json, batches_to_jsonl};
 use shell::*;
 
 #[derive(Debug)]
 enum CliError {
     InvalidArgument(String),
-    ContentIndexRequired,
 }
 
 impl std::fmt::Display for CliError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidArgument(message) => formatter.write_str(message),
-            Self::ContentIndexRequired => {
-                formatter.write_str("Content search index is missing or stale")
-            }
         }
     }
 }
@@ -86,6 +59,8 @@ impl std::error::Error for CliError {}
 fn invalid_argument(message: impl Into<String>) -> CliError {
     CliError::InvalidArgument(message.into())
 }
+
+const MAX_SQL_INPUT_BYTES: u64 = 64 * 1024;
 
 fn read_sql_input(
     sql: Option<String>,
@@ -263,13 +238,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Man => {
             io::stdout().lock().write_all(&render_manpage()?)?;
         }
-        Command::Doctor {
-            data_root,
-            source,
-            profile,
-            database,
-        } => {
-            let inputs = resolve_source_inputs(data_root, source, profile, database)?;
+        Command::Doctor { database } => {
+            let inputs = resolve_source_inputs(None, Vec::new(), None, Some(database))?;
             let installation_salt = installation_salt()?;
             let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
             for bound in sources {
@@ -311,19 +281,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Query {
-            data_root,
-            source,
-            profile,
             database,
             output,
-            csv_formulas,
-            acknowledge_raw_csv_formulas,
+            output_file,
             access,
             param,
             limits,
-            plan,
-            metadata,
-            diagnose,
+            diagnostics,
             shell_summary,
             sql,
             file,
@@ -331,19 +295,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             execute_query(
                 QueryExecution {
-                    data_root,
-                    source,
-                    profile,
-                    database,
+                    data_root: None,
+                    source: Vec::new(),
+                    profile: None,
+                    database: Some(database),
                     output,
-                    csv_formulas,
-                    acknowledge_raw_csv_formulas,
+                    output_file,
                     access,
                     param,
                     limits,
-                    plan,
-                    metadata,
-                    diagnose,
+                    diagnostics,
                     shell_summary,
                     sql,
                     file,
@@ -353,305 +314,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
-        Command::Export {
-            data_root,
-            source,
-            profile,
-            database,
-            access,
-            param,
-            limits,
-            file,
-            sql,
-        } => {
-            execute_export(
-                ExportExecution {
-                    data_root,
-                    source,
-                    profile,
-                    database,
-                    access,
-                    param,
-                    limits,
-                    file,
-                    sql,
-                },
-                quiet,
-            )
-            .await?;
-        }
-        Command::Report {
-            data_root,
-            source,
-            profile,
-            database,
-            access,
-            limits,
-            project,
-            since,
-            until,
-            report,
-        } => {
-            if database.is_none() && data_root.is_none() && source.is_empty() && profile.is_none() {
-                return Err(invalid_argument("report requires -d <database>").into());
-            }
-            execute_report(ReportExecution {
-                data_root,
-                source,
-                profile,
-                database,
-                access,
-                limits,
-                project,
-                since,
-                until,
-                report,
-            })
-            .await?;
-        }
-        Command::Search {
-            data_root,
-            source,
-            profile,
-            database,
-            access,
-            limit,
-            source_id,
-            session_id,
-            document_kind,
-            context_tokens,
-            max_output_bytes,
-            timeout,
-            query,
-        } => {
-            let grant = access_grant(&access);
-            if !grant.content {
-                return Err("search requires --access content".into());
-            }
-            let deadline = Instant::now()
-                .checked_add(timeout)
-                .ok_or("timeout exceeds the supported range")?;
-            let inputs = resolve_source_inputs(data_root, source, profile, database)?;
-            let state_root = aql_state_root()?;
-            let selected = parse_sources(inputs.data_root, inputs.source_specs)?;
-            let mut stores = Vec::with_capacity(selected.len());
-            let mut generation_count = 0_usize;
-            for source in &selected {
-                let store = IndexStore::open_existing(&state_root, &source.canonical_root)?;
-                let generations = store
-                    .active_generations()?
-                    .into_iter()
-                    .filter(|generation| generation.policy == IndexPolicy::Content)
-                    .collect::<Vec<_>>();
-                generation_count = generation_count
-                    .checked_add(generations.len())
-                    .ok_or("search source count overflow")?;
-                stores.push((store, generations));
-            }
-            if generation_count == 0 {
-                return Err(CliError::ContentIndexRequired.into());
-            }
-            if generation_count > 64 {
-                return Err("search source count exceeds the supported limit".into());
-            }
-            let mut hits = Vec::new();
-            let session_id = session_id
-                .map(|session_id| private_search_session_id(&session_id))
-                .transpose()?;
-            let search_options = SearchOptions {
-                source_id,
-                session_id,
-                document_kind: document_kind.map(|kind| kind.as_str().to_string()),
-                context_tokens,
-            };
-            for (store, generations) in &stores {
-                for generation in generations {
-                    if Instant::now() >= deadline {
-                        return Err("search timed out".into());
-                    }
-                    hits.extend(store.search_generation_with_options(
-                        generation,
-                        &query,
-                        limit,
-                        &search_options,
-                    )?);
-                }
-            }
-            hits.sort_by(|left, right| {
-                left.rank
-                    .total_cmp(&right.rank)
-                    .then_with(|| left.document_id.cmp(&right.document_id))
-            });
-            hits.truncate(limit as usize);
-            let mut written = 0_u64;
-            let mut stdout = io::stdout().lock();
-            for hit in hits {
-                if Instant::now() >= deadline {
-                    return Err("search timed out".into());
-                }
-                let rendered = serde_json::to_string(&search_hit_json(hit))?;
-                written = written
-                    .checked_add(rendered.len() as u64 + 1)
-                    .ok_or("search output size overflow")?;
-                if written > max_output_bytes {
-                    return Err("search output budget exceeded".into());
-                }
-                writeln!(stdout, "{rendered}")?;
-            }
-            stdout.flush()?;
-            if !io::stdout().is_terminal() && !quiet {
-                eprintln!("warning=search results are derived from persisted Content");
-            }
-        }
-        Command::Action { action } => execute_action_command(action)?,
-        Command::Index { index } => match index {
-            IndexCommand::Status {
-                data_root,
-                source,
-                profile,
-                database,
-                output,
-            } => {
-                let data_root = resolve_single_source_root(data_root, source, profile, database)?;
-                let state_root = aql_state_root()?;
-                match IndexStore::open_existing(&state_root, &data_root) {
-                    Ok(store) => {
-                        let generations = store.active_generations()?;
-                        match output {
-                            IndexStatusOutput::Text => {
-                                if generations.is_empty() {
-                                    println!("freshness=missing");
-                                }
-                                for generation in generations {
-                                    println!("source_id={}", generation.source_id);
-                                    println!("policy={}", generation.policy);
-                                    println!("freshness={}", generation.freshness);
-                                    println!("records={}", generation.record_count);
-                                    println!("size_bytes={}", generation.size_bytes);
-                                    println!("schema={}", generation.schema_version);
-                                }
-                            }
-                            IndexStatusOutput::Json => println!(
-                                "{}",
-                                serde_json::to_string(&serde_json::json!({
-                                    "freshness": if generations.is_empty() { "missing" } else { "available" },
-                                    "generations": generations,
-                                }))?
-                            ),
-                        }
-                    }
-                    Err(aql_index::IndexError::Missing) => match output {
-                        IndexStatusOutput::Text => println!("freshness=missing"),
-                        IndexStatusOutput::Json => {
-                            println!("{{\"freshness\":\"missing\",\"generations\":[]}}")
-                        }
-                    },
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            IndexCommand::Build {
-                data_root,
-                source,
-                profile,
-                database,
-                policy,
-                access,
-                acknowledge_persistent_sensitive_copy,
-                max_records,
-                max_bytes_read,
-                max_index_bytes,
-                timeout,
-            } => execute_index_write(
-                IndexWriteRequest {
-                    data_root,
-                    source,
-                    profile,
-                    database,
-                    policy,
-                    access,
-                    acknowledge_persistent_sensitive_copy,
-                    max_records,
-                    max_bytes_read,
-                    max_index_bytes,
-                    timeout,
-                },
-                MetadataWriteMode::Build,
-            )?,
-            IndexCommand::Update {
-                data_root,
-                source,
-                profile,
-                database,
-                policy,
-                access,
-                acknowledge_persistent_sensitive_copy,
-                max_records,
-                max_bytes_read,
-                max_index_bytes,
-                timeout,
-            } => execute_index_write(
-                IndexWriteRequest {
-                    data_root,
-                    source,
-                    profile,
-                    database,
-                    policy,
-                    access,
-                    acknowledge_persistent_sensitive_copy,
-                    max_records,
-                    max_bytes_read,
-                    max_index_bytes,
-                    timeout,
-                },
-                MetadataWriteMode::Update,
-            )?,
-            IndexCommand::Clear {
-                data_root,
-                source,
-                profile,
-                database,
-                source_id,
-                all,
-                acknowledge_clear_all_indexes,
-            } => {
-                let data_root = resolve_single_source_root(data_root, source, profile, database)?;
-                if !all && source_id.is_none() {
-                    return Err("index clear requires --source-id or --all".into());
-                }
-                if all && !acknowledge_clear_all_indexes {
-                    return Err("--all requires --acknowledge-clear-all-indexes".into());
-                }
-                let state_root = aql_state_root()?;
-                let store = IndexStore::open_existing(&state_root, &data_root)?;
-                let lock = store.acquire_write_lock()?;
-                let removed = if all {
-                    store.clear_all(lock)?
-                } else {
-                    store.clear_source(
-                        source_id
-                            .as_deref()
-                            .ok_or("index clear requires --source-id")?,
-                        lock,
-                    )?
-                };
-                println!("removed_generations={removed}");
-            }
-            IndexCommand::Repair {
-                data_root,
-                source,
-                profile,
-                database,
-            } => {
-                let data_root = resolve_single_source_root(data_root, source, profile, database)?;
-                let state_root = aql_state_root()?;
-                let store = IndexStore::open_existing(&state_root, &data_root)?;
-                let lock = store.acquire_write_lock()?;
-                let removed = store.repair_abandoned(lock)?;
-                println!("removed_abandoned_files={removed}");
-            }
-        },
-        Command::Sources { sources } => execute_source_command(sources)?,
-        Command::Profile { profile } => execute_profile_command(profile, "profile")?,
         Command::Database { database } => execute_database_command(database)?,
         Command::Schema {
             table,
@@ -671,128 +333,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct ReportExecution {
-    data_root: Option<PathBuf>,
-    source: Vec<String>,
-    profile: Option<String>,
-    database: Option<String>,
-    access: Vec<Access>,
-    limits: ExecutionLimits,
-    project: Option<String>,
-    since: Option<String>,
-    until: Option<String>,
-    report: ReportKind,
-}
-
-async fn execute_report(request: ReportExecution) -> Result<(), Box<dyn std::error::Error>> {
-    let ReportExecution {
-        data_root,
-        source,
-        profile,
-        database,
-        access,
-        limits,
-        project,
-        since,
-        until,
-        report,
-    } = request;
-    let ExecutionLimits {
-        max_records,
-        max_bytes_read,
-        max_output_bytes,
-        max_single_value_bytes,
-        max_memory_bytes,
-        timeout,
-    } = limits;
-    let (budget, deadline_at) = execution_budget(
-        max_records,
-        max_bytes_read,
-        max_output_bytes,
-        max_single_value_bytes,
-        timeout,
-    )?;
-    let mut options = QueryOptions {
-        access: access_grant(&access),
-        budget: budget.clone(),
-        max_memory_bytes,
-        ..QueryOptions::default()
-    };
-    let report_parameters = report_parameters(report, project, since, until)?;
-    let sections = report_sections(report);
-    let mut validated = Vec::with_capacity(sections.len());
-    for section in &sections {
-        let parameters = section
-            .parameters
-            .iter()
-            .map(|name| ((*name).to_string(), report_parameters[*name].clone()))
-            .collect();
-        let bound = bind_sql_parameters(section.sql, &parameters)?;
-        let sql = validate_read_only_sql(&bound)?;
-        prepare_query(&sql, options.clone()).await?;
-        validated.push(sql);
-    }
-    let inputs = resolve_source_inputs(data_root, source, profile, database)?;
-    let installation_salt = installation_salt()?;
-    options.redaction_salt = installation_salt.clone();
-    let cancellation = options.cancellation.clone();
-    let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
-    let mut transaction = TransactionalOutput::new(max_memory_bytes);
-    let report_title = match report {
-        ReportKind::Summary => "# AQL Agent Usage Summary\n\n",
-        ReportKind::Project => "# AQL Project Activity Report\n\n",
-    };
-    if !write_export_chunk(
-        &mut transaction,
-        report_title.as_bytes(),
-        &budget,
-        &cancellation,
-    )? {
-        return Ok(());
-    }
-    for (section, sql) in sections.iter().zip(validated.iter()) {
-        let prepared = prepare_query(sql, options.clone()).await?;
-        let result = prepared.execute_stream(sources.clone()).await?;
-        let remaining = deadline_at.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            cancellation.cancel();
-            return Err("query timed out".into());
-        }
-        if !stream_markdown_section(
-            &mut transaction,
-            section.title,
-            result,
-            &budget,
-            &cancellation,
-            remaining,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-    }
-    publish_bytes(
-        &mut io::stdout().lock(),
-        transaction.as_bytes(),
-        &cancellation,
-    )?;
-    Ok(())
-}
-
 struct QueryExecution {
     data_root: Option<PathBuf>,
     source: Vec<String>,
     profile: Option<String>,
     database: Option<String>,
     output: Output,
-    csv_formulas: CsvFormulaMode,
-    acknowledge_raw_csv_formulas: bool,
+    output_file: Option<PathBuf>,
     access: Vec<Access>,
     param: Vec<String>,
     limits: ExecutionLimits,
-    plan: bool,
-    metadata: bool,
-    diagnose: bool,
+    diagnostics: bool,
     shell_summary: bool,
     sql: Option<String>,
     file: Option<PathBuf>,
@@ -809,14 +360,11 @@ async fn execute_query(
         profile,
         database,
         output,
-        csv_formulas,
-        acknowledge_raw_csv_formulas,
+        output_file,
         access,
         param,
         limits,
-        plan,
-        metadata,
-        diagnose,
+        diagnostics,
         shell_summary,
         sql,
         file,
@@ -831,7 +379,6 @@ async fn execute_query(
         timeout,
     } = limits;
     let parse_started = Instant::now();
-    validate_csv_options(output, csv_formulas, acknowledge_raw_csv_formulas)?;
     let sql = read_sql_input(sql, file, stdin)?;
     let query_started = Instant::now();
     let (sql, explain) = match explain_sql(&sql) {
@@ -841,7 +388,7 @@ async fn execute_query(
     };
     let bound_sql = bind_sql_parameters(sql, &parse_sql_parameters(&param)?)?;
     let validated_sql = validate_read_only_sql(&bound_sql)?;
-    diagnostic_timing(diagnose, "parse", parse_started);
+    diagnostic_timing(diagnostics, "parse", parse_started);
     let (query_budget, _) = execution_budget(
         max_records,
         max_bytes_read,
@@ -857,7 +404,11 @@ async fn execute_query(
     };
     let authorize_started = Instant::now();
     prepare_query(&validated_sql, options.clone()).await?;
-    diagnostic_timing(diagnose, "authorize", authorize_started);
+    diagnostic_timing(diagnostics, "authorize", authorize_started);
+    let mut secure_output = output_file
+        .as_deref()
+        .map(SecureOutputFile::create)
+        .transpose()?;
     let inputs = resolve_source_inputs(data_root, source, profile, database)?;
     let installation_salt = installation_salt()?;
     options.redaction_salt = installation_salt.clone();
@@ -866,11 +417,11 @@ async fn execute_query(
     let prepared = prepare_query(&validated_sql, options).await?;
     let probe_started = Instant::now();
     let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
-    diagnostic_timing(diagnose, "probe", probe_started);
+    diagnostic_timing(diagnostics, "probe", probe_started);
     if sources.is_empty() {
         return Err("probe returned no compatible source".into());
     }
-    if plan || explain {
+    if explain {
         let summary = prepared.plan_summary();
         eprintln!("plan.tables={}", summary.tables.join(","));
         eprintln!("plan.columns={}", summary.columns.join(","));
@@ -932,13 +483,13 @@ async fn execute_query(
             return Err("query timed out".into());
         }
     };
-    diagnostic_timing(diagnose, "execute", execute_started);
+    diagnostic_timing(diagnostics, "execute", execute_started);
     if !quiet {
         for warning in &result.metadata.warnings {
             eprintln!("warning={warning}");
         }
     }
-    if metadata {
+    if diagnostics {
         eprintln!("metadata.sources={}", result.metadata.source_ids.join(","));
         eprintln!(
             "metadata.records_scanned={}",
@@ -966,7 +517,7 @@ async fn execute_query(
         Output::Json => (batches_to_json(&batches)?, false),
         Output::Jsonl => (batches_to_jsonl(&batches)?, false),
         Output::Csv => {
-            let csv = batches_to_csv(&batches, csv_formulas)?;
+            let csv = batches_to_csv(&batches)?;
             (csv.rendered, csv.formula_escaped)
         }
     };
@@ -974,672 +525,24 @@ async fn execute_query(
     if formula_escaped && !quiet {
         eprintln!("warning=CSV formula-like text was escaped");
     }
-    if !access.is_empty() && !io::stdout().is_terminal() && !quiet {
+    if !access.is_empty() && (secure_output.is_some() || !io::stdout().is_terminal()) && !quiet {
         eprintln!("warning=sensitive access was granted for non-terminal output");
     }
-    write_rendered(&mut io::stdout().lock(), &rendered, &cancellation)?;
-    diagnostic_timing(diagnose, "render", render_started);
+    if let Some(output) = secure_output.as_mut() {
+        write_rendered(output.writer(), &rendered, &cancellation)?;
+    } else {
+        write_rendered(&mut io::stdout().lock(), &rendered, &cancellation)?;
+    }
+    if let Some(output) = secure_output {
+        output.commit()?;
+    }
+    diagnostic_timing(diagnostics, "render", render_started);
     if shell_summary && !quiet {
         eprintln!(
             "({returned_rows} rows, {} ms)",
             query_started.elapsed().as_millis()
         );
     }
-    Ok(())
-}
-
-struct ExportExecution {
-    data_root: Option<PathBuf>,
-    source: Vec<String>,
-    profile: Option<String>,
-    database: Option<String>,
-    access: Vec<Access>,
-    param: Vec<String>,
-    limits: ExecutionLimits,
-    file: Option<PathBuf>,
-    sql: String,
-}
-
-async fn execute_export(
-    request: ExportExecution,
-    quiet: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let ExportExecution {
-        data_root,
-        source,
-        profile,
-        database,
-        access,
-        param,
-        limits,
-        file,
-        sql,
-    } = request;
-    let ExecutionLimits {
-        max_records,
-        max_bytes_read,
-        max_output_bytes,
-        max_single_value_bytes,
-        max_memory_bytes,
-        timeout,
-    } = limits;
-    let bound_sql = bind_sql_parameters(&sql, &parse_sql_parameters(&param)?)?;
-    let validated_sql = validate_read_only_sql(&bound_sql)?;
-    let (budget, deadline_at) = execution_budget(
-        max_records,
-        max_bytes_read,
-        max_output_bytes,
-        max_single_value_bytes,
-        timeout,
-    )?;
-    let mut options = QueryOptions {
-        access: access_grant(&access),
-        budget: budget.clone(),
-        max_memory_bytes,
-        ..QueryOptions::default()
-    };
-    prepare_query(&validated_sql, options.clone()).await?;
-    let inputs = resolve_source_inputs(data_root, source, profile, database)?;
-    let mut secure_output = file.as_deref().map(SecureOutputFile::create).transpose()?;
-    let installation_salt = installation_salt()?;
-    options.redaction_salt = installation_salt.clone();
-    let cancellation = options.cancellation.clone();
-    let prepared = prepare_query(&validated_sql, options).await?;
-    let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
-    let result = prepared.execute_stream(sources).await?;
-    let remaining = deadline_at.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        cancellation.cancel();
-        return Err("query timed out".into());
-    }
-    if let Some(output) = secure_output.as_mut() {
-        stream_portable_json(output.writer(), result, &budget, &cancellation, remaining).await?;
-    } else {
-        if !access.is_empty() && !io::stdout().is_terminal() && !quiet {
-            eprintln!("warning=sensitive access was granted for non-terminal output");
-        }
-        let mut transaction = TransactionalOutput::new(max_memory_bytes);
-        stream_portable_json(&mut transaction, result, &budget, &cancellation, remaining).await?;
-        publish_bytes(
-            &mut io::stdout().lock(),
-            transaction.as_bytes(),
-            &cancellation,
-        )?;
-    }
-    if let Some(output) = secure_output {
-        output.commit()?;
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum MetadataWriteMode {
-    Build,
-    Update,
-}
-
-fn execute_index_write(
-    request: IndexWriteRequest,
-    mode: MetadataWriteMode,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let policy = IndexPolicy::from(request.policy);
-    let grant = access_grant(&request.access);
-    if policy == IndexPolicy::Content
-        && (!grant.content || !request.acknowledge_persistent_sensitive_copy)
-    {
-        return Err("content indexing requires --access content and --acknowledge-persistent-sensitive-copy".into());
-    }
-    if policy == IndexPolicy::Content {
-        require_fts5()?;
-    }
-    let deadline = Instant::now()
-        .checked_add(request.timeout)
-        .ok_or("timeout exceeds the supported range")?;
-    let budget = ResourceBudget {
-        max_records: request.max_records,
-        max_bytes_read: request.max_bytes_read,
-        max_output_bytes: 0,
-        max_single_value_bytes: 16 * 1024 * 1024,
-        deadline: Some(deadline),
-        ..ResourceBudget::default()
-    };
-    let inputs = resolve_source_inputs(
-        request.data_root,
-        request.source,
-        request.profile,
-        request.database,
-    )?;
-    write_index(inputs, budget, mode, policy, grant, request.max_index_bytes)
-}
-
-fn write_index(
-    inputs: SourceInputs,
-    budget: ResourceBudget,
-    mode: MetadataWriteMode,
-    policy: IndexPolicy,
-    access: AccessGrant,
-    max_index_bytes: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = parse_sources(inputs.data_root, inputs.source_specs)?;
-    if parsed.len() != 1 {
-        return Err("index build/update requires exactly one source".into());
-    }
-    let selected = &parsed[0];
-    let data_root = &selected.canonical_root;
-    let state_root = aql_state_root()?;
-    let store = match mode {
-        MetadataWriteMode::Build => IndexStore::create(&state_root, data_root)?,
-        MetadataWriteMode::Update => {
-            IndexStore::open_existing(&state_root, data_root).map_err(|error| match error {
-                aql_index::IndexError::Missing => aql_index::IndexError::RebuildRequired,
-                other => other,
-            })?
-        }
-    };
-    let lock = store.acquire_write_lock()?;
-    let installation_salt = installation_salt()?;
-    let adapter = read_adapter(&selected.adapter_id, &installation_salt)?;
-    let manifests = adapter
-        .probe(&ProbeRequest {
-            data_root: selected.root.to_string_lossy().into_owned(),
-        })?
-        .manifests;
-    if manifests.is_empty() {
-        return Err("probe returned no compatible source".into());
-    }
-    let active_generations = if matches!(mode, MetadataWriteMode::Update) {
-        store.active_generations()?
-    } else {
-        Vec::new()
-    };
-    for manifest in manifests {
-        if matches!(mode, MetadataWriteMode::Update) {
-            let Some(active) = active_generations.iter().find(|generation| {
-                generation.source_id == manifest.source_id.as_str() && generation.policy == policy
-            }) else {
-                return Err(aql_index::IndexError::RebuildRequired.into());
-            };
-            if active.schema_version != INDEX_SCHEMA_VERSION
-                || active.adapter_id != manifest.agent_id
-                || active.format_fingerprint != manifest.format_fingerprint
-                || active.tokenizer_version
-                    != (policy == IndexPolicy::Content).then(|| TOKENIZER_VERSION.to_string())
-                || active.freshness != IndexFreshness::Fresh
-            {
-                return Err(aql_index::IndexError::RebuildRequired.into());
-            }
-        }
-        let mut builder = store.begin_generation(&lock)?;
-        if policy == IndexPolicy::Content {
-            builder.initialize_content_fts()?;
-        }
-        let empty_watermark = IndexWatermark::default();
-        builder.put_metadata_record(
-            "agent",
-            manifest.source_id.as_str(),
-            manifest.source_id.as_str(),
-            &serde_json::json!({
-                "source_id": manifest.source_id.as_str(),
-                "agent_id": &manifest.agent_id,
-                "display_name": &manifest.display_name,
-                "format_fingerprint": &manifest.format_fingerprint,
-                "capabilities": &manifest.capabilities,
-                "snapshot_available": manifest.snapshot.is_some(),
-            }),
-            &empty_watermark,
-        )?;
-        let mut session_projection = vec![
-            "session_id",
-            "source_id",
-            "agent_id",
-            "model",
-            "provider",
-            "created_at",
-            "updated_at",
-            "archived",
-            "tokens_used",
-        ];
-        if policy == IndexPolicy::Content {
-            session_projection.extend(["title", "preview"]);
-        }
-        let scan = adapter.scan(ScanRequest {
-            source: manifest.clone(),
-            table: TableName::Sessions,
-            projection: session_projection
-                .into_iter()
-                .map(ColumnName::new)
-                .collect(),
-            predicates: Vec::new(),
-            limit: None,
-            order_hint: Vec::new(),
-            access,
-            budget: budget.clone(),
-            cancellation: CancellationToken::default(),
-            snapshot: manifest.snapshot.clone(),
-        })?;
-        let mut record_count = 1_u64;
-        let mut max_updated_at_ms: Option<i64> = None;
-        for record in scan.records {
-            let CanonicalRecord::Session(session) = record? else {
-                return Err("session index scan produced a non-session record".into());
-            };
-            max_updated_at_ms = match (max_updated_at_ms, session.updated_at) {
-                (Some(current), Some(value)) => Some(current.max(value.timestamp_millis())),
-                (None, Some(value)) => Some(value.timestamp_millis()),
-                (current, None) => current,
-            };
-            let persistent_session_id = installation_scoped_hmac(
-                "aql-index-session-id-v1",
-                session.session_id.as_str(),
-                &installation_salt,
-            );
-            let mut record_watermark = IndexWatermark::default();
-            record_watermark.components.insert(
-                "state".to_string(),
-                WatermarkComponent::Sqlite {
-                    schema_fingerprint: manifest.format_fingerprint.clone(),
-                    max_updated_at_ms: session.updated_at.map(|value| value.timestamp_millis()),
-                    max_native_id_hmac: None,
-                },
-            );
-            builder.put_metadata_record(
-                "session",
-                &persistent_session_id,
-                session.source_id.as_str(),
-                &serde_json::json!({
-                    "session_id": &persistent_session_id,
-                    "source_id": session.source_id.as_str(),
-                    "agent_id": &session.agent_id,
-                    "model": &session.model,
-                    "provider": &session.provider,
-                    "created_at": session.created_at,
-                    "updated_at": session.updated_at,
-                    "status": &session.status,
-                    "archived": session.archived,
-                    "message_count": session.message_count,
-                    "tool_call_count": session.tool_call_count,
-                    "tokens_used": session.tokens_used,
-                    "identity_confidence": &session.identity_confidence,
-                    "snapshot_state": &session.snapshot_state,
-                }),
-                &record_watermark,
-            )?;
-            record_count = record_count
-                .checked_add(1)
-                .ok_or("index record count overflow")?;
-            if policy == IndexPolicy::Content {
-                for (kind, value) in [
-                    ("session_title", session.title.as_deref()),
-                    ("session_preview", session.preview.as_deref()),
-                ] {
-                    if let Some(content) = value.filter(|content| !content.is_empty()) {
-                        let document_id = installation_scoped_hmac(
-                            kind,
-                            session.session_id.as_str(),
-                            &installation_salt,
-                        );
-                        builder.put_content_document(
-                            &document_id,
-                            session.source_id.as_str(),
-                            &persistent_session_id,
-                            None,
-                            kind,
-                            content,
-                            &record_watermark,
-                        )?;
-                        record_count = record_count
-                            .checked_add(1)
-                            .ok_or("index record count overflow")?;
-                    }
-                }
-            }
-        }
-        if policy == IndexPolicy::Content {
-            let messages = adapter.scan(ScanRequest {
-                source: manifest.clone(),
-                table: TableName::Messages,
-                projection: ["message_id", "session_id", "content"]
-                    .into_iter()
-                    .map(ColumnName::new)
-                    .collect(),
-                predicates: Vec::new(),
-                limit: None,
-                order_hint: Vec::new(),
-                access,
-                budget: budget.clone(),
-                cancellation: CancellationToken::default(),
-                snapshot: manifest.snapshot.clone(),
-            })?;
-            for record in messages.records {
-                let CanonicalRecord::Message(message) = record? else {
-                    return Err("message index scan produced a non-message record".into());
-                };
-                if message.role == "tool" {
-                    continue;
-                }
-                let Some(content) = message
-                    .content
-                    .as_deref()
-                    .filter(|content| !content.is_empty())
-                else {
-                    continue;
-                };
-                let persistent_session_id = installation_scoped_hmac(
-                    "aql-index-session-id-v1",
-                    message.session_id.as_str(),
-                    &installation_salt,
-                );
-                let persistent_message_id = installation_scoped_hmac(
-                    "aql-index-message-id-v1",
-                    message.message_id.as_str(),
-                    &installation_salt,
-                );
-                let document_id = installation_scoped_hmac(
-                    "message_content",
-                    message.message_id.as_str(),
-                    &installation_salt,
-                );
-                builder.put_content_document(
-                    &document_id,
-                    message.source_id.as_str(),
-                    &persistent_session_id,
-                    Some(&persistent_message_id),
-                    "message_content",
-                    content,
-                    &IndexWatermark::default(),
-                )?;
-                record_count = record_count
-                    .checked_add(1)
-                    .ok_or("index record count overflow")?;
-            }
-        }
-        let mut watermark = IndexWatermark::default();
-        watermark.components.insert(
-            "state".to_string(),
-            WatermarkComponent::Sqlite {
-                schema_fingerprint: manifest.format_fingerprint.clone(),
-                max_updated_at_ms,
-                max_native_id_hmac: None,
-            },
-        );
-        let completed_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis()
-            .try_into()?;
-        let generation = IndexGeneration {
-            generation_id: builder.generation_id().to_string(),
-            schema_version: INDEX_SCHEMA_VERSION.to_string(),
-            policy,
-            source_id: manifest.source_id.to_string(),
-            adapter_id: manifest.agent_id,
-            format_fingerprint: manifest.format_fingerprint,
-            tokenizer_version: (policy == IndexPolicy::Content)
-                .then(|| TOKENIZER_VERSION.to_string()),
-            watermark,
-            snapshot_strength: "weak".to_string(),
-            freshness: IndexFreshness::Fresh,
-            record_count,
-            size_bytes: 0,
-            completed_at_ms: Some(completed_at_ms),
-            file_name: builder.file_name().to_string(),
-            active: true,
-        };
-        let _ = builder.commit(&generation, max_index_bytes)?;
-        println!("source_id={}", generation.source_id);
-        println!("policy={}", generation.policy);
-        println!("records={}", generation.record_count);
-        println!("freshness={}", generation.freshness);
-        if matches!(mode, MetadataWriteMode::Update) {
-            println!("update_mode=full_reconcile");
-        }
-    }
-    lock.release()?;
-    Ok(())
-}
-
-struct ReportSection {
-    title: &'static str,
-    sql: &'static str,
-    parameters: &'static [&'static str],
-}
-
-const REPORT_SCHEMA_VERSION: &str = "aql-reports-v1";
-
-fn report_parameters(
-    report: ReportKind,
-    project: Option<String>,
-    since: Option<String>,
-    until: Option<String>,
-) -> Result<std::collections::BTreeMap<String, SqlParameter>, CliError> {
-    if report == ReportKind::Summary && project.is_some() {
-        return Err(invalid_argument(
-            "--project is only valid for the project report",
-        ));
-    }
-    if project.as_ref().is_some_and(|value| {
-        value.is_empty() || value.len() > 4_096 || value.chars().any(char::is_control)
-    }) {
-        return Err(invalid_argument("report project filter is invalid"));
-    }
-    for value in [&since, &until].into_iter().flatten() {
-        chrono::DateTime::parse_from_rfc3339(value)
-            .map_err(|_| invalid_argument("report time filters must be RFC 3339 timestamps"))?;
-    }
-    if let (Some(since), Some(until)) = (&since, &until)
-        && chrono::DateTime::parse_from_rfc3339(since)
-            .map_err(|_| invalid_argument("report time filters must be RFC 3339 timestamps"))?
-            >= chrono::DateTime::parse_from_rfc3339(until)
-                .map_err(|_| invalid_argument("report time filters must be RFC 3339 timestamps"))?
-    {
-        return Err(invalid_argument(
-            "report --since must be earlier than --until",
-        ));
-    }
-    Ok(std::collections::BTreeMap::from([
-        (
-            "project".to_string(),
-            project.map_or(SqlParameter::Null, SqlParameter::Text),
-        ),
-        (
-            "since".to_string(),
-            since.map_or(SqlParameter::Null, SqlParameter::Text),
-        ),
-        (
-            "until".to_string(),
-            until.map_or(SqlParameter::Null, SqlParameter::Text),
-        ),
-    ]))
-}
-
-fn report_sections(report: ReportKind) -> Vec<ReportSection> {
-    match report {
-        ReportKind::Summary => vec![
-            ReportSection {
-                title: "Overview by model",
-                sql: "SELECT agent_id, model, provider, MIN(bucket_start) AS first_activity, MAX(bucket_start) AS last_activity, COUNT(DISTINCT session_id) AS sessions, SUM(message_count) AS messages, SUM(tool_call_count) AS tool_calls, SUM(error_count) AS errors, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(total_tokens) AS total_tokens FROM usage WHERE (:since IS NULL OR bucket_start >= CAST(:since AS TIMESTAMP)) AND (:until IS NULL OR bucket_start < CAST(:until AS TIMESTAMP)) GROUP BY agent_id, model, provider ORDER BY agent_id, model, provider",
-                parameters: &["since", "until"],
-            },
-            ReportSection {
-                title: "Failed tools",
-                sql: "SELECT tool_name, status, COUNT(*) AS failed_calls FROM tool_calls WHERE status IN ('error', 'failed') AND (:since IS NULL OR started_at >= CAST(:since AS TIMESTAMP)) AND (:until IS NULL OR started_at < CAST(:until AS TIMESTAMP)) GROUP BY tool_name, status ORDER BY failed_calls DESC, tool_name",
-                parameters: &["since", "until"],
-            },
-            ReportSection {
-                title: "Sources",
-                sql: "SELECT agent_id, provider, COUNT(*) AS sessions, MIN(created_at) AS first_session, MAX(updated_at) AS last_session FROM sessions WHERE (:since IS NULL OR updated_at >= CAST(:since AS TIMESTAMP)) AND (:until IS NULL OR created_at < CAST(:until AS TIMESTAMP)) GROUP BY agent_id, provider ORDER BY agent_id, provider",
-                parameters: &["since", "until"],
-            },
-        ],
-        ReportKind::Project => vec![
-            ReportSection {
-                title: "Project activity by model",
-                sql: "SELECT MASK_PATH(s.cwd, 2) AS project, s.model, MIN(u.bucket_start) AS first_activity, MAX(u.bucket_start) AS last_activity, COUNT(DISTINCT s.session_id) AS sessions, SUM(u.message_count) AS messages, SUM(u.tool_call_count) AS tool_calls, SUM(u.error_count) AS errors, SUM(u.total_tokens) AS total_tokens FROM sessions s LEFT JOIN usage u ON s.session_id = u.session_id WHERE (:project IS NULL OR MASK_PATH(s.cwd, 2) = :project) AND (:since IS NULL OR u.bucket_start >= CAST(:since AS TIMESTAMP)) AND (:until IS NULL OR u.bucket_start < CAST(:until AS TIMESTAMP)) GROUP BY MASK_PATH(s.cwd, 2), s.model ORDER BY project, s.model",
-                parameters: &["project", "since", "until"],
-            },
-            ReportSection {
-                title: "Failed tools by project",
-                sql: "SELECT MASK_PATH(s.cwd, 2) AS project, t.tool_name, t.status, COUNT(*) AS failed_calls FROM tool_calls t JOIN sessions s ON t.session_id = s.session_id WHERE t.status IN ('error', 'failed') AND (:project IS NULL OR MASK_PATH(s.cwd, 2) = :project) AND (:since IS NULL OR t.started_at >= CAST(:since AS TIMESTAMP)) AND (:until IS NULL OR t.started_at < CAST(:until AS TIMESTAMP)) GROUP BY MASK_PATH(s.cwd, 2), t.tool_name, t.status ORDER BY failed_calls DESC, project, t.tool_name",
-                parameters: &["project", "since", "until"],
-            },
-        ],
-    }
-}
-
-async fn stream_markdown_section(
-    writer: &mut impl Write,
-    title: &str,
-    result: StreamingQueryResult,
-    budget: &ResourceBudget,
-    cancellation: &CancellationToken,
-    timeout: Duration,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let StreamingQueryResult {
-        mut stream,
-        metadata,
-    } = result;
-    let schema = stream.schema();
-    let mut header = format!("## {}\n\n|", markdown_escape(title));
-    for field in schema.fields() {
-        header.push(' ');
-        header.push_str(&markdown_escape(field.name()));
-        header.push_str(" |");
-    }
-    header.push_str("\n|");
-    for _ in schema.fields() {
-        header.push_str(" --- |");
-    }
-    header.push('\n');
-    if !write_export_chunk(writer, header.as_bytes(), budget, cancellation)? {
-        return Ok(false);
-    }
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-    loop {
-        let batch = tokio::select! {
-            batch = stream.next() => batch,
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                cancellation.cancel();
-                return Err("query cancelled".into());
-            }
-            _ = &mut deadline => {
-                cancellation.cancel();
-                return Err("query timed out".into());
-            }
-        };
-        let Some(batch) = batch else { break };
-        let batch = batch?;
-        for row_index in 0..batch.num_rows() {
-            let mut row = String::from("|");
-            for column_index in 0..batch.num_columns() {
-                let value = arrow_json_value(&batch, column_index, row_index)?;
-                row.push(' ');
-                row.push_str(&markdown_value(&value));
-                row.push_str(" |");
-            }
-            row.push('\n');
-            if !write_export_chunk(writer, row.as_bytes(), budget, cancellation)? {
-                return Ok(false);
-            }
-        }
-    }
-    let metadata = metadata.finish()?;
-    if !metadata.warnings.is_empty() {
-        let mut warnings = String::from("\nWarnings:\n\n");
-        for warning in metadata.warnings {
-            warnings.push_str("- ");
-            warnings.push_str(&markdown_escape(&warning));
-            warnings.push('\n');
-        }
-        if !write_export_chunk(writer, warnings.as_bytes(), budget, cancellation)? {
-            return Ok(false);
-        }
-    }
-    write_export_chunk(writer, b"\n", budget, cancellation)
-}
-
-fn markdown_value(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => "unknown".to_string(),
-        serde_json::Value::String(value) => markdown_escape(value),
-        other => markdown_escape(&other.to_string()),
-    }
-}
-
-fn markdown_escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '|' => escaped.push_str("\\|"),
-            '\n' => escaped.push_str("<br>"),
-            '\r' => escaped.push_str("<br>"),
-            '`' => escaped.push_str("\\`"),
-            character if character.is_control() => escaped.push('\u{fffd}'),
-            character => escaped.push(character),
-        }
-    }
-    escaped
-}
-
-async fn stream_portable_json(
-    writer: &mut impl Write,
-    result: StreamingQueryResult,
-    budget: &ResourceBudget,
-    cancellation: &CancellationToken,
-    timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let StreamingQueryResult {
-        mut stream,
-        metadata,
-    } = result;
-    if !write_export_chunk(
-        writer,
-        b"{\"format\":\"aql-portable-v1\",\"schema_version\":1,\"records\":[",
-        budget,
-        cancellation,
-    )? {
-        return Ok(());
-    }
-    let mut first = true;
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-    loop {
-        let batch = tokio::select! {
-            batch = stream.next() => batch,
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                cancellation.cancel();
-                return Err("query cancelled".into());
-            }
-            _ = &mut deadline => {
-                cancellation.cancel();
-                return Err("query timed out".into());
-            }
-        };
-        let Some(batch) = batch else { break };
-        let batch = batch?;
-        for row_index in 0..batch.num_rows() {
-            let row = batch_row_to_value(&batch, row_index)?;
-            let encoded = serde_json::to_vec(&row)?;
-            if !first && !write_export_chunk(writer, b",", budget, cancellation)? {
-                return Ok(());
-            }
-            if !write_export_chunk(writer, &encoded, budget, cancellation)? {
-                return Ok(());
-            }
-            first = false;
-        }
-    }
-    let metadata = portable_metadata(metadata.finish()?);
-    let suffix = serde_json::to_vec(&metadata)?;
-    if !write_export_chunk(writer, b"],\"metadata\":", budget, cancellation)?
-        || !write_export_chunk(writer, &suffix, budget, cancellation)?
-        || !write_export_chunk(writer, b"}\n", budget, cancellation)?
-    {
-        return Ok(());
-    }
-    writer.flush()?;
     Ok(())
 }
 
@@ -1734,32 +637,6 @@ fn parse_sql_parameters(
     Ok(parameters)
 }
 
-fn private_search_session_id(
-    canonical_session_id: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    Ok(installation_scoped_hmac(
-        "aql-index-session-id-v1",
-        canonical_session_id,
-        &installation_salt()?,
-    ))
-}
-
-fn search_hit_json(hit: aql_index::SearchHit) -> serde_json::Value {
-    let mut rendered = serde_json::json!({
-        "document_id": hit.document_id,
-        "source_id": hit.source_id,
-        "session_id": hit.session_id,
-        "message_id": hit.message_id,
-        "document_kind": hit.document_kind,
-        "rank": hit.rank,
-        "access_class": if hit.context.is_some() { "content" } else { "content_derived" },
-    });
-    if let Some(context) = hit.context {
-        rendered["context"] = serde_json::Value::String(context);
-    }
-    rendered
-}
-
 fn integer_text(value: &str) -> bool {
     let digits = value
         .strip_prefix('-')
@@ -1782,15 +659,6 @@ fn source_supports_table(capabilities: &[String], table: &str) -> bool {
 }
 
 fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
-    if matches!(
-        error.downcast_ref::<CliError>(),
-        Some(CliError::ContentIndexRequired)
-    ) {
-        return Some(
-            "run `aql index build -d <database> --policy content --access content --acknowledge-persistent-sensitive-copy`"
-                .to_string(),
-        );
-    }
     if let Some(aql_engine_datafusion::QueryError::AccessDenied(access)) =
         error.downcast_ref::<aql_engine_datafusion::QueryError>()
     {
@@ -1825,12 +693,8 @@ fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
         Some(access_retry_hint("content", "Content"))
     } else if message.contains("requires --access path") {
         Some(access_retry_hint("path", "Path"))
-    } else if message.contains("rebuild") && message.contains("index") {
-        Some("run `aql index build -d <database> --policy metadata`; Content search requires explicit Content indexing".to_string())
     } else if message.contains("sql input") || message.contains("one sql input") {
         Some("pass SQL directly, with `--file query.sql`, or with `--stdin`".to_string())
-    } else if message.contains("profile missing") {
-        Some("run `aql database list` or create it with `aql database add`".to_string())
     } else {
         None
     }
@@ -1909,7 +773,6 @@ fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
     if let Some(cli) = error.downcast_ref::<CliError>() {
         return match cli {
             CliError::InvalidArgument(_) => 2,
-            CliError::ContentIndexRequired => 4,
         };
     }
     if let Some(query) = error.downcast_ref::<aql_engine_datafusion::QueryError>() {
@@ -1939,32 +802,6 @@ fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
             aql_adapter_api::AdapterError::Internal { .. } => 1,
         };
     }
-    if let Some(action) = error.downcast_ref::<aql_actions::ActionError>() {
-        return match action {
-            aql_actions::ActionError::InvalidPlan
-            | aql_actions::ActionError::UnsupportedPlanSchema
-            | aql_actions::ActionError::PlanExpired
-            | aql_actions::ActionError::PlanDigestMismatch
-            | aql_actions::ActionError::ConfirmationMismatch
-            | aql_actions::ActionError::InvalidArguments
-            | aql_actions::ActionError::ArgumentCommitmentMismatch => 2,
-            aql_actions::ActionError::AuditLimitExceeded => 5,
-            aql_actions::ActionError::Unsupported(_)
-            | aql_actions::ActionError::InvalidAudit
-            | aql_actions::ActionError::UnsupportedAuditSchema
-            | aql_actions::ActionError::AuditTampered
-            | aql_actions::ActionError::Commitment
-            | aql_actions::ActionError::StateRootOverlap
-            | aql_actions::ActionError::UnsafeStateRoot
-            | aql_actions::ActionError::MissingState
-            | aql_actions::ActionError::InvalidOwnershipMarker
-            | aql_actions::ActionError::LockHeld
-            | aql_actions::ActionError::StateChanged
-            | aql_actions::ActionError::InvalidStoredPlan
-            | aql_actions::ActionError::Io(_)
-            | aql_actions::ActionError::Platform(_) => 4,
-        };
-    }
     if let Some(config) = error.downcast_ref::<ConfigError>() {
         return match config {
             ConfigError::InvalidProfileName | ConfigError::InvalidSource => 2,
@@ -1984,30 +821,21 @@ fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
         };
     }
     let message = error.to_string();
-    if message.contains("outcome is unknown") {
-        6
-    } else if message == "query cancelled" {
+    if message == "query cancelled" {
         130
     } else if message.contains("timed out") || message.contains("resource budget exceeded") {
         5
     } else if message.contains("unknown database")
         || message.contains("unknown or unavailable database")
-        || (message.contains("index rebuild") && message.contains("required"))
     {
         4
     } else if message.contains("requires --access") {
         3
-    } else if message.contains("unsupported")
-        || message.contains("revision changed")
-        || message.contains("already been consumed")
-        || message.contains("must be isolated")
-    {
+    } else if message.contains("unsupported") {
         4
     } else if message.contains("invalid")
         || message.contains("No database selected")
         || message.contains("at least one explicit source")
-        || message.contains("requires --new-title")
-        || message.contains("requires --confirm")
         || message.contains("requires --acknowledge")
     {
         2
@@ -2020,7 +848,6 @@ fn error_category(error: &(dyn std::error::Error + 'static)) -> &'static str {
     if let Some(cli) = error.downcast_ref::<CliError>() {
         return match cli {
             CliError::InvalidArgument(_) => "invalid_request",
-            CliError::ContentIndexRequired => "index_missing",
         };
     }
     if let Some(query) = error.downcast_ref::<aql_engine_datafusion::QueryError>() {
@@ -2043,33 +870,6 @@ fn error_category(error: &(dyn std::error::Error + 'static)) -> &'static str {
             aql_adapter_api::AdapterError::Internal { .. } => "internal",
         };
     }
-    if let Some(action) = error.downcast_ref::<aql_actions::ActionError>() {
-        return match action {
-            aql_actions::ActionError::Unsupported(_) => "unsupported",
-            aql_actions::ActionError::InvalidPlan
-            | aql_actions::ActionError::UnsupportedPlanSchema
-            | aql_actions::ActionError::PlanExpired
-            | aql_actions::ActionError::PlanDigestMismatch
-            | aql_actions::ActionError::ConfirmationMismatch
-            | aql_actions::ActionError::InvalidArguments
-            | aql_actions::ActionError::ArgumentCommitmentMismatch => "invalid_request",
-            aql_actions::ActionError::AuditLimitExceeded => "resource_limit",
-            aql_actions::ActionError::InvalidAudit
-            | aql_actions::ActionError::UnsupportedAuditSchema
-            | aql_actions::ActionError::AuditTampered
-            | aql_actions::ActionError::Commitment
-            | aql_actions::ActionError::StateRootOverlap
-            | aql_actions::ActionError::UnsafeStateRoot
-            | aql_actions::ActionError::MissingState
-            | aql_actions::ActionError::InvalidOwnershipMarker
-            | aql_actions::ActionError::StateChanged
-            | aql_actions::ActionError::InvalidStoredPlan => "state_integrity",
-            aql_actions::ActionError::LockHeld => "concurrent_writer",
-            aql_actions::ActionError::Io(_) | aql_actions::ActionError::Platform(_) => {
-                "state_unavailable"
-            }
-        };
-    }
     if let Some(config) = error.downcast_ref::<ConfigError>() {
         return match config {
             ConfigError::InvalidProfileName | ConfigError::InvalidSource => "invalid_request",
@@ -2087,9 +887,7 @@ fn error_category(error: &(dyn std::error::Error + 'static)) -> &'static str {
         };
     }
     let message = error.to_string();
-    if message.contains("outcome is unknown") {
-        "unknown_outcome"
-    } else if message == "query cancelled" {
+    if message == "query cancelled" {
         "cancelled"
     } else if message.contains("timed out") {
         "deadline_exceeded"
@@ -2099,22 +897,13 @@ fn error_category(error: &(dyn std::error::Error + 'static)) -> &'static str {
         || message.contains("unknown or unavailable database")
     {
         "not_found"
-    } else if message.contains("index rebuild") && message.contains("required") {
-        "index_missing"
     } else if message.contains("requires --access") {
         "access_denied"
     } else if message.contains("unsupported") {
         "unsupported"
-    } else if message.contains("revision changed") {
-        "revision_conflict"
-    } else if message.contains("already been consumed") {
-        "already_consumed"
-    } else if message.contains("must be isolated") {
-        "isolation_violation"
     } else if message.contains("invalid")
         || message.contains("No database selected")
         || message.contains("at least one explicit source")
-        || message.contains("requires --new-title")
         || message.contains("requires --acknowledge")
     {
         "invalid_request"
@@ -2436,13 +1225,8 @@ fn public_command(source: &clap::Command) -> clap::Command {
 
 fn build_metadata() -> serde_json::Value {
     serde_json::json!({
-        "action_audit_schema": ACTION_AUDIT_SCHEMA_VERSION,
-        "action_plan_schema": ACTION_PLAN_SCHEMA_VERSION,
-        "action_store_schema": ACTION_STORE_SCHEMA_VERSION,
         "canonical_schema": "aql-canonical-v0",
         "config_schema": CONFIG_SCHEMA_VERSION,
-        "index_schema": INDEX_SCHEMA_VERSION,
-        "report_schema": REPORT_SCHEMA_VERSION,
         "package": env!("CARGO_PKG_NAME"),
         "target": format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
         "version": env!("CARGO_PKG_VERSION"),
@@ -2454,7 +1238,7 @@ fn render_version(output: VersionOutput) -> Result<String, Box<dyn std::error::E
     Ok(match output {
         VersionOutput::Json => serde_json::to_string(&metadata)?,
         VersionOutput::Text => format!(
-            "aql {}\ntarget={}\ncanonical_schema={}\nconfig_schema={}\nindex_schema={}\nreport_schema={}\naction_plan_schema={}\naction_audit_schema={}\naction_store_schema={}",
+            "aql {}\ntarget={}\ncanonical_schema={}\nconfig_schema={}",
             metadata["version"]
                 .as_str()
                 .ok_or("missing build version")?,
@@ -2465,21 +1249,6 @@ fn render_version(output: VersionOutput) -> Result<String, Box<dyn std::error::E
             metadata["config_schema"]
                 .as_str()
                 .ok_or("missing config schema")?,
-            metadata["index_schema"]
-                .as_str()
-                .ok_or("missing index schema")?,
-            metadata["report_schema"]
-                .as_str()
-                .ok_or("missing report schema")?,
-            metadata["action_plan_schema"]
-                .as_str()
-                .ok_or("missing Action plan schema")?,
-            metadata["action_audit_schema"]
-                .as_str()
-                .ok_or("missing Action audit schema")?,
-            metadata["action_store_schema"]
-                .as_str()
-                .ok_or("missing Action store schema")?,
         ),
     })
 }

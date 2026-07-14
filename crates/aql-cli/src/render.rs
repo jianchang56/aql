@@ -22,26 +22,8 @@ pub(super) struct CsvRendering {
     pub(super) formula_escaped: bool,
 }
 
-pub(super) fn validate_csv_options(
-    output: Output,
-    formulas: CsvFormulaMode,
-    acknowledge_raw: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if output != Output::Csv && (formulas != CsvFormulaMode::Safe || acknowledge_raw) {
-        return Err("CSV formula options require --output csv".into());
-    }
-    if output == Output::Csv && formulas == CsvFormulaMode::Raw && !acknowledge_raw {
-        return Err("raw CSV formulas require --acknowledge-raw-csv-formulas".into());
-    }
-    if formulas == CsvFormulaMode::Safe && acknowledge_raw {
-        return Err("--acknowledge-raw-csv-formulas requires --csv-formulas raw".into());
-    }
-    Ok(())
-}
-
 pub(super) fn batches_to_csv(
     batches: &[RecordBatch],
-    formulas: CsvFormulaMode,
 ) -> Result<CsvRendering, Box<dyn std::error::Error>> {
     let Some(first) = batches.first() else {
         return Ok(CsvRendering {
@@ -68,13 +50,7 @@ pub(super) fn batches_to_csv(
                 if column_index > 0 {
                     rendered.push(',');
                 }
-                let cell = csv_arrow_cell(
-                    batch,
-                    column_index,
-                    row_index,
-                    formulas,
-                    &mut formula_escaped,
-                )?;
+                let cell = csv_arrow_cell(batch, column_index, row_index, &mut formula_escaped)?;
                 rendered.push_str(&cell);
             }
             rendered.push_str("\r\n");
@@ -90,7 +66,6 @@ fn csv_arrow_cell(
     batch: &RecordBatch,
     column_index: usize,
     row_index: usize,
-    formulas: CsvFormulaMode,
     formula_escaped: &mut bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use datafusion::arrow::array::Array;
@@ -111,7 +86,7 @@ fn csv_arrow_cell(
                     field.name().as_str(),
                     "capabilities" | "content_json" | "arguments"
                 );
-            if formula_sensitive && formulas == CsvFormulaMode::Safe && starts_csv_formula(&value) {
+            if formula_sensitive && starts_csv_formula(&value) {
                 value.insert(0, '\'');
                 *formula_escaped = true;
             }

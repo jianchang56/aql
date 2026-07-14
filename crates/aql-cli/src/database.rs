@@ -1,5 +1,19 @@
 use super::*;
 
+pub(super) fn canonical_or_prospective(path: &std::path::Path) -> io::Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let name = path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "path has no final component")
+            })?;
+            Ok(parent.canonicalize()?.join(name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn profile_to_source_inputs(
     profile: Profile,
 ) -> Result<SourceInputs, Box<dyn std::error::Error>> {
@@ -196,20 +210,6 @@ pub(super) fn resolve_source_inputs(
     profile_to_source_inputs(profile)
 }
 
-pub(super) fn resolve_single_source_root(
-    data_root: Option<PathBuf>,
-    source_specs: Vec<String>,
-    profile_name: Option<String>,
-    database_name: Option<String>,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let inputs = resolve_source_inputs(data_root, source_specs, profile_name, database_name)?;
-    let mut parsed = parse_sources(inputs.data_root, inputs.source_specs)?;
-    if parsed.len() != 1 {
-        return Err("this index operation requires a database with exactly one source".into());
-    }
-    Ok(parsed.remove(0).canonical_root)
-}
-
 pub(super) fn profile_source_inputs(
     name: &str,
 ) -> Result<Option<SourceInputs>, Box<dyn std::error::Error>> {
@@ -323,97 +323,75 @@ pub(super) fn aql_config_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(root)
 }
 
-pub(super) fn execute_profile_command(
-    command: ProfileCommand,
-    noun: &str,
+fn add_configured_database(
+    name: String,
+    source_specs: Vec<String>,
+    acknowledge_persistent_path: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !acknowledge_persistent_path {
+        return Err("database add requires --acknowledge-persistent-path".into());
+    }
+    aql_config::validate_profile_name(&name)?;
     let config_root = aql_config_root()?;
     let state_root = canonical_or_prospective(&aql_state_root()?)?;
-    match command {
-        ProfileCommand::Add {
-            name,
-            source,
-            acknowledge_persistent_path,
-        } => {
-            if !acknowledge_persistent_path {
-                return Err("profile add requires --acknowledge-persistent-path".into());
-            }
-            aql_config::validate_profile_name(&name)?;
-            let parsed = parse_sources(None, source)?;
-            let mut protected = Vec::with_capacity(parsed.len() + 1);
-            protected.push(state_root.clone());
-            protected.extend(parsed.iter().map(|item| item.canonical_root.clone()));
-            let profile = Profile {
-                name: name.clone(),
-                sources: parsed
-                    .into_iter()
-                    .map(|item| ProfileSource {
-                        adapter_id: item.adapter_id,
-                        source_root: item.canonical_root,
-                    })
-                    .collect(),
-            };
-            let store = ConfigStore::create(&config_root, &protected)?;
-            let lock = store.acquire_write_lock()?;
-            store.add(profile, std::slice::from_ref(&state_root), lock)?;
-            println!("{noun}={name}");
-            println!("status=added");
-        }
-        ProfileCommand::List => {
-            let profiles =
-                match ConfigStore::open_existing(&config_root, std::slice::from_ref(&state_root)) {
-                    Ok(store) => store.list()?,
-                    Err(ConfigError::Missing) => Vec::new(),
-                    Err(error) => return Err(error.into()),
-                };
-            println!("{noun}s={}", profiles.len());
-            for profile in profiles {
-                let adapters = profile
-                    .sources
-                    .iter()
-                    .map(|source| source.adapter_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                println!(
-                    "{noun}={} sources={} adapters={adapters}",
-                    profile.name,
-                    profile.sources.len()
-                );
-            }
-        }
-        ProfileCommand::Show { name, access } => {
-            let store =
-                ConfigStore::open_existing(&config_root, std::slice::from_ref(&state_root))?;
-            let profile = store.get_validated(&name, std::slice::from_ref(&state_root))?;
-            let path_access = access_grant(&access).path;
-            println!("{noun}={}", profile.name);
-            println!("sources={}", profile.sources.len());
-            for (index, source) in profile.sources.iter().enumerate() {
-                println!("source.{}.adapter={}", index + 1, source.adapter_id);
-                if path_access {
-                    println!(
-                        "source.{}.root={}",
-                        index + 1,
-                        source.source_root.to_string_lossy()
-                    );
-                } else {
-                    println!("source.{}.root=masked", index + 1);
-                }
-            }
-            if path_access && !io::stdout().is_terminal() {
-                eprintln!("warning=Path access was granted for non-terminal output");
-            }
-        }
-        ProfileCommand::Remove { name } => {
-            aql_config::validate_profile_name(&name)?;
-            let store =
-                ConfigStore::open_existing(&config_root, std::slice::from_ref(&state_root))?;
-            let lock = store.acquire_write_lock()?;
-            store.remove(&name, lock)?;
-            println!("{noun}={name}");
-            println!("status=removed");
+    let parsed = parse_sources(None, source_specs)?;
+    let mut protected = Vec::with_capacity(parsed.len() + 1);
+    protected.push(state_root.clone());
+    protected.extend(parsed.iter().map(|item| item.canonical_root.clone()));
+    let database = Profile {
+        name: name.clone(),
+        sources: parsed
+            .into_iter()
+            .map(|item| ProfileSource {
+                adapter_id: item.adapter_id,
+                source_root: item.canonical_root,
+            })
+            .collect(),
+    };
+    let store = ConfigStore::create(&config_root, &protected)?;
+    let lock = store.acquire_write_lock()?;
+    store.add(database, std::slice::from_ref(&state_root), lock)?;
+    println!("database={name}");
+    println!("status=added");
+    Ok(())
+}
+
+fn show_configured_database(
+    name: String,
+    access: Vec<Access>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state_root = canonical_or_prospective(&aql_state_root()?)?;
+    let store = ConfigStore::open_existing(&aql_config_root()?, std::slice::from_ref(&state_root))?;
+    let database = store.get_validated(&name, std::slice::from_ref(&state_root))?;
+    let path_access = access_grant(&access).path;
+    println!("database={}", database.name);
+    println!("members={}", database.sources.len());
+    for (index, source) in database.sources.iter().enumerate() {
+        println!("member.{}.adapter={}", index + 1, source.adapter_id);
+        if path_access {
+            println!(
+                "member.{}.root={}",
+                index + 1,
+                source.source_root.to_string_lossy()
+            );
+        } else {
+            println!("member.{}.root=masked", index + 1);
         }
     }
+    if path_access && !io::stdout().is_terminal() {
+        eprintln!("warning=Path access was granted for non-terminal output");
+    }
+    Ok(())
+}
+
+fn remove_configured_database(name: String) -> Result<(), Box<dyn std::error::Error>> {
+    aql_config::validate_profile_name(&name)?;
+    let state_root = canonical_or_prospective(&aql_state_root()?)?;
+    let store = ConfigStore::open_existing(&aql_config_root()?, std::slice::from_ref(&state_root))?;
+    let lock = store.acquire_write_lock()?;
+    store.remove(&name, lock)?;
+    println!("database={name}");
+    println!("status=removed");
     Ok(())
 }
 
@@ -433,31 +411,20 @@ pub(super) fn execute_database_command(
         DatabaseCommand::Add {
             name,
             member,
-            agent,
-            path,
             acknowledge_persistent_path,
         } => {
-            let members = if member.is_empty() {
-                if agent.len() != path.len() {
-                    return Err(
-                        "database add requires the same number of --agent and --path values".into(),
-                    );
-                }
-                agent.into_iter().zip(path).collect::<Vec<_>>()
-            } else {
-                member
-                    .into_iter()
-                    .map(|member| {
-                        let (agent, path) = member
-                            .split_once('=')
-                            .ok_or("database member must use AGENT=/absolute/path syntax")?;
-                        if agent.is_empty() || path.is_empty() {
-                            return Err("database member agent and path cannot be empty".into());
-                        }
-                        Ok((agent.to_string(), PathBuf::from(path)))
-                    })
-                    .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
-            };
+            let members = member
+                .into_iter()
+                .map(|member| {
+                    let (agent, path) = member
+                        .split_once('=')
+                        .ok_or("database member must use AGENT=/absolute/path syntax")?;
+                    if agent.is_empty() || path.is_empty() {
+                        return Err("database member agent and path cannot be empty".into());
+                    }
+                    Ok((agent.to_string(), PathBuf::from(path)))
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
             let source = members
                 .into_iter()
                 .map(
@@ -479,18 +446,11 @@ pub(super) fn execute_database_command(
                     },
                 )
                 .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-            execute_profile_command(
-                ProfileCommand::Add {
-                    name,
-                    source,
-                    acknowledge_persistent_path,
-                },
-                "database",
-            )
+            add_configured_database(name, source, acknowledge_persistent_path)
         }
         DatabaseCommand::Show { name, access } => {
             if profile_source_inputs(&name)?.is_some() {
-                return execute_profile_command(ProfileCommand::Show { name, access }, "database");
+                return show_configured_database(name, access);
             }
             let path_access = access_grant(&access).path;
             if name == "all" {
@@ -534,17 +494,7 @@ pub(super) fn execute_database_command(
             }
             Ok(())
         }
-        DatabaseCommand::Remove { name } => {
-            execute_profile_command(ProfileCommand::Remove { name }, "database")
-        }
-    }
-}
-
-pub(super) fn execute_source_command(
-    command: SourcesCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match command {
-        SourcesCommand::Discover => discover_sources(),
+        DatabaseCommand::Remove { name } => remove_configured_database(name),
     }
 }
 
