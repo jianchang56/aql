@@ -436,6 +436,23 @@ fn json_output_preserves_arrow_types_and_json_columns() {
 }
 
 #[test]
+fn structured_renderers_stop_at_the_output_limit() {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec!["synthetic-output"]))],
+    )
+    .expect("synthetic batch");
+    assert!(batches_to_json_limited(std::slice::from_ref(&batch), 8).is_err());
+    assert!(batches_to_jsonl_limited(std::slice::from_ref(&batch), 8).is_err());
+    assert!(batches_to_csv_limited(std::slice::from_ref(&batch), 8).is_err());
+    assert!(batches_to_table_limited(std::slice::from_ref(&batch), 8).is_err());
+}
+
+#[test]
 fn csv_output_preserves_null_empty_literal_and_rfc4180_text() {
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)])),
@@ -786,6 +803,13 @@ fn secure_output_rejects_symlinks_and_cleans_abandoned_temps() {
             .count(),
         0
     );
+
+    let real_parent = root.join("real-parent");
+    fs::create_dir(&real_parent).expect("create real parent");
+    let linked_parent = root.join("linked-parent");
+    symlink(&real_parent, &linked_parent).expect("create intermediate directory symlink");
+    assert!(SecureOutputFile::create(&linked_parent.join("nested.json")).is_err());
+
     fs::remove_dir_all(root).expect("clean synthetic output directory");
 }
 

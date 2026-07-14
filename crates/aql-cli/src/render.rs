@@ -1,20 +1,58 @@
 use super::*;
 
-pub(super) fn batches_to_json(
+pub(super) fn batches_to_json_limited(
     batches: &[RecordBatch],
+    max_bytes: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    Ok(serde_json::to_string(&batches_to_values(batches)?)?)
+    let mut rendered = LimitedString::new(max_bytes);
+    rendered.push_str("[")?;
+    let mut first = true;
+    for batch in batches {
+        for row_index in 0..batch.num_rows() {
+            if !first {
+                rendered.push_str(",")?;
+            }
+            let row = serde_json::to_string(&batch_row_to_value(batch, row_index)?)?;
+            rendered.push_str(&row)?;
+            first = false;
+        }
+    }
+    rendered.push_str("]")?;
+    Ok(rendered.finish())
 }
 
-pub(super) fn batches_to_jsonl(
+pub(super) fn batches_to_table_limited(
     batches: &[RecordBatch],
+    max_bytes: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let rows = batches_to_values(batches)?;
-    Ok(rows
-        .into_iter()
-        .map(|row| serde_json::to_string(&row))
-        .collect::<Result<Vec<_>, _>>()?
-        .join("\n"))
+    let mut rendered = LimitedString::new(max_bytes);
+    let pretty = datafusion::arrow::util::pretty::pretty_format_batches(batches)?;
+    if std::fmt::Write::write_fmt(&mut rendered, format_args!("{pretty}")).is_err() {
+        if rendered.overflowed {
+            return Err("resource budget exceeded: output_bytes".into());
+        }
+        return Err("table rendering failed".into());
+    }
+    Ok(rendered.finish())
+}
+
+pub(super) fn batches_to_jsonl_limited(
+    batches: &[RecordBatch],
+    max_bytes: u64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut rendered = LimitedString::new(max_bytes);
+    let mut first = true;
+    for batch in batches {
+        for row_index in 0..batch.num_rows() {
+            if !first {
+                rendered.push_str("\n")?;
+            }
+            let row = serde_json::to_string(&batch_row_to_value(batch, row_index)?)?;
+            rendered.push_str(&row)?;
+            first = false;
+        }
+    }
+    Ok(rendered.finish())
 }
 
 pub(super) struct CsvRendering {
@@ -22,8 +60,16 @@ pub(super) struct CsvRendering {
     pub(super) formula_escaped: bool,
 }
 
+#[cfg(test)]
 pub(super) fn batches_to_csv(
     batches: &[RecordBatch],
+) -> Result<CsvRendering, Box<dyn std::error::Error>> {
+    batches_to_csv_limited(batches, u64::MAX)
+}
+
+pub(super) fn batches_to_csv_limited(
+    batches: &[RecordBatch],
+    max_bytes: u64,
 ) -> Result<CsvRendering, Box<dyn std::error::Error>> {
     let Some(first) = batches.first() else {
         return Ok(CsvRendering {
@@ -32,14 +78,14 @@ pub(super) fn batches_to_csv(
         });
     };
     let schema = first.schema();
-    let mut rendered = String::new();
+    let mut rendered = LimitedString::new(max_bytes);
     for (index, field) in schema.fields().iter().enumerate() {
         if index > 0 {
-            rendered.push(',');
+            rendered.push_str(",")?;
         }
-        rendered.push_str(&csv_quote(field.name(), false)?);
+        rendered.push_str(&csv_quote(field.name(), false)?)?;
     }
-    rendered.push_str("\r\n");
+    rendered.push_str("\r\n")?;
     let mut formula_escaped = false;
     for batch in batches {
         if batch.schema() != schema {
@@ -48,18 +94,63 @@ pub(super) fn batches_to_csv(
         for row_index in 0..batch.num_rows() {
             for column_index in 0..batch.num_columns() {
                 if column_index > 0 {
-                    rendered.push(',');
+                    rendered.push_str(",")?;
                 }
                 let cell = csv_arrow_cell(batch, column_index, row_index, &mut formula_escaped)?;
-                rendered.push_str(&cell);
+                rendered.push_str(&cell)?;
             }
-            rendered.push_str("\r\n");
+            rendered.push_str("\r\n")?;
         }
     }
     Ok(CsvRendering {
-        rendered,
+        rendered: rendered.finish(),
         formula_escaped,
     })
+}
+
+struct LimitedString {
+    value: String,
+    max_bytes: u64,
+    overflowed: bool,
+}
+
+impl LimitedString {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            value: String::new(),
+            max_bytes,
+            overflowed: false,
+        }
+    }
+
+    fn push_str(&mut self, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let next = (self.value.len() as u64)
+            .checked_add(value.len() as u64)
+            .ok_or("rendered output size overflow")?;
+        if next > self.max_bytes {
+            return Err("resource budget exceeded: output_bytes".into());
+        }
+        self.value.push_str(value);
+        Ok(())
+    }
+
+    fn finish(self) -> String {
+        self.value
+    }
+}
+
+impl std::fmt::Write for LimitedString {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let next = (self.value.len() as u64)
+            .checked_add(value.len() as u64)
+            .ok_or(std::fmt::Error)?;
+        if next > self.max_bytes {
+            self.overflowed = true;
+            return Err(std::fmt::Error);
+        }
+        self.value.push_str(value);
+        Ok(())
+    }
 }
 
 fn csv_arrow_cell(
@@ -132,6 +223,7 @@ fn csv_quote(value: &str, force: bool) -> Result<String, Box<dyn std::error::Err
     Ok(output)
 }
 
+#[cfg(test)]
 pub(super) fn batches_to_values(
     batches: &[RecordBatch],
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {

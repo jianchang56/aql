@@ -21,7 +21,6 @@ use aql_engine_datafusion::{
 use aql_model::AccessClass;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::arrow::util::pretty::pretty_format_batches;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -39,8 +38,11 @@ use cli_args::*;
 use database::*;
 use output::SecureOutputFile;
 #[cfg(test)]
-use render::batches_to_values;
-use render::{batches_to_csv, batches_to_json, batches_to_jsonl};
+use render::{batches_to_csv, batches_to_values};
+use render::{
+    batches_to_csv_limited, batches_to_json_limited, batches_to_jsonl_limited,
+    batches_to_table_limited,
+};
 use shell::*;
 
 #[derive(Debug)]
@@ -244,31 +246,43 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let inputs = resolve_database_inputs(&database)?;
             let installation_salt = installation_salt()?;
             let sources = bind_sources(inputs.source_specs, installation_salt)?;
+            let deadline = Instant::now()
+                .checked_add(Duration::from_secs(30))
+                .ok_or("doctor deadline is invalid")?;
+            let diagnostic_budget = ResourceBudget {
+                max_records: 100,
+                max_bytes_read: 16 * 1024 * 1024,
+                max_output_bytes: 64 * 1024,
+                max_single_value_bytes: 16 * 1024 * 1024,
+                deadline: Some(deadline),
+                ..ResourceBudget::default()
+            };
+            let cancellation = CancellationToken::default();
+            let source_count = u64::try_from(sources.len())?;
+            if source_count == 0 {
+                return Err("probe returned no compatible source".into());
+            }
+            let per_source_limit = (100_u64 / source_count).max(1);
+            let mut report = String::new();
+            use std::fmt::Write as _;
             for bound in sources {
                 let manifest = &bound.manifest;
-                println!("agent={}", manifest.agent_id);
-                println!("format={}", manifest.format_fingerprint);
-                println!("capabilities={}", manifest.capabilities.join(","));
+                writeln!(report, "agent={}", manifest.agent_id)?;
+                writeln!(report, "format={}", manifest.format_fingerprint)?;
+                writeln!(report, "capabilities={}", manifest.capabilities.join(","))?;
                 for warning in &manifest.warnings {
-                    println!("warning={warning}");
+                    writeln!(report, "warning={warning}")?;
                 }
-                let diagnostic_budget = ResourceBudget {
-                    max_records: 100,
-                    max_bytes_read: 16 * 1024 * 1024,
-                    max_output_bytes: 0,
-                    max_single_value_bytes: 16 * 1024 * 1024,
-                    ..ResourceBudget::default()
-                };
                 let diagnostics = bound.adapter.scan(ScanRequest {
                     source: manifest.clone(),
                     table: TableName::Sessions,
                     projection: vec![ColumnName::new("session_id")],
                     predicates: Vec::new(),
-                    limit: Some(100),
+                    limit: Some(per_source_limit),
                     order_hint: Vec::new(),
                     access: AccessGrant::default(),
-                    budget: diagnostic_budget,
-                    cancellation: CancellationToken::default(),
+                    budget: diagnostic_budget.clone(),
+                    cancellation: cancellation.clone(),
                     snapshot: manifest.snapshot.clone(),
                 })?;
                 let mut session_records = 0_u64;
@@ -276,11 +290,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     record?;
                     session_records += 1;
                 }
-                println!("session_records={session_records}");
+                writeln!(report, "session_records={session_records}")?;
                 for warning in diagnostics.diagnostics.snapshot()? {
-                    println!("warning={:?}", warning.kind);
+                    writeln!(report, "warning={:?}", warning.kind)?;
                 }
             }
+            diagnostic_budget.charge_output_bytes(report.len() as u64)?;
+            io::stdout().lock().write_all(report.as_bytes())?;
         }
         Command::Query {
             database,
@@ -380,6 +396,13 @@ async fn execute_query(
         parse_byte_size,
     )?)
     .map_err(|_| invalid_argument("AQL_MAX_MEMORY_BYTES is too large"))?;
+    let (query_budget, deadline) = execution_budget(
+        max_records,
+        max_bytes_read,
+        max_output_bytes,
+        max_single_value_bytes,
+        timeout,
+    )?;
     let parse_started = Instant::now();
     let sql = read_sql_input(sql, file, stdin)?;
     let query_started = Instant::now();
@@ -390,14 +413,8 @@ async fn execute_query(
     };
     let bound_sql = bind_sql_parameters(sql, &parse_sql_parameters(&param)?)?;
     let validated_sql = validate_read_only_sql(&bound_sql)?;
+    ensure_before_deadline(deadline)?;
     diagnostic_timing(diagnostics, "parse", parse_started);
-    let (query_budget, _) = execution_budget(
-        max_records,
-        max_bytes_read,
-        max_output_bytes,
-        max_single_value_bytes,
-        timeout,
-    )?;
     let mut options = QueryOptions {
         access: access_grant(&access),
         budget: query_budget,
@@ -405,56 +422,100 @@ async fn execute_query(
         ..QueryOptions::default()
     };
     let authorize_started = Instant::now();
-    prepare_query(&validated_sql, options.clone()).await?;
+    let authorization_timeout = remaining_timeout(deadline)?;
+    tokio::time::timeout(
+        authorization_timeout,
+        prepare_query(&validated_sql, options.clone()),
+    )
+    .await
+    .map_err(|_| "query timed out")??;
     diagnostic_timing(diagnostics, "authorize", authorize_started);
     let mut secure_output = output_file
         .as_deref()
         .map(SecureOutputFile::create)
         .transpose()?;
+    ensure_before_deadline(deadline)?;
     let inputs = resolve_database_inputs(&database)?;
+    ensure_before_deadline(deadline)?;
     let installation_salt = installation_salt()?;
     options.redaction_salt = installation_salt.clone();
     let cancellation = options.cancellation.clone();
     let budget = options.budget.clone();
-    let prepared = prepare_query(&validated_sql, options).await?;
+    let prepare_timeout = remaining_timeout(deadline)?;
+    let prepared = tokio::time::timeout(prepare_timeout, prepare_query(&validated_sql, options))
+        .await
+        .map_err(|_| "query timed out")??;
     let probe_started = Instant::now();
     let sources = bind_sources(inputs.source_specs, installation_salt)?;
+    ensure_before_deadline(deadline)?;
     diagnostic_timing(diagnostics, "probe", probe_started);
     if sources.is_empty() {
         return Err("probe returned no compatible source".into());
     }
     if explain {
+        if output != Output::Table {
+            return Err("EXPLAIN supports only the default table output".into());
+        }
         let summary = prepared.plan_summary();
-        eprintln!("plan.tables={}", summary.tables.join(","));
-        eprintln!("plan.columns={}", summary.columns.join(","));
-        eprintln!("plan.required_access={}", summary.required_access.join(","));
+        let mut rendered = String::new();
+        use std::fmt::Write as _;
+        writeln!(rendered, "plan.tables={}", summary.tables.join(","))?;
+        writeln!(rendered, "plan.columns={}", summary.columns.join(","))?;
+        writeln!(
+            rendered,
+            "plan.required_access={}",
+            summary.required_access.join(",")
+        )?;
         for reason in &summary.access_reasons {
-            eprintln!("plan.access_reason={reason}");
+            writeln!(rendered, "plan.access_reason={reason}")?;
         }
         for pushdown in &summary.pushdown {
-            eprintln!("plan.pushdown={pushdown}");
+            writeln!(rendered, "plan.pushdown={pushdown}")?;
         }
-        eprintln!("plan.max_records={}", summary.max_records);
-        eprintln!("plan.max_bytes_read={}", summary.max_bytes_read);
-        eprintln!("plan.max_output_bytes={}", summary.max_output_bytes);
-        eprintln!("plan.max_memory_bytes={}", summary.max_memory_bytes);
+        writeln!(rendered, "plan.max_records={}", summary.max_records)?;
+        writeln!(rendered, "plan.max_bytes_read={}", summary.max_bytes_read)?;
+        writeln!(
+            rendered,
+            "plan.max_output_bytes={}",
+            summary.max_output_bytes
+        )?;
+        writeln!(
+            rendered,
+            "plan.max_memory_bytes={}",
+            summary.max_memory_bytes
+        )?;
         for source in &sources {
-            eprintln!("plan.source_id={}", source.manifest.source_id);
-            eprintln!("plan.format={}", source.manifest.format_fingerprint);
+            writeln!(rendered, "plan.source_id={}", source.manifest.source_id)?;
+            writeln!(
+                rendered,
+                "plan.format={}",
+                source.manifest.format_fingerprint
+            )?;
             for table in &summary.tables {
                 let supported = source_supports_table(&source.manifest.capabilities, table);
-                eprintln!(
+                writeln!(
+                    rendered,
                     "plan.source_capability=source:{},table:{table},supported:{}",
                     source.manifest.source_id, supported
-                );
+                )?;
             }
+        }
+        budget.charge_output_bytes(rendered_publication_len(&rendered) as u64)?;
+        if let Some(output) = secure_output.as_mut() {
+            write_rendered(output.writer(), &rendered, &cancellation)?;
+        } else {
+            write_rendered(&mut io::stdout().lock(), &rendered, &cancellation)?;
+        }
+        if let Some(output) = secure_output {
+            output.commit()?;
         }
         return Ok(());
     }
     let execute_started = Instant::now();
     let mut query_task = tokio::spawn(async move { prepared.execute(sources).await });
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
+    let execution_timeout = remaining_timeout(deadline)?;
+    let deadline_sleep = tokio::time::sleep(execution_timeout);
+    tokio::pin!(deadline_sleep);
     let result = tokio::select! {
         result = &mut query_task => result??,
         signal = tokio::signal::ctrl_c() => {
@@ -471,7 +532,7 @@ async fn execute_query(
             }
             return Err("query cancelled".into());
         }
-        _ = &mut deadline => {
+        _ = &mut deadline_sleep => {
             cancellation.cancel();
             if tokio::time::timeout(
                 Duration::from_secs(3),
@@ -514,12 +575,15 @@ async fn execute_query(
     let render_started = Instant::now();
     let batches = result.batches;
     let returned_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+    let render_limit = max_output_bytes
+        .checked_sub(1)
+        .ok_or("max output bytes must be greater than zero")?;
     let (rendered, formula_escaped) = match output {
-        Output::Table => (pretty_format_batches(&batches)?.to_string(), false),
-        Output::Json => (batches_to_json(&batches)?, false),
-        Output::Jsonl => (batches_to_jsonl(&batches)?, false),
+        Output::Table => (batches_to_table_limited(&batches, render_limit)?, false),
+        Output::Json => (batches_to_json_limited(&batches, render_limit)?, false),
+        Output::Jsonl => (batches_to_jsonl_limited(&batches, render_limit)?, false),
         Output::Csv => {
-            let csv = batches_to_csv(&batches)?;
+            let csv = batches_to_csv_limited(&batches, render_limit)?;
             (csv.rendered, csv.formula_escaped)
         }
     };
@@ -582,6 +646,20 @@ fn execution_budget(
         },
         deadline,
     ))
+}
+
+fn remaining_timeout(deadline: Instant) -> Result<Duration, Box<dyn std::error::Error>> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| "query timed out".into())
+}
+
+fn ensure_before_deadline(deadline: Instant) -> Result<(), Box<dyn std::error::Error>> {
+    if Instant::now() >= deadline {
+        Err("query timed out".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_sql_parameters(

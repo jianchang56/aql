@@ -28,13 +28,8 @@ impl SecureOutputFile {
             .filter(|name| !name.is_empty())
             .ok_or("output target must have a file name")?
             .to_os_string();
-        let directory_path = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        let directory = rustix::fs::openat(
-            rustix::fs::CWD,
-            directory_path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
+        let directory_path = output_directory_path(path);
+        let directory = open_output_directory(directory_path)?;
         let directory_stat = rustix::fs::fstat(&directory)?;
         let directory_identity = identity(&directory_stat);
         match rustix::fs::statat(&directory, &target_name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -70,8 +65,10 @@ impl SecureOutputFile {
 
         self.file.flush()?;
         self.file.sync_all()?;
-        let current_directory =
-            rustix::fs::statat(rustix::fs::CWD, &self.directory_path, AtFlags::empty())?;
+        let current_directory = {
+            let directory = open_output_directory(&self.directory_path)?;
+            rustix::fs::fstat(&directory)?
+        };
         if identity(&current_directory) != self.directory_identity {
             return Err("output target directory changed during write".into());
         }
@@ -98,6 +95,57 @@ impl SecureOutputFile {
 }
 
 #[cfg(unix)]
+fn output_directory_path(path: &std::path::Path) -> &std::path::Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
+#[cfg(unix)]
+fn open_output_directory(
+    path: &std::path::Path,
+) -> Result<std::os::fd::OwnedFd, Box<dyn std::error::Error>> {
+    use rustix::fs::{CWD, Mode, OFlags, openat};
+    use std::path::Component;
+
+    let path = normalize_output_directory(path);
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = if path.is_absolute() {
+        openat(CWD, "/", flags, Mode::empty())?
+    } else {
+        openat(CWD, ".", flags, Mode::empty())?
+    };
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                directory = openat(&directory, name, flags, Mode::empty())?;
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err("output path must not contain parent traversal".into());
+            }
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_output_directory(path: &std::path::Path) -> std::path::PathBuf {
+    for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+        let alias = std::path::Path::new(alias);
+        if let Ok(relative) = path.strip_prefix(alias) {
+            return std::path::Path::new(target).join(relative);
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn normalize_output_directory(path: &std::path::Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(unix)]
 impl Drop for SecureOutputFile {
     fn drop(&mut self) {
         if !self.committed {
@@ -115,6 +163,22 @@ fn identity(stat: &rustix::fs::Stat) -> FileIdentity {
     FileIdentity {
         device: stat.st_dev as u64,
         inode: stat.st_ino,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_parent_resolves_to_current_directory() {
+        assert_eq!(
+            output_directory_path(std::path::Path::new("result.json")),
+            std::path::Path::new(".")
+        );
+        let directory = open_output_directory(std::path::Path::new(""))
+            .expect("an empty relative parent resolves to the current directory");
+        let _ = directory;
     }
 }
 
