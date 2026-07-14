@@ -392,6 +392,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             until,
             report,
         } => {
+            if database.is_none() && data_root.is_none() && source.is_empty() && profile.is_none() {
+                return Err(invalid_argument("report requires -d <database>").into());
+            }
             execute_report(ReportExecution {
                 data_root,
                 source,
@@ -1813,6 +1816,7 @@ fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("no database selected")
         || message.contains("at least one explicit source")
+        || message.contains("requires -d <database>")
         || message.contains("unknown database")
         || message.contains("unknown or unavailable database")
     {

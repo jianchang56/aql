@@ -173,7 +173,7 @@ pub(super) enum Command {
         source: Vec<String>,
         #[arg(long, global = true, hide = true, conflicts_with_all = ["data_root", "source", "database"])]
         profile: Option<String>,
-        /// Select the database used by the report.
+        /// Required: select the database used by the report.
         #[arg(
             short = 'd',
             long,

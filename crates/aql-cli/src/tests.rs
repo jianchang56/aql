@@ -346,6 +346,13 @@ fn command_line_and_shell_errors_offer_contextual_recovery() {
     };
     assert!(cli_parse_error_hint(&missing_database).contains("aql database list"));
 
+    let report_database = invalid_argument("report requires -d <database>");
+    assert!(
+        error_hint(&report_database)
+            .expect("report database hint")
+            .contains("aql database list")
+    );
+
     let access = aql_engine_datafusion::QueryError::AccessDenied("content");
     let rendered = shell_query_error(&access);
     assert!(rendered.contains("GRANT CONTENT FOR SESSION;"));
