@@ -11,7 +11,9 @@ use aql_adapter_claude_code::ClaudeCodeAdapter;
 use aql_adapter_codex::CodexAdapter;
 use aql_adapter_kimi_code::KimiCodeAdapter;
 use aql_adapter_opencode::OpenCodeAdapter;
-use aql_config::{CONFIG_SCHEMA_VERSION, ConfigError, ConfigStore, Profile, ProfileSource};
+use aql_config::{
+    CONFIG_SCHEMA_VERSION, ConfigError, ConfigStore, Database as ConfiguredDatabase, DatabaseMember,
+};
 use aql_engine_datafusion::{
     FederatedSource, QUERY_SCHEMAS, QueryDataType, QueryOptions, SqlParameter, bind_sql_parameters,
     prepare_query, validate_read_only_sql,
@@ -239,9 +241,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             io::stdout().lock().write_all(&render_manpage()?)?;
         }
         Command::Doctor { database } => {
-            let inputs = resolve_source_inputs(None, Vec::new(), None, Some(database))?;
+            let inputs = resolve_database_inputs(&database)?;
             let installation_salt = installation_salt()?;
-            let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
+            let sources = bind_sources(inputs.source_specs, installation_salt)?;
             for bound in sources {
                 let manifest = &bound.manifest;
                 println!("agent={}", manifest.agent_id);
@@ -295,10 +297,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             execute_query(
                 QueryExecution {
-                    data_root: None,
-                    source: Vec::new(),
-                    profile: None,
-                    database: Some(database),
+                    database,
                     output,
                     output_file,
                     access,
@@ -334,10 +333,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 struct QueryExecution {
-    data_root: Option<PathBuf>,
-    source: Vec<String>,
-    profile: Option<String>,
-    database: Option<String>,
+    database: String,
     output: Output,
     output_file: Option<PathBuf>,
     access: Vec<Access>,
@@ -355,9 +351,6 @@ async fn execute_query(
     quiet: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let QueryExecution {
-        data_root,
-        source,
-        profile,
         database,
         output,
         output_file,
@@ -409,14 +402,14 @@ async fn execute_query(
         .as_deref()
         .map(SecureOutputFile::create)
         .transpose()?;
-    let inputs = resolve_source_inputs(data_root, source, profile, database)?;
+    let inputs = resolve_database_inputs(&database)?;
     let installation_salt = installation_salt()?;
     options.redaction_salt = installation_salt.clone();
     let cancellation = options.cancellation.clone();
     let budget = options.budget.clone();
     let prepared = prepare_query(&validated_sql, options).await?;
     let probe_started = Instant::now();
-    let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
+    let sources = bind_sources(inputs.source_specs, installation_salt)?;
     diagnostic_timing(diagnostics, "probe", probe_started);
     if sources.is_empty() {
         return Err("probe returned no compatible source".into());
@@ -804,7 +797,7 @@ fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
     }
     if let Some(config) = error.downcast_ref::<ConfigError>() {
         return match config {
-            ConfigError::InvalidProfileName | ConfigError::InvalidSource => 2,
+            ConfigError::InvalidDatabaseName | ConfigError::InvalidMember => 2,
             ConfigError::Missing
             | ConfigError::UnsafeRoot
             | ConfigError::RootOverlap
@@ -812,8 +805,8 @@ fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
             | ConfigError::UnknownFile
             | ConfigError::InvalidConfig
             | ConfigError::UnsupportedSchema
-            | ConfigError::ProfileExists
-            | ConfigError::ProfileMissing
+            | ConfigError::DatabaseExists
+            | ConfigError::DatabaseMissing
             | ConfigError::LockHeld
             | ConfigError::StateChanged
             | ConfigError::Io(_)
@@ -872,9 +865,9 @@ fn error_category(error: &(dyn std::error::Error + 'static)) -> &'static str {
     }
     if let Some(config) = error.downcast_ref::<ConfigError>() {
         return match config {
-            ConfigError::InvalidProfileName | ConfigError::InvalidSource => "invalid_request",
-            ConfigError::ProfileExists => "already_exists",
-            ConfigError::ProfileMissing | ConfigError::Missing => "not_found",
+            ConfigError::InvalidDatabaseName | ConfigError::InvalidMember => "invalid_request",
+            ConfigError::DatabaseExists => "already_exists",
+            ConfigError::DatabaseMissing | ConfigError::Missing => "not_found",
             ConfigError::LockHeld => "concurrent_writer",
             ConfigError::UnsafeRoot
             | ConfigError::RootOverlap

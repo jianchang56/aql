@@ -158,7 +158,6 @@ fn data_commands_accept_one_consistent_database_option() {
     ] {
         assert!(Cli::try_parse_from(arguments).is_err());
     }
-    assert!(resolve_source_inputs(None, Vec::new(), None, None).is_err());
 }
 
 #[test]
@@ -371,32 +370,29 @@ fn schema_and_examples_have_explicit_list_modes() {
 }
 
 #[test]
-fn source_specs_reject_unknown_ambiguous_duplicate_and_overlap_before_probe() {
+fn database_members_reject_unknown_duplicate_and_overlap_before_probe() {
     let root =
         std::env::temp_dir().join(format!("aql-source-parse-{:016x}", rand::random::<u64>()));
     let nested = root.join("nested");
     fs::create_dir_all(&nested).expect("create synthetic source roots");
     let absolute = root.to_string_lossy();
     let nested_absolute = nested.to_string_lossy();
-    assert!(parse_sources(None, vec![format!("unknown={absolute}")]).is_err());
-    assert!(parse_sources(None, vec![format!("claude-code={absolute}")]).is_ok());
-    assert!(parse_sources(None, vec![format!("opencode={absolute}")]).is_ok());
-    assert!(parse_sources(Some(root.clone()), vec![format!("codex={absolute}")]).is_err());
+    assert!(parse_source_specs(vec![format!("unknown={absolute}")]).is_err());
+    assert!(parse_source_specs(vec![format!("claude-code={absolute}")]).is_ok());
+    assert!(parse_source_specs(vec![format!("opencode={absolute}")]).is_ok());
+    assert!(parse_source_specs(vec!["codex=relative".to_string()]).is_err());
     assert!(
-        parse_sources(
-            None,
-            vec![format!("codex={absolute}"), format!("kimi-code={absolute}")]
-        )
+        parse_source_specs(vec![
+            format!("codex={absolute}"),
+            format!("kimi-code={absolute}")
+        ])
         .is_err()
     );
     assert!(
-        parse_sources(
-            None,
-            vec![
-                format!("codex={absolute}"),
-                format!("kimi-code={nested_absolute}")
-            ]
-        )
+        parse_source_specs(vec![
+            format!("codex={absolute}"),
+            format!("kimi-code={nested_absolute}")
+        ])
         .is_err()
     );
     fs::remove_dir_all(root).expect("remove synthetic source roots");

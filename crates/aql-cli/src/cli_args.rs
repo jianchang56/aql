@@ -215,6 +215,5 @@ pub(super) struct ParsedSource {
 }
 
 pub(super) struct SourceInputs {
-    pub(super) data_root: Option<PathBuf>,
     pub(super) source_specs: Vec<String>,
 }

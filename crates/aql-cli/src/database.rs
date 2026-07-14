@@ -14,24 +14,21 @@ pub(super) fn canonical_or_prospective(path: &std::path::Path) -> io::Result<Pat
     }
 }
 
-pub(super) fn profile_to_source_inputs(
-    profile: Profile,
+pub(super) fn configured_database_to_inputs(
+    database: ConfiguredDatabase,
 ) -> Result<SourceInputs, Box<dyn std::error::Error>> {
-    let source_specs = profile
-        .sources
+    let source_specs = database
+        .members
         .into_iter()
         .map(|source| {
             let root = source
-                .source_root
+                .root
                 .to_str()
-                .ok_or("profile source path is invalid")?;
+                .ok_or("database member path is invalid")?;
             Ok(format!("{}={root}", source.adapter_id))
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-    Ok(SourceInputs {
-        data_root: None,
-        source_specs,
-    })
+    Ok(SourceInputs { source_specs })
 }
 
 struct DatabaseCandidate {
@@ -89,11 +86,10 @@ pub(super) fn read_adapter(
 }
 
 pub(super) fn bind_sources(
-    data_root: Option<PathBuf>,
     source_specs: Vec<String>,
     installation_salt: Vec<u8>,
 ) -> Result<Vec<FederatedSource>, Box<dyn std::error::Error>> {
-    let parsed = parse_sources(data_root, source_specs)?;
+    let parsed = parse_source_specs(source_specs)?;
     let mut bound = Vec::new();
     let mut source_ids = std::collections::BTreeSet::new();
     for source in parsed {
@@ -117,47 +113,39 @@ pub(super) fn bind_sources(
     Ok(bound)
 }
 
-pub(super) fn parse_sources(
-    data_root: Option<PathBuf>,
+pub(super) fn parse_source_specs(
     source_specs: Vec<String>,
 ) -> Result<Vec<ParsedSource>, Box<dyn std::error::Error>> {
-    if data_root.is_some() && !source_specs.is_empty() {
-        return Err("--data-root cannot be combined with --source".into());
+    if source_specs.is_empty() {
+        return Err("database must contain at least one member".into());
     }
-    let raw = if let Some(root) = data_root {
-        vec![("codex".to_string(), root, false)]
-    } else {
-        if source_specs.is_empty() {
-            return Err("at least one source is required".into());
+    if source_specs.len() > 16 {
+        return Err("database member count exceeds the supported limit".into());
+    }
+    let mut raw = Vec::with_capacity(source_specs.len());
+    for spec in source_specs {
+        let (adapter_id, root) = spec
+            .split_once('=')
+            .ok_or("database member must use adapter=/absolute/path syntax")?;
+        if !matches!(
+            adapter_id,
+            "claude-code" | "codex" | "kimi-code" | "opencode"
+        ) {
+            return Err("unknown database member adapter".into());
         }
-        if source_specs.len() > 16 {
-            return Err("source count exceeds the supported limit".into());
+        if root.is_empty() {
+            return Err("database member path cannot be empty".into());
         }
-        let mut parsed = Vec::with_capacity(source_specs.len());
-        for spec in source_specs {
-            let (adapter_id, root) = spec
-                .split_once('=')
-                .ok_or("source must use adapter=/absolute/path syntax")?;
-            if !matches!(
-                adapter_id,
-                "claude-code" | "codex" | "kimi-code" | "opencode"
-            ) {
-                return Err("unknown source adapter".into());
-            }
-            if root.is_empty() {
-                return Err("source path cannot be empty".into());
-            }
-            parsed.push((adapter_id.to_string(), PathBuf::from(root), true));
-        }
-        parsed
-    };
+        raw.push((adapter_id.to_string(), PathBuf::from(root)));
+    }
 
     let mut result = Vec::with_capacity(raw.len());
-    for (adapter_id, root, require_absolute) in raw {
-        if require_absolute && !root.is_absolute() {
-            return Err("source path must be absolute".into());
+    for (adapter_id, root) in raw {
+        if !root.is_absolute() {
+            return Err("database member path must be absolute".into());
         }
-        let canonical = fs::canonicalize(&root).map_err(|_| "source path is unavailable")?;
+        let canonical =
+            fs::canonicalize(&root).map_err(|_| "database member path is unavailable")?;
         result.push(ParsedSource {
             adapter_id,
             root,
@@ -170,50 +158,17 @@ pub(super) fn parse_sources(
                 || left.canonical_root.starts_with(&right.canonical_root)
                 || right.canonical_root.starts_with(&left.canonical_root)
             {
-                return Err("duplicate or overlapping source roots".into());
+                return Err("duplicate or overlapping database member roots".into());
             }
         }
     }
     Ok(result)
 }
 
-pub(super) fn resolve_source_inputs(
-    data_root: Option<PathBuf>,
-    source_specs: Vec<String>,
-    profile_name: Option<String>,
-    database_name: Option<String>,
-) -> Result<SourceInputs, Box<dyn std::error::Error>> {
-    if let Some(database) = database_name {
-        if data_root.is_some() || !source_specs.is_empty() || profile_name.is_some() {
-            return Err(
-                "--database cannot be combined with --data-root, --source or --profile".into(),
-            );
-        }
-        return resolve_database_inputs(&database);
-    }
-    if profile_name.is_none() {
-        if data_root.is_none() && source_specs.is_empty() {
-            return Err("at least one explicit source or --profile is required".into());
-        }
-        return Ok(SourceInputs {
-            data_root,
-            source_specs,
-        });
-    }
-    if data_root.is_some() || !source_specs.is_empty() {
-        return Err("--profile cannot be combined with --data-root or --source".into());
-    }
-    let name = profile_name.ok_or("profile selection is invalid")?;
-    let state_root = canonical_or_prospective(&aql_state_root()?)?;
-    let store = ConfigStore::open_existing(&aql_config_root()?, std::slice::from_ref(&state_root))?;
-    let profile = store.get_validated(&name, std::slice::from_ref(&state_root))?;
-    profile_to_source_inputs(profile)
-}
-
-pub(super) fn profile_source_inputs(
+pub(super) fn configured_database_inputs(
     name: &str,
 ) -> Result<Option<SourceInputs>, Box<dyn std::error::Error>> {
-    aql_config::validate_profile_name(name)?;
+    aql_config::validate_database_name(name)?;
     let state_root = canonical_or_prospective(&aql_state_root()?)?;
     let config_root = aql_config_root()?;
     match fs::symlink_metadata(&config_root) {
@@ -226,11 +181,11 @@ pub(super) fn profile_source_inputs(
         Err(ConfigError::Missing) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    if !store.list()?.iter().any(|profile| profile.name == name) {
+    if !store.list()?.iter().any(|database| database.name == name) {
         return Ok(None);
     }
-    let profile = store.get_validated(name, std::slice::from_ref(&state_root))?;
-    Ok(Some(profile_to_source_inputs(profile)?))
+    let database = store.get_validated(name, std::slice::from_ref(&state_root))?;
+    Ok(Some(configured_database_to_inputs(database)?))
 }
 
 fn candidate_is_compatible(
@@ -268,7 +223,7 @@ pub(super) fn resolve_database_inputs(
     {
         return Err("database name must use lowercase ASCII letters, digits, '_' or '-'".into());
     }
-    if let Some(inputs) = profile_source_inputs(name)? {
+    if let Some(inputs) = configured_database_inputs(name)? {
         return Ok(inputs);
     }
     let candidates = database_candidates()?;
@@ -290,17 +245,13 @@ pub(super) fn resolve_database_inputs(
         if source_specs.is_empty() {
             return Err("database 'all' has no compatible local Agent data".into());
         }
-        return Ok(SourceInputs {
-            data_root: None,
-            source_specs,
-        });
+        return Ok(SourceInputs { source_specs });
     }
     let candidate = candidates
         .into_iter()
         .find(|candidate| candidate.name == name)
         .ok_or("unknown database; run SHOW DATABASES")?;
     Ok(SourceInputs {
-        data_root: None,
         source_specs: vec![format!(
             "{}={}",
             candidate.adapter_id,
@@ -331,20 +282,20 @@ fn add_configured_database(
     if !acknowledge_persistent_path {
         return Err("database add requires --acknowledge-persistent-path".into());
     }
-    aql_config::validate_profile_name(&name)?;
+    aql_config::validate_database_name(&name)?;
     let config_root = aql_config_root()?;
     let state_root = canonical_or_prospective(&aql_state_root()?)?;
-    let parsed = parse_sources(None, source_specs)?;
+    let parsed = parse_source_specs(source_specs)?;
     let mut protected = Vec::with_capacity(parsed.len() + 1);
     protected.push(state_root.clone());
     protected.extend(parsed.iter().map(|item| item.canonical_root.clone()));
-    let database = Profile {
+    let database = ConfiguredDatabase {
         name: name.clone(),
-        sources: parsed
+        members: parsed
             .into_iter()
-            .map(|item| ProfileSource {
+            .map(|item| DatabaseMember {
                 adapter_id: item.adapter_id,
-                source_root: item.canonical_root,
+                root: item.canonical_root,
             })
             .collect(),
     };
@@ -365,14 +316,14 @@ fn show_configured_database(
     let database = store.get_validated(&name, std::slice::from_ref(&state_root))?;
     let path_access = access_grant(&access).path;
     println!("database={}", database.name);
-    println!("members={}", database.sources.len());
-    for (index, source) in database.sources.iter().enumerate() {
+    println!("members={}", database.members.len());
+    for (index, source) in database.members.iter().enumerate() {
         println!("member.{}.adapter={}", index + 1, source.adapter_id);
         if path_access {
             println!(
                 "member.{}.root={}",
                 index + 1,
-                source.source_root.to_string_lossy()
+                source.root.to_string_lossy()
             );
         } else {
             println!("member.{}.root=masked", index + 1);
@@ -385,7 +336,7 @@ fn show_configured_database(
 }
 
 fn remove_configured_database(name: String) -> Result<(), Box<dyn std::error::Error>> {
-    aql_config::validate_profile_name(&name)?;
+    aql_config::validate_database_name(&name)?;
     let state_root = canonical_or_prospective(&aql_state_root()?)?;
     let store = ConfigStore::open_existing(&aql_config_root()?, std::slice::from_ref(&state_root))?;
     let lock = store.acquire_write_lock()?;
@@ -449,7 +400,7 @@ pub(super) fn execute_database_command(
             add_configured_database(name, source, acknowledge_persistent_path)
         }
         DatabaseCommand::Show { name, access } => {
-            if profile_source_inputs(&name)?.is_some() {
+            if configured_database_inputs(&name)?.is_some() {
                 return show_configured_database(name, access);
             }
             let path_access = access_grant(&access).path;
@@ -548,7 +499,7 @@ pub(super) fn configured_database_names() -> Result<Vec<String>, Box<dyn std::er
         Ok(store) => Ok(store
             .list()?
             .into_iter()
-            .map(|profile| profile.name)
+            .map(|database| database.name)
             .collect()),
         Err(ConfigError::Missing) => Ok(Vec::new()),
         Err(error) => Err(error.into()),
@@ -577,7 +528,7 @@ pub(super) fn available_database_names() -> Result<Vec<String>, Box<dyn std::err
 }
 
 pub(super) fn database_is_available(name: &str) -> Result<bool, Box<dyn std::error::Error>> {
-    if profile_source_inputs(name)?.is_some() {
+    if configured_database_inputs(name)?.is_some() {
         return Ok(true);
     }
     let candidates = database_candidates()?;

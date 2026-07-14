@@ -1,4 +1,4 @@
-//! Private, versioned storage for named AQL source profiles.
+//! Private, versioned storage for named AQL databases.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -9,15 +9,15 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONFIG_SCHEMA_VERSION: &str = "aql-config-v1";
+pub const CONFIG_SCHEMA_VERSION: &str = "aql-databases-v1";
 pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-pub const MAX_PROFILES: usize = 64;
-pub const MAX_SOURCES_PER_PROFILE: usize = 16;
+pub const MAX_DATABASES: usize = 64;
+pub const MAX_MEMBERS_PER_DATABASE: usize = 16;
 
 const CONFIG_FILE: &str = "config.toml";
-const LOCK_FILE: &str = ".aql-config-v1.lock";
+const LOCK_FILE: &str = ".aql-databases-v1.lock";
 const OWNERSHIP_FILE: &str = "OWNED_BY_AQL";
-const OWNERSHIP_MARKER: &[u8] = b"aql-config-owned-v1\n";
+const OWNERSHIP_MARKER: &[u8] = b"aql-databases-owned-v1\n";
 const TEMP_PREFIX: &str = ".config-building-";
 const TEMP_SUFFIX: &str = ".toml";
 
@@ -37,14 +37,14 @@ pub enum ConfigError {
     InvalidConfig,
     #[error("AQL config schema is unsupported")]
     UnsupportedSchema,
-    #[error("AQL profile name is invalid")]
-    InvalidProfileName,
-    #[error("AQL profile already exists")]
-    ProfileExists,
-    #[error("AQL profile is missing")]
-    ProfileMissing,
-    #[error("AQL profile source is invalid")]
-    InvalidSource,
+    #[error("AQL database name is invalid")]
+    InvalidDatabaseName,
+    #[error("AQL database already exists")]
+    DatabaseExists,
+    #[error("AQL database is missing")]
+    DatabaseMissing,
+    #[error("AQL database member is invalid")]
+    InvalidMember,
     #[error("AQL config writer is already active")]
     LockHeld,
     #[error("AQL config changed during the operation")]
@@ -57,30 +57,30 @@ pub enum ConfigError {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProfileSource {
+pub struct DatabaseMember {
     pub adapter_id: String,
-    pub source_root: PathBuf,
+    pub root: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Profile {
+pub struct Database {
     pub name: String,
-    pub sources: Vec<ProfileSource>,
+    pub members: Vec<DatabaseMember>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     schema_version: String,
-    profiles: Vec<Profile>,
+    databases: Vec<Database>,
 }
 
 impl Default for ConfigFile {
     fn default() -> Self {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION.to_string(),
-            profiles: Vec::new(),
+            databases: Vec::new(),
         }
     }
 }
@@ -153,27 +153,27 @@ impl ConfigStore {
         &self.root
     }
 
-    pub fn list(&self) -> Result<Vec<Profile>, ConfigError> {
-        Ok(self.read_config()?.profiles)
+    pub fn list(&self) -> Result<Vec<Database>, ConfigError> {
+        Ok(self.read_config()?.databases)
     }
 
-    pub fn get(&self, name: &str) -> Result<Profile, ConfigError> {
-        validate_profile_name(name)?;
+    pub fn get(&self, name: &str) -> Result<Database, ConfigError> {
+        validate_database_name(name)?;
         self.read_config()?
-            .profiles
+            .databases
             .into_iter()
-            .find(|profile| profile.name == name)
-            .ok_or(ConfigError::ProfileMissing)
+            .find(|database| database.name == name)
+            .ok_or(ConfigError::DatabaseMissing)
     }
 
     pub fn get_validated(
         &self,
         name: &str,
         protected_roots: &[PathBuf],
-    ) -> Result<Profile, ConfigError> {
-        let profile = self.get(name)?;
-        validate_profile(&profile, &self.root, protected_roots)?;
-        Ok(profile)
+    ) -> Result<Database, ConfigError> {
+        let database = self.get(name)?;
+        validate_database(&database, &self.root, protected_roots)?;
+        Ok(database)
     }
 
     pub fn acquire_write_lock(&self) -> Result<ConfigWriteLock, ConfigError> {
@@ -213,22 +213,26 @@ impl ConfigStore {
 
     pub fn add(
         &self,
-        profile: Profile,
+        database: Database,
         protected_roots: &[PathBuf],
         lock: ConfigWriteLock,
     ) -> Result<(), ConfigError> {
         self.validate_lock(&lock)?;
-        validate_profile(&profile, &self.root, protected_roots)?;
+        validate_database(&database, &self.root, protected_roots)?;
         let mut config = self.read_config_or_default()?;
-        if config.profiles.iter().any(|item| item.name == profile.name) {
-            return Err(ConfigError::ProfileExists);
+        if config
+            .databases
+            .iter()
+            .any(|item| item.name == database.name)
+        {
+            return Err(ConfigError::DatabaseExists);
         }
-        if config.profiles.len() >= MAX_PROFILES {
+        if config.databases.len() >= MAX_DATABASES {
             return Err(ConfigError::InvalidConfig);
         }
-        config.profiles.push(profile);
+        config.databases.push(database);
         config
-            .profiles
+            .databases
             .sort_by(|left, right| left.name.cmp(&right.name));
         self.publish_config(&config)?;
         lock.release()?;
@@ -237,12 +241,12 @@ impl ConfigStore {
 
     pub fn remove(&self, name: &str, lock: ConfigWriteLock) -> Result<(), ConfigError> {
         self.validate_lock(&lock)?;
-        validate_profile_name(name)?;
+        validate_database_name(name)?;
         let mut config = self.read_config()?;
-        let original = config.profiles.len();
-        config.profiles.retain(|profile| profile.name != name);
-        if config.profiles.len() == original {
-            return Err(ConfigError::ProfileMissing);
+        let original = config.databases.len();
+        config.databases.retain(|database| database.name != name);
+        if config.databases.len() == original {
+            return Err(ConfigError::DatabaseMissing);
         }
         self.publish_config(&config)?;
         lock.release()?;
@@ -476,28 +480,28 @@ fn validate_config(config: &ConfigFile) -> Result<(), ConfigError> {
     if config.schema_version != CONFIG_SCHEMA_VERSION {
         return Err(ConfigError::UnsupportedSchema);
     }
-    if config.profiles.len() > MAX_PROFILES {
+    if config.databases.len() > MAX_DATABASES {
         return Err(ConfigError::InvalidConfig);
     }
     let mut names = std::collections::BTreeSet::new();
-    for profile in &config.profiles {
-        if !names.insert(profile.name.as_str()) {
+    for database in &config.databases {
+        if !names.insert(database.name.as_str()) {
             return Err(ConfigError::InvalidConfig);
         }
-        validate_profile_shape(profile)?;
+        validate_database_shape(database)?;
     }
     Ok(())
 }
 
-fn validate_profile(
-    profile: &Profile,
+fn validate_database(
+    database: &Database,
     config_root: &Path,
     protected_roots: &[PathBuf],
 ) -> Result<(), ConfigError> {
-    validate_profile_shape(profile)?;
-    let mut roots: Vec<PathBuf> = Vec::with_capacity(profile.sources.len());
-    for source in &profile.sources {
-        let canonical = canonicalize_no_symlink(&source.source_root)?;
+    validate_database_shape(database)?;
+    let mut roots: Vec<PathBuf> = Vec::with_capacity(database.members.len());
+    for source in &database.members {
+        let canonical = canonicalize_no_symlink(&source.root)?;
         if paths_overlap(&canonical, config_root)
             || protected_roots
                 .iter()
@@ -511,24 +515,24 @@ fn validate_profile(
     Ok(())
 }
 
-fn validate_profile_shape(profile: &Profile) -> Result<(), ConfigError> {
-    validate_profile_name(&profile.name)?;
-    if profile.sources.is_empty() || profile.sources.len() > MAX_SOURCES_PER_PROFILE {
-        return Err(ConfigError::InvalidSource);
+fn validate_database_shape(database: &Database) -> Result<(), ConfigError> {
+    validate_database_name(&database.name)?;
+    if database.members.is_empty() || database.members.len() > MAX_MEMBERS_PER_DATABASE {
+        return Err(ConfigError::InvalidMember);
     }
-    for source in &profile.sources {
+    for source in &database.members {
         if !matches!(
             source.adapter_id.as_str(),
             "claude-code" | "codex" | "kimi-code" | "opencode"
-        ) || !source.source_root.is_absolute()
+        ) || !source.root.is_absolute()
         {
-            return Err(ConfigError::InvalidSource);
+            return Err(ConfigError::InvalidMember);
         }
     }
     Ok(())
 }
 
-pub fn validate_profile_name(name: &str) -> Result<(), ConfigError> {
+pub fn validate_database_name(name: &str) -> Result<(), ConfigError> {
     let bytes = name.as_bytes();
     if bytes.is_empty()
         || bytes.len() > 64
@@ -537,7 +541,7 @@ pub fn validate_profile_name(name: &str) -> Result<(), ConfigError> {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
         })
     {
-        return Err(ConfigError::InvalidProfileName);
+        return Err(ConfigError::InvalidDatabaseName);
     }
     Ok(())
 }
@@ -750,56 +754,56 @@ mod tests {
         source
     }
 
-    fn profile(source_root: PathBuf) -> Profile {
-        Profile {
+    fn database(root: PathBuf) -> Database {
+        Database {
             name: "daily".to_string(),
-            sources: vec![ProfileSource {
+            members: vec![DatabaseMember {
                 adapter_id: "codex".to_string(),
-                source_root,
+                root,
             }],
         }
     }
 
     #[test]
-    fn profile_name_and_shape_are_exact() {
+    fn database_name_and_shape_are_exact() {
         for valid in ["a", "daily", "a-1_b"] {
-            assert!(validate_profile_name(valid).is_ok());
+            assert!(validate_database_name(valid).is_ok());
         }
         for invalid in ["", "A", "1a", "a/b", "a b", "é"] {
-            assert!(validate_profile_name(invalid).is_err());
+            assert!(validate_database_name(invalid).is_err());
         }
-        let too_many = Profile {
+        let too_many = Database {
             name: "daily".to_string(),
-            sources: (0..=MAX_SOURCES_PER_PROFILE)
-                .map(|index| ProfileSource {
+            members: (0..=MAX_MEMBERS_PER_DATABASE)
+                .map(|index| DatabaseMember {
                     adapter_id: "codex".to_string(),
-                    source_root: PathBuf::from(format!("/synthetic/{index}")),
+                    root: PathBuf::from(format!("/synthetic/{index}")),
                 })
                 .collect(),
         };
         assert!(matches!(
-            validate_profile_shape(&too_many),
-            Err(ConfigError::InvalidSource)
+            validate_database_shape(&too_many),
+            Err(ConfigError::InvalidMember)
         ));
-        let unknown_adapter = Profile {
+        let unknown_adapter = Database {
             name: "daily".to_string(),
-            sources: vec![ProfileSource {
+            members: vec![DatabaseMember {
                 adapter_id: "unknown".to_string(),
-                source_root: PathBuf::from("/synthetic"),
+                root: PathBuf::from("/synthetic"),
             }],
         };
         assert!(matches!(
-            validate_profile_shape(&unknown_adapter),
-            Err(ConfigError::InvalidSource)
+            validate_database_shape(&unknown_adapter),
+            Err(ConfigError::InvalidMember)
         ));
-        let claude = Profile {
+        let claude = Database {
             name: "claude".to_string(),
-            sources: vec![ProfileSource {
+            members: vec![DatabaseMember {
                 adapter_id: "claude-code".to_string(),
-                source_root: PathBuf::from("/synthetic/claude"),
+                root: PathBuf::from("/synthetic/claude"),
             }],
         };
-        assert!(validate_profile_shape(&claude).is_ok());
+        assert!(validate_database_shape(&claude).is_ok());
     }
 
     #[test]
@@ -834,11 +838,11 @@ mod tests {
         let store = ConfigStore::create(&config_root, &[]).expect("config store creates");
         let lock = store.acquire_write_lock().expect("writer locks");
         store
-            .add(profile(source_root), &[], lock)
-            .expect("profile is added");
-        assert_eq!(store.list().expect("profiles list").len(), 1);
+            .add(database(source_root), &[], lock)
+            .expect("database is added");
+        assert_eq!(store.list().expect("databases list").len(), 1);
         let bytes = fs::read(config_root.join(CONFIG_FILE)).expect("config is readable");
-        assert!(bytes.starts_with(b"schema_version = \"aql-config-v1\""));
+        assert!(bytes.starts_with(b"schema_version = \"aql-databases-v1\""));
         assert_eq!(
             fs::metadata(config_root.join(CONFIG_FILE))
                 .expect("config metadata")
@@ -848,8 +852,8 @@ mod tests {
             0o600
         );
         let lock = store.acquire_write_lock().expect("writer locks");
-        store.remove("daily", lock).expect("profile removes");
-        assert!(store.list().expect("profiles list").is_empty());
+        store.remove("daily", lock).expect("database removes");
+        assert!(store.list().expect("databases list").is_empty());
         fs::remove_dir_all(root).expect("test root is removed");
     }
 
@@ -863,21 +867,21 @@ mod tests {
             .expect("config store creates");
         let lock = store.acquire_write_lock().expect("writer locks");
         assert!(matches!(
-            store.add(profile(protected.clone()), &[protected], lock),
+            store.add(database(protected.clone()), &[protected], lock),
             Err(ConfigError::RootOverlap)
         ));
         let lock = store.acquire_write_lock().expect("writer locks");
         store
-            .add(profile(source_root.clone()), &[], lock)
-            .expect("profile adds");
+            .add(database(source_root.clone()), &[], lock)
+            .expect("database adds");
         let lock = store.acquire_write_lock().expect("writer locks");
         assert!(matches!(
-            store.add(profile(source_root), &[], lock),
-            Err(ConfigError::ProfileExists)
+            store.add(database(source_root), &[], lock),
+            Err(ConfigError::DatabaseExists)
         ));
         fs::write(
             config_root.join(CONFIG_FILE),
-            "schema_version = \"future\"\nprofiles = []\n",
+            "schema_version = \"future\"\ndatabases = []\n",
         )
         .expect("future config writes");
         fs::set_permissions(
