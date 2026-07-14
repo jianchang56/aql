@@ -32,6 +32,36 @@ fn named_query_parameters_are_scalar_and_unique() {
 }
 
 #[test]
+fn report_parameters_are_fixed_bounded_scalars() {
+    let parameters = report_parameters(
+        ReportKind::Project,
+        Some("…/demo".to_string()),
+        Some("2026-01-01T00:00:00Z".to_string()),
+        Some("2026-02-01T00:00:00Z".to_string()),
+    )
+    .expect("report parameters validate");
+    for section in report_sections(ReportKind::Project) {
+        let selected = section
+            .parameters
+            .iter()
+            .map(|name| ((*name).to_string(), parameters[*name].clone()))
+            .collect();
+        let bound = bind_sql_parameters(section.sql, &selected).expect("report SQL binds");
+        validate_read_only_sql(&bound).expect("bound report remains read only");
+    }
+    assert!(report_parameters(ReportKind::Summary, Some("demo".to_string()), None, None,).is_err());
+    assert!(
+        report_parameters(
+            ReportKind::Summary,
+            None,
+            Some("2026-02-01T00:00:00Z".to_string()),
+            Some("2026-01-01T00:00:00Z".to_string()),
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn database_cli_is_short_clear_and_mutually_exclusive() {
     let parsed = Cli::try_parse_from([
         "aql",

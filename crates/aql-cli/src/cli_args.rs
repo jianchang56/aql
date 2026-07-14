@@ -186,6 +186,15 @@ pub(super) enum Command {
         access: Vec<Access>,
         #[command(flatten)]
         limits: ExecutionLimits,
+        /// Restrict the project report to one displayed masked project value.
+        #[arg(long)]
+        project: Option<String>,
+        /// Include activity at or after this RFC 3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// Include activity before this RFC 3339 timestamp.
+        #[arg(long)]
+        until: Option<String>,
         #[command(subcommand)]
         report: ReportKind,
     },
@@ -671,7 +680,7 @@ impl From<IndexPolicyArg> for IndexPolicy {
     }
 }
 
-#[derive(Clone, Copy, Subcommand)]
+#[derive(Clone, Copy, Eq, PartialEq, Subcommand)]
 pub(super) enum ReportKind {
     /// Render database-wide session, message, tool and usage totals.
     Summary,

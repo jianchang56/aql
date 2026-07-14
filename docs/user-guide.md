@@ -241,7 +241,16 @@ aql export -d work --output-file ./usage.json \
 ```bash
 aql report -d work summary
 aql report -d work --access path project
+aql report -d work \
+  --since 2026-01-01T00:00:00Z \
+  --until 2026-02-01T00:00:00Z \
+  summary
+aql report -d work --access path \
+  --project '…/demo' \
+  project
 ```
+
+`--since` 和 `--until` 接受 RFC 3339 时间；`--project` 只适用于 project report，并匹配报告中显示的 masked project 值。参数绑定到固定、版本化的报告 SQL，不能提供 SQL 片段。
 
 stdout export/report 会在全部来源成功后一次发布，避免部分成功结果。
 

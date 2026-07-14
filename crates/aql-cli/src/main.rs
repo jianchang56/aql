@@ -352,6 +352,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             database,
             access,
             limits,
+            project,
+            since,
+            until,
             report,
         } => {
             execute_report(ReportExecution {
@@ -361,6 +364,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 database,
                 access,
                 limits,
+                project,
+                since,
+                until,
                 report,
             })
             .await?;
@@ -640,6 +646,9 @@ struct ReportExecution {
     database: Option<String>,
     access: Vec<Access>,
     limits: ExecutionLimits,
+    project: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
     report: ReportKind,
 }
 
@@ -651,6 +660,9 @@ async fn execute_report(request: ReportExecution) -> Result<(), Box<dyn std::err
         database,
         access,
         limits,
+        project,
+        since,
+        until,
         report,
     } = request;
     let ExecutionLimits {
@@ -674,10 +686,17 @@ async fn execute_report(request: ReportExecution) -> Result<(), Box<dyn std::err
         max_memory_bytes,
         ..QueryOptions::default()
     };
+    let report_parameters = report_parameters(report, project, since, until)?;
     let sections = report_sections(report);
     let mut validated = Vec::with_capacity(sections.len());
     for section in &sections {
-        let sql = validate_read_only_sql(section.sql)?;
+        let parameters = section
+            .parameters
+            .iter()
+            .map(|name| ((*name).to_string(), report_parameters[*name].clone()))
+            .collect();
+        let bound = bind_sql_parameters(section.sql, &parameters)?;
+        let sql = validate_read_only_sql(&bound)?;
         prepare_query(&sql, options.clone()).await?;
         validated.push(sql);
     }
@@ -1363,6 +1382,47 @@ fn write_index(
 struct ReportSection {
     title: &'static str,
     sql: &'static str,
+    parameters: &'static [&'static str],
+}
+
+fn report_parameters(
+    report: ReportKind,
+    project: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+) -> Result<std::collections::BTreeMap<String, SqlParameter>, Box<dyn std::error::Error>> {
+    if report == ReportKind::Summary && project.is_some() {
+        return Err("--project is only valid for the project report".into());
+    }
+    if project.as_ref().is_some_and(|value| {
+        value.is_empty() || value.len() > 4_096 || value.chars().any(char::is_control)
+    }) {
+        return Err("report project filter is invalid".into());
+    }
+    for value in [&since, &until].into_iter().flatten() {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map_err(|_| "report time filters must be RFC 3339 timestamps")?;
+    }
+    if let (Some(since), Some(until)) = (&since, &until)
+        && chrono::DateTime::parse_from_rfc3339(since)?
+            >= chrono::DateTime::parse_from_rfc3339(until)?
+    {
+        return Err("report --since must be earlier than --until".into());
+    }
+    Ok(std::collections::BTreeMap::from([
+        (
+            "project".to_string(),
+            project.map_or(SqlParameter::Null, SqlParameter::Text),
+        ),
+        (
+            "since".to_string(),
+            since.map_or(SqlParameter::Null, SqlParameter::Text),
+        ),
+        (
+            "until".to_string(),
+            until.map_or(SqlParameter::Null, SqlParameter::Text),
+        ),
+    ]))
 }
 
 fn report_sections(report: ReportKind) -> Vec<ReportSection> {
@@ -1370,25 +1430,30 @@ fn report_sections(report: ReportKind) -> Vec<ReportSection> {
         ReportKind::Summary => vec![
             ReportSection {
                 title: "Overview by model",
-                sql: "SELECT agent_id, model, provider, MIN(bucket_start) AS first_activity, MAX(bucket_start) AS last_activity, COUNT(DISTINCT session_id) AS sessions, SUM(message_count) AS messages, SUM(tool_call_count) AS tool_calls, SUM(error_count) AS errors, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(total_tokens) AS total_tokens FROM usage GROUP BY agent_id, model, provider ORDER BY agent_id, model, provider",
+                sql: "SELECT agent_id, model, provider, MIN(bucket_start) AS first_activity, MAX(bucket_start) AS last_activity, COUNT(DISTINCT session_id) AS sessions, SUM(message_count) AS messages, SUM(tool_call_count) AS tool_calls, SUM(error_count) AS errors, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cached_tokens) AS cached_tokens, SUM(total_tokens) AS total_tokens FROM usage WHERE (:since IS NULL OR bucket_start >= CAST(:since AS TIMESTAMP)) AND (:until IS NULL OR bucket_start < CAST(:until AS TIMESTAMP)) GROUP BY agent_id, model, provider ORDER BY agent_id, model, provider",
+                parameters: &["since", "until"],
             },
             ReportSection {
                 title: "Failed tools",
-                sql: "SELECT tool_name, status, COUNT(*) AS failed_calls FROM tool_calls WHERE status IN ('error', 'failed') GROUP BY tool_name, status ORDER BY failed_calls DESC, tool_name",
+                sql: "SELECT tool_name, status, COUNT(*) AS failed_calls FROM tool_calls WHERE status IN ('error', 'failed') AND (:since IS NULL OR started_at >= CAST(:since AS TIMESTAMP)) AND (:until IS NULL OR started_at < CAST(:until AS TIMESTAMP)) GROUP BY tool_name, status ORDER BY failed_calls DESC, tool_name",
+                parameters: &["since", "until"],
             },
             ReportSection {
                 title: "Sources",
-                sql: "SELECT agent_id, provider, COUNT(*) AS sessions, MIN(created_at) AS first_session, MAX(updated_at) AS last_session FROM sessions GROUP BY agent_id, provider ORDER BY agent_id, provider",
+                sql: "SELECT agent_id, provider, COUNT(*) AS sessions, MIN(created_at) AS first_session, MAX(updated_at) AS last_session FROM sessions WHERE (:since IS NULL OR updated_at >= CAST(:since AS TIMESTAMP)) AND (:until IS NULL OR created_at < CAST(:until AS TIMESTAMP)) GROUP BY agent_id, provider ORDER BY agent_id, provider",
+                parameters: &["since", "until"],
             },
         ],
         ReportKind::Project => vec![
             ReportSection {
                 title: "Project activity by model",
-                sql: "SELECT MASK_PATH(s.cwd, 2) AS project, s.model, MIN(u.bucket_start) AS first_activity, MAX(u.bucket_start) AS last_activity, COUNT(DISTINCT s.session_id) AS sessions, SUM(u.message_count) AS messages, SUM(u.tool_call_count) AS tool_calls, SUM(u.error_count) AS errors, SUM(u.total_tokens) AS total_tokens FROM sessions s LEFT JOIN usage u ON s.session_id = u.session_id GROUP BY MASK_PATH(s.cwd, 2), s.model ORDER BY project, s.model",
+                sql: "SELECT MASK_PATH(s.cwd, 2) AS project, s.model, MIN(u.bucket_start) AS first_activity, MAX(u.bucket_start) AS last_activity, COUNT(DISTINCT s.session_id) AS sessions, SUM(u.message_count) AS messages, SUM(u.tool_call_count) AS tool_calls, SUM(u.error_count) AS errors, SUM(u.total_tokens) AS total_tokens FROM sessions s LEFT JOIN usage u ON s.session_id = u.session_id WHERE (:project IS NULL OR MASK_PATH(s.cwd, 2) = :project) AND (:since IS NULL OR u.bucket_start >= CAST(:since AS TIMESTAMP)) AND (:until IS NULL OR u.bucket_start < CAST(:until AS TIMESTAMP)) GROUP BY MASK_PATH(s.cwd, 2), s.model ORDER BY project, s.model",
+                parameters: &["project", "since", "until"],
             },
             ReportSection {
                 title: "Failed tools by project",
-                sql: "SELECT MASK_PATH(s.cwd, 2) AS project, t.tool_name, t.status, COUNT(*) AS failed_calls FROM tool_calls t JOIN sessions s ON t.session_id = s.session_id WHERE t.status IN ('error', 'failed') GROUP BY MASK_PATH(s.cwd, 2), t.tool_name, t.status ORDER BY failed_calls DESC, project, t.tool_name",
+                sql: "SELECT MASK_PATH(s.cwd, 2) AS project, t.tool_name, t.status, COUNT(*) AS failed_calls FROM tool_calls t JOIN sessions s ON t.session_id = s.session_id WHERE t.status IN ('error', 'failed') AND (:project IS NULL OR MASK_PATH(s.cwd, 2) = :project) AND (:since IS NULL OR t.started_at >= CAST(:since AS TIMESTAMP)) AND (:until IS NULL OR t.started_at < CAST(:until AS TIMESTAMP)) GROUP BY MASK_PATH(s.cwd, 2), t.tool_name, t.status ORDER BY failed_calls DESC, project, t.tool_name",
+                parameters: &["project", "since", "until"],
             },
         ],
     }
