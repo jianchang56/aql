@@ -67,12 +67,16 @@ use shell::*;
 #[derive(Debug)]
 enum CliError {
     InvalidArgument(String),
+    ContentIndexRequired,
 }
 
 impl std::fmt::Display for CliError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidArgument(message) => formatter.write_str(message),
+            Self::ContentIndexRequired => {
+                formatter.write_str("Content search index is missing or stale")
+            }
         }
     }
 }
@@ -191,16 +195,18 @@ async fn main() {
         }
         Err(error) => {
             let exit_code = error.exit_code();
+            let hint = cli_parse_error_hint(&error);
             match requested_format {
                 ErrorFormat::Text => {
                     let _ = error.print();
+                    eprintln!("hint={hint}");
                 }
                 ErrorFormat::Json => eprintln!(
                     "{}",
                     serde_json::json!({
                         "category": "invalid_request",
                         "message": "invalid command-line arguments",
-                        "hint": "run `aql --help` or `aql <command> --help`",
+                        "hint": hint,
                         "exit_code": exit_code,
                     })
                 ),
@@ -212,6 +218,16 @@ async fn main() {
     if let Err(error) = run(cli).await {
         render_error(error.as_ref(), error_format);
         std::process::exit(error_exit_code(error.as_ref()));
+    }
+}
+
+fn cli_parse_error_hint(error: &clap::Error) -> &'static str {
+    if error.kind() == clap::error::ErrorKind::MissingRequiredArgument
+        && error.to_string().contains("--database <DATABASE>")
+    {
+        "run `aql database list`, then retry with `-d <database>`"
+    } else {
+        "run `aql --help` or `aql <command> --help`"
     }
 }
 
@@ -430,7 +446,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 stores.push((store, generations));
             }
             if generation_count == 0 {
-                return Err(aql_index::IndexError::RebuildRequired.into());
+                return Err(CliError::ContentIndexRequired.into());
             }
             if generation_count > 64 {
                 return Err("search source count exceeds the supported limit".into());
@@ -1763,6 +1779,15 @@ fn source_supports_table(capabilities: &[String], table: &str) -> bool {
 }
 
 fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+    if matches!(
+        error.downcast_ref::<CliError>(),
+        Some(CliError::ContentIndexRequired)
+    ) {
+        return Some(
+            "run `aql index build -d <database> --policy content --access content --acknowledge-persistent-sensitive-copy`"
+                .to_string(),
+        );
+    }
     if let Some(aql_engine_datafusion::QueryError::AccessDenied(access)) =
         error.downcast_ref::<aql_engine_datafusion::QueryError>()
     {
@@ -1877,8 +1902,11 @@ fn render_error(error: &(dyn std::error::Error + 'static), format: ErrorFormat) 
 }
 
 fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
-    if error.downcast_ref::<CliError>().is_some() {
-        return 2;
+    if let Some(cli) = error.downcast_ref::<CliError>() {
+        return match cli {
+            CliError::InvalidArgument(_) => 2,
+            CliError::ContentIndexRequired => 4,
+        };
     }
     if let Some(query) = error.downcast_ref::<aql_engine_datafusion::QueryError>() {
         return match query {
@@ -1985,8 +2013,11 @@ fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
 }
 
 fn error_category(error: &(dyn std::error::Error + 'static)) -> &'static str {
-    if error.downcast_ref::<CliError>().is_some() {
-        return "invalid_request";
+    if let Some(cli) = error.downcast_ref::<CliError>() {
+        return match cli {
+            CliError::InvalidArgument(_) => "invalid_request",
+            CliError::ContentIndexRequired => "index_missing",
+        };
     }
     if let Some(query) = error.downcast_ref::<aql_engine_datafusion::QueryError>() {
         return match query {

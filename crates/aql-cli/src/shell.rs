@@ -535,7 +535,7 @@ pub(super) async fn run_shell(
                         }),
                     };
                     if let Err(error) = Box::pin(run(query)).await {
-                        eprintln!("ERROR: {error}");
+                        eprintln!("{}", shell_query_error(error.as_ref()));
                     }
                 }
                 _ => {
@@ -546,6 +546,24 @@ pub(super) async fn run_shell(
             }
         }
     }
+}
+
+pub(super) fn shell_query_error(error: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(aql_engine_datafusion::QueryError::AccessDenied(access)) =
+        error.downcast_ref::<aql_engine_datafusion::QueryError>()
+    {
+        let grant = match *access {
+            "content" => "CONTENT",
+            "path" => "PATH",
+            "tool-input" => "TOOL INPUT",
+            "tool-output" => "TOOL OUTPUT",
+            _ => return format!("ERROR: {error}"),
+        };
+        return format!(
+            "ERROR: Query requires {access} access. Run GRANT {grant} FOR SESSION; only if it is genuinely needed."
+        );
+    }
+    format!("ERROR: {error}")
 }
 
 pub(super) fn shell_prompt(selected_database: Option<&str>, access: &[Access]) -> String {

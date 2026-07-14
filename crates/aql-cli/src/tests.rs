@@ -290,8 +290,30 @@ fn errors_have_stable_hints_for_database_and_index_workflows() {
     let index = io::Error::other("index rebuild required");
     assert_eq!(error_category(&index), "index_missing");
     assert!(error_hint(&index).is_some());
+    let content_index = CliError::ContentIndexRequired;
+    assert_eq!(error_category(&content_index), "index_missing");
+    assert_eq!(error_exit_code(&content_index), 4);
+    assert!(
+        error_hint(&content_index)
+            .expect("Content index hint")
+            .contains("--policy content")
+    );
     assert_eq!(shell_quote("SELECT 1"), "'SELECT 1'");
     assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
+}
+
+#[test]
+fn command_line_and_shell_errors_offer_contextual_recovery() {
+    let missing_database = match Cli::try_parse_from(["aql", "query", "SELECT 1"]) {
+        Ok(_) => panic!("database is required"),
+        Err(error) => error,
+    };
+    assert!(cli_parse_error_hint(&missing_database).contains("aql database list"));
+
+    let access = aql_engine_datafusion::QueryError::AccessDenied("content");
+    let rendered = shell_query_error(&access);
+    assert!(rendered.contains("GRANT CONTENT FOR SESSION;"));
+    assert!(!rendered.contains("--access"));
 }
 
 #[test]
