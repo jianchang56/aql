@@ -166,7 +166,7 @@ aql query -d codex --diagnostics \
   'SELECT session_id FROM sessions LIMIT 10'
 ```
 
-`EXPLAIN` 输出授权后的表、列、访问需求、pushdown、预算和来源能力，不执行查询。`--diagnostics` 向 stderr 输出实际发生阶段的耗时、来源 ID、扫描 pushdown、读取量和 warning；不包含 SQL literal、参数值、真实路径或结果。
+`EXPLAIN` 输出授权后的表、列、访问需求、pushdown、预算和来源能力，不执行查询。计划使用默认 table 输出，可以通过 `--output-file` 原子写入；其他 `--output` 格式会被拒绝。`--diagnostics` 向 stderr 输出实际发生阶段的耗时、来源 ID、扫描 pushdown、读取量和 warning；不包含 SQL literal、参数值、真实路径或结果。
 
 ## 资源预算
 

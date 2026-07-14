@@ -207,6 +207,7 @@ fn verify_docs() -> Result<(), Box<dyn std::error::Error>> {
         "--diagnose",
         "--csv-formulas",
     ];
+    let invalid_direct_release_syntax = "target/release/aql-release -- ";
     for path in current_docs.iter().copied() {
         let text = std::fs::read_to_string(path)?;
         if let Some(value) = removed_surface.iter().find(|value| text.contains(**value)) {
@@ -214,7 +215,32 @@ fn verify_docs() -> Result<(), Box<dyn std::error::Error>> {
                 format!("current documentation {path} mentions removed surface {value}").into(),
             );
         }
+        if text.contains(invalid_direct_release_syntax) {
+            return Err(
+                format!("current documentation {path} uses cargo-only release syntax").into(),
+            );
+        }
         verify_markdown_links(path, &text)?;
+    }
+    let installation = std::fs::read_to_string("docs/installation.md")?;
+    for required in [
+        "target/release/aql-release build",
+        "target/release/aql-release verify",
+        "target/release/aql-release install",
+        "target/release/aql-release uninstall",
+        "target/release/aql-release formula",
+        "--homepage",
+        "--aarch64-macos-sha256",
+        "--x86-64-macos-sha256",
+        "--aarch64-linux-sha256",
+        "--x86-64-linux-sha256",
+    ] {
+        if !installation.contains(required) {
+            return Err(format!("installation documentation is missing {required}").into());
+        }
+    }
+    if installation.contains("--dist") {
+        return Err("installation documentation uses unsupported --dist".into());
     }
     let release = std::fs::read_to_string(".github/workflows/release.yml")?;
     for required in [

@@ -39,7 +39,7 @@ cargo xtask verify
 SOURCE_DATE_EPOCH=1 cargo build --locked --release -p aql-cli -p aql-release
 TARGET=aarch64-macos
 
-target/release/aql-release -- build \
+target/release/aql-release build \
   --binary target/release/aql \
   --output-dir ./dist \
   --version 0.1.0 \
@@ -48,7 +48,7 @@ target/release/aql-release -- build \
 SHA256=$(awk '{print $1}' \
   "./dist/aql-0.1.0-$TARGET.tar.gz.sha256")
 
-target/release/aql-release -- verify \
+target/release/aql-release verify \
   --archive "./dist/aql-0.1.0-$TARGET.tar.gz" \
   --expected-sha256 "$SHA256" \
   --version 0.1.0 \
@@ -62,7 +62,7 @@ Release workflow 使用固定 SHA 的 GitHub Actions、locked Cargo 构建、四
 先验证 archive，再安装到新的版本化 prefix。不要覆盖已有 prefix：
 
 ```bash
-target/release/aql-release -- install \
+target/release/aql-release install \
   --archive "./dist/aql-0.1.0-$TARGET.tar.gz" \
   --expected-sha256 "$SHA256" \
   --version 0.1.0 \
@@ -86,7 +86,7 @@ $HOME/.local/aql/0.2.0
 ## 卸载
 
 ```bash
-target/release/aql-release -- uninstall \
+target/release/aql-release uninstall \
   --prefix "$HOME/.local/aql/0.1.0"
 ```
 
@@ -97,10 +97,14 @@ target/release/aql-release -- uninstall \
 ## Homebrew Formula
 
 ```bash
-target/release/aql-release -- formula \
+target/release/aql-release formula \
   --version 0.1.0 \
   --base-url https://github.com/OWNER/REPO/releases/download/v0.1.0 \
-  --dist ./dist \
+  --homepage https://github.com/OWNER/REPO \
+  --aarch64-macos-sha256 "$AARCH64_MACOS_SHA256" \
+  --x86-64-macos-sha256 "$X86_64_MACOS_SHA256" \
+  --aarch64-linux-sha256 "$AARCH64_LINUX_SHA256" \
+  --x86-64-linux-sha256 "$X86_64_LINUX_SHA256" \
   --output ./dist/aql.rb
 ```
 

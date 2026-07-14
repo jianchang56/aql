@@ -184,7 +184,7 @@ aql query -d codex 'EXPLAIN SELECT model FROM sessions'
 aql query -d codex --diagnostics 'SELECT model FROM sessions LIMIT 10'
 ```
 
-`EXPLAIN` 只输出授权后的查询计划；`--diagnostics` 向 stderr 输出去敏的来源、扫描、预算和阶段耗时。
+`EXPLAIN` 只输出授权后的查询计划，并可通过 `--output-file` 原子写入；它只使用默认 table 输出。`--diagnostics` 向 stderr 输出去敏的来源、扫描、预算和阶段耗时。
 
 ## 安全边界
 
