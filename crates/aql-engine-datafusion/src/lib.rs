@@ -1054,6 +1054,8 @@ pub struct PlanSummary {
     pub tables: Vec<String>,
     pub columns: Vec<String>,
     pub required_access: Vec<String>,
+    pub access_reasons: Vec<String>,
+    pub pushdown: Vec<String>,
     pub max_records: u64,
     pub max_bytes_read: u64,
     pub max_output_bytes: u64,
@@ -1263,6 +1265,8 @@ fn summarize_plan(plan: &LogicalPlan, options: &QueryOptions) -> Result<PlanSumm
     let mut tables = BTreeSet::new();
     let mut columns = BTreeSet::new();
     let mut required_access = BTreeSet::new();
+    let mut access_reasons = BTreeSet::new();
+    let mut pushdown = BTreeSet::new();
     plan.apply(|node| {
         if let LogicalPlan::TableScan(scan) = node {
             let table_name = scan.table_name.to_string();
@@ -1277,8 +1281,22 @@ fn summarize_plan(plan: &LogicalPlan, options: &QueryOptions) -> Result<PlanSumm
                 table_name
             };
             tables.insert(table_name.clone());
+            pushdown.insert(format!(
+                "{table_name}:predicates={},limit={}",
+                if scan.filters.is_empty() {
+                    "none"
+                } else {
+                    "conservative"
+                },
+                if scan.fetch.is_some() {
+                    "candidate"
+                } else {
+                    "none"
+                },
+            ));
             if table_name == "artifacts" {
                 required_access.insert("path".to_string());
+                access_reasons.insert("artifacts:<table>:path".to_string());
             }
             if let Some(schema) = QUERY_SCHEMAS
                 .iter()
@@ -1293,6 +1311,11 @@ fn summarize_plan(plan: &LogicalPlan, options: &QueryOptions) -> Result<PlanSumm
                         && column.access != AccessClass::Safe
                     {
                         required_access.insert(required_grant(column.access).to_string());
+                        access_reasons.insert(format!(
+                            "{table_name}.{}:{}",
+                            field.name(),
+                            required_grant(column.access)
+                        ));
                     }
                 }
             }
@@ -1303,6 +1326,8 @@ fn summarize_plan(plan: &LogicalPlan, options: &QueryOptions) -> Result<PlanSumm
         tables: tables.into_iter().collect(),
         columns: columns.into_iter().collect(),
         required_access: required_access.into_iter().collect(),
+        access_reasons: access_reasons.into_iter().collect(),
+        pushdown: pushdown.into_iter().collect(),
         max_records: options.budget.max_records,
         max_bytes_read: options.budget.max_bytes_read,
         max_output_bytes: options.budget.max_output_bytes,

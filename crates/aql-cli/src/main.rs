@@ -798,6 +798,12 @@ async fn execute_query(
         eprintln!("plan.tables={}", summary.tables.join(","));
         eprintln!("plan.columns={}", summary.columns.join(","));
         eprintln!("plan.required_access={}", summary.required_access.join(","));
+        for reason in &summary.access_reasons {
+            eprintln!("plan.access_reason={reason}");
+        }
+        for pushdown in &summary.pushdown {
+            eprintln!("plan.pushdown={pushdown}");
+        }
         eprintln!("plan.max_records={}", summary.max_records);
         eprintln!("plan.max_bytes_read={}", summary.max_bytes_read);
         eprintln!("plan.max_output_bytes={}", summary.max_output_bytes);
@@ -805,6 +811,27 @@ async fn execute_query(
         for source in &sources {
             eprintln!("plan.source_id={}", source.manifest.source_id);
             eprintln!("plan.format={}", source.manifest.format_fingerprint);
+            for table in &summary.tables {
+                let capability = match table.as_str() {
+                    "sessions" => "sessions",
+                    "messages" => "messages",
+                    "tool_calls" => "tool_calls",
+                    "usage" => "usage",
+                    "session_edges" => "session_edges",
+                    "artifacts" => "artifacts",
+                    "agents" => "sessions",
+                    _ => table,
+                };
+                eprintln!(
+                    "plan.source_capability=source:{},table:{table},supported:{}",
+                    source.manifest.source_id,
+                    source
+                        .manifest
+                        .capabilities
+                        .iter()
+                        .any(|candidate| candidate == capability)
+                );
+            }
         }
         return Ok(());
     }

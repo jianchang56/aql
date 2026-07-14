@@ -174,6 +174,8 @@ aql query -d codex --metadata \
   'SELECT session_id FROM sessions LIMIT 10'
 ```
 
+计划输出还会逐项说明敏感字段对应的临时授权、predicate/limit 的候选下推状态，以及每个脱敏 source ID 是否声明目标 canonical table capability。计划不会输出真实 source path。
+
 也可以使用标准只读 `EXPLAIN`，它只生成脱敏计划而不执行查询：
 
 ```bash
