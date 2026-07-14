@@ -181,6 +181,7 @@ aql doctor -d codex
 aql query -d codex 'EXPLAIN SELECT model FROM sessions'
 aql query -d codex --plan 'SELECT model FROM sessions'
 aql query -d codex --metadata 'SELECT model FROM sessions LIMIT 10'
+aql query -d codex --diagnose 'SELECT model FROM sessions LIMIT 10'
 
 # SQL 文件或 stdin
 aql query -d codex --file ./query.sql

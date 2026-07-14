@@ -122,6 +122,9 @@ pub(super) enum Command {
         /// Print source, scan, pushdown and budget metadata to stderr.
         #[arg(long)]
         metadata: bool,
+        /// Print privacy-safe query stage timings to stderr.
+        #[arg(long)]
+        diagnose: bool,
         #[arg(skip)]
         shell_summary: bool,
         #[arg(conflicts_with_all = ["file", "stdin"], required_unless_present_any = ["file", "stdin"])]

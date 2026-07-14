@@ -527,6 +527,7 @@ pub(super) async fn run_shell(
                             },
                             plan: false,
                             metadata: false,
+                            diagnose: false,
                             shell_summary: true,
                             sql: Some(statement),
                             file: None,

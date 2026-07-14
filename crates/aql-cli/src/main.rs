@@ -288,6 +288,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             limits,
             plan,
             metadata,
+            diagnose,
             shell_summary,
             sql,
             file,
@@ -307,6 +308,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     limits,
                     plan,
                     metadata,
+                    diagnose,
                     shell_summary,
                     sql,
                     file,
@@ -723,6 +725,7 @@ struct QueryExecution {
     limits: ExecutionLimits,
     plan: bool,
     metadata: bool,
+    diagnose: bool,
     shell_summary: bool,
     sql: Option<String>,
     file: Option<PathBuf>,
@@ -746,6 +749,7 @@ async fn execute_query(
         limits,
         plan,
         metadata,
+        diagnose,
         shell_summary,
         sql,
         file,
@@ -759,6 +763,7 @@ async fn execute_query(
         max_memory_bytes,
         timeout,
     } = limits;
+    let parse_started = Instant::now();
     validate_csv_options(output, csv_formulas, acknowledge_raw_csv_formulas)?;
     let sql = read_sql_input(sql, file, stdin)?;
     let query_started = Instant::now();
@@ -769,6 +774,7 @@ async fn execute_query(
     };
     let bound_sql = bind_sql_parameters(sql, &parse_sql_parameters(&param)?)?;
     let validated_sql = validate_read_only_sql(&bound_sql)?;
+    diagnostic_timing(diagnose, "parse", parse_started);
     let (query_budget, _) = execution_budget(
         max_records,
         max_bytes_read,
@@ -782,14 +788,18 @@ async fn execute_query(
         max_memory_bytes,
         ..QueryOptions::default()
     };
+    let authorize_started = Instant::now();
     prepare_query(&validated_sql, options.clone()).await?;
+    diagnostic_timing(diagnose, "authorize", authorize_started);
     let inputs = resolve_source_inputs(data_root, source, profile, database)?;
     let installation_salt = installation_salt()?;
     options.redaction_salt = installation_salt.clone();
     let cancellation = options.cancellation.clone();
     let budget = options.budget.clone();
     let prepared = prepare_query(&validated_sql, options).await?;
+    let probe_started = Instant::now();
     let sources = bind_sources(inputs.data_root, inputs.source_specs, installation_salt)?;
+    diagnostic_timing(diagnose, "probe", probe_started);
     if sources.is_empty() {
         return Err("probe returned no compatible source".into());
     }
@@ -835,6 +845,7 @@ async fn execute_query(
         }
         return Ok(());
     }
+    let execute_started = Instant::now();
     let mut query_task = tokio::spawn(async move { prepared.execute(sources).await });
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
@@ -868,6 +879,7 @@ async fn execute_query(
             return Err("query timed out".into());
         }
     };
+    diagnostic_timing(diagnose, "execute", execute_started);
     if !quiet {
         for warning in &result.metadata.warnings {
             eprintln!("warning={warning}");
@@ -893,6 +905,7 @@ async fn execute_query(
             );
         }
     }
+    let render_started = Instant::now();
     let batches = result.batches;
     let returned_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
     let (rendered, formula_escaped) = match output {
@@ -912,6 +925,7 @@ async fn execute_query(
         eprintln!("warning=sensitive access was granted for non-terminal output");
     }
     write_rendered(&mut io::stdout().lock(), &rendered, &cancellation)?;
+    diagnostic_timing(diagnose, "render", render_started);
     if shell_summary && !quiet {
         eprintln!(
             "({returned_rows} rows, {} ms)",
@@ -1601,6 +1615,15 @@ fn integer_text(value: &str) -> bool {
         .or_else(|| value.strip_prefix('+'))
         .unwrap_or(value);
     !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn diagnostic_timing(enabled: bool, stage: &str, started: Instant) {
+    if enabled {
+        eprintln!(
+            "diagnostic.stage={stage},elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
 }
 
 fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
