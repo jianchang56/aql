@@ -686,6 +686,33 @@ fn csv_output_rejects_controls_and_inconsistent_schemas() {
 
 #[test]
 fn generated_release_docs_are_deterministic_and_exclude_internal_arguments() {
+    generated_command().debug_assert();
+    let generated = generated_command();
+    let generated_query = generated
+        .get_subcommands()
+        .find(|command| command.get_name() == "query")
+        .expect("generated query command exists");
+    assert!(
+        generated_query
+            .get_arguments()
+            .all(|argument| argument.get_id() != "shell_summary")
+    );
+    let generated_database_add = generated
+        .get_subcommands()
+        .find(|command| command.get_name() == "database")
+        .and_then(|command| {
+            command
+                .get_subcommands()
+                .find(|command| command.get_name() == "add")
+        })
+        .expect("generated database add command exists");
+    assert!(
+        generated_database_add
+            .get_arguments()
+            .find(|argument| argument.get_id() == "member")
+            .is_some_and(clap::Arg::is_required_set)
+    );
+
     let contains_token = |text: &str, token: &str| {
         text.split(|character: char| {
             !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
