@@ -78,11 +78,11 @@ AQL 拒绝多条 SQL、DML、DDL、COPY、ATTACH、外部文件或 URL、任意 
 SQL 可以来自一个有界 regular file 或 stdin：
 
 ```bash
-aql query -d codex --file ./query.sql
+aql query -d codex --file ./query.aql
 printf '%s\n' 'SELECT COUNT(*) FROM sessions' | aql query -d codex --stdin
 ```
 
-直接参数、`--file` 和 `--stdin` 三者互斥；输入最大 64 KiB。
+直接参数、`--file` 和 `--stdin` 三者互斥；`--file` 只接受一个最大 64 KiB 的 `.aql` 只读脚本。
 
 ## Schema 和示例
 

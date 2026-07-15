@@ -26,7 +26,7 @@ flowchart LR
 agents sessions messages tool_calls usage session_edges artifacts
 ```
 
-用户不会查询 Agent 私有表、JSON key 或文件结构。
+除 Agent 数据表外，AQL 还提供只读元数据表 `aql_tables`、`aql_columns`、`aql_sources` 和 `aql_capabilities`；用户不会查询 Agent 私有表、JSON key 或文件结构。
 
 ## Adapter API
 
@@ -61,7 +61,7 @@ Adapter 只读取固定格式白名单。未知格式或无法证明安全兼容
 
 `aql-engine-datafusion` 在 DataFusion 之前执行固定 firewall：
 
-- 恰好一条 SELECT/CTE 或 EXPLAIN SELECT；
+- 恰好一条 SELECT/CTE 或 EXPLAIN SELECT；`SHOW TABLES` 和 `DESCRIBE/DESC` 在进入同一查询管线前重写为元数据 SELECT；
 - 只允许 canonical tables；
 - 固定函数白名单；
 - AST complexity limits；
@@ -80,7 +80,7 @@ SQL 永远不是 mutation language。
 - 配置数据库由 `aql-config` 的 `aql-databases-v1` 存储；
 - 配置数据库与内置数据库同名时，配置数据库优先。
 
-Shell 的 SHOW/USE/DESCRIBE/GRANT 控制语句由 CLI 处理；SELECT 进入同一 query path。
+Shell 的 SHOW/USE/GRANT 控制语句由 CLI 处理；SHOW TABLES、DESCRIBE/DESC、SELECT 和 EXPLAIN 进入同一 query path。`--file` 只接受单查询 `.aql` 文件。
 
 ## 输出
 

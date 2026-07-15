@@ -164,6 +164,13 @@ fn read_sql_input(
         let Some(std::path::Component::Normal(file_name)) = components.last() else {
             return Err(sql_input_error("SQL file path must name one regular file").into());
         };
+        if std::path::Path::new(file_name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("aql")
+        {
+            return Err(sql_input_error("--file accepts only .aql scripts").into());
+        }
         let directory_flags = rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::DIRECTORY
             | rustix::fs::OFlags::NOFOLLOW

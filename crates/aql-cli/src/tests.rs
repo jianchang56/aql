@@ -218,8 +218,8 @@ fn automation_environment_defaults_exclude_database_and_access() {
 
 #[test]
 fn query_sql_inputs_are_mutually_exclusive_and_explain_is_plan_only() {
-    Cli::try_parse_from(["aql", "query", "-d", "codex", "--file", "query.sql"])
-        .expect("SQL file syntax");
+    Cli::try_parse_from(["aql", "query", "-d", "codex", "--file", "query.aql"])
+        .expect("AQL file syntax");
     Cli::try_parse_from(["aql", "query", "-d", "codex", "--stdin"]).expect("stdin SQL syntax");
     assert!(Cli::try_parse_from(["aql", "query", "-d", "codex", "--stdin", "SELECT 1"]).is_err());
     assert_eq!(explain_sql(" EXPLAIN SELECT 1"), Some("SELECT 1"));
@@ -259,15 +259,18 @@ fn sql_file_input_is_bounded_regular_and_no_follow() {
         .path()
         .canonicalize()
         .expect("canonical temporary directory")
-        .join("query.sql");
+        .join("query.aql");
     fs::write(&query, b"SELECT 1").expect("write query");
     assert_eq!(
         read_sql_input(None, Some(query.clone()), false).expect("read query"),
         "SELECT 1"
     );
-    let link = temporary.path().join("query-link.sql");
+    let link = temporary.path().join("query-link.aql");
     std::os::unix::fs::symlink(&query, &link).expect("query symlink");
     assert!(read_sql_input(None, Some(link), false).is_err());
+    let sql_file = temporary.path().join("query.sql");
+    fs::write(&sql_file, b"SELECT 1").expect("write legacy SQL extension");
+    assert!(read_sql_input(None, Some(sql_file), false).is_err());
     let real_directory = temporary.path().join("real-directory");
     fs::create_dir(&real_directory).expect("create real directory");
     let nested_query = real_directory.join("nested.sql");

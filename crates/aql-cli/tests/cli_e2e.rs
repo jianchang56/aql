@@ -193,6 +193,42 @@ fn query_formats_bare_output_file_and_budgets_are_end_to_end() {
     assert_success(&functions);
     assert!(stdout(&functions).contains("agent"));
 
+    let script = environment
+        .home
+        .parent()
+        .expect("isolated root")
+        .join("query.aql");
+    fs::write(&script, "SELECT session_id FROM sessions LIMIT 1;")
+        .expect("write synthetic AQL script");
+    let scripted = environment.run([
+        "query".into(),
+        "-d".into(),
+        "codex".into(),
+        "--output".into(),
+        "json".into(),
+        "--file".into(),
+        script.as_os_str().to_owned(),
+    ]);
+    assert_success(&scripted);
+    assert!(stdout(&scripted).contains("session-minimal"));
+
+    let legacy = environment
+        .home
+        .parent()
+        .expect("isolated root")
+        .join("query.sql");
+    fs::write(&legacy, "SELECT session_id FROM sessions LIMIT 1;")
+        .expect("write legacy extension script");
+    let rejected_script = environment.run([
+        "query".into(),
+        "-d".into(),
+        "codex".into(),
+        "--file".into(),
+        legacy.as_os_str().to_owned(),
+    ]);
+    assert_eq!(rejected_script.status.code(), Some(2));
+    assert!(rejected_script.stdout.is_empty());
+
     let output_directory = environment.temporary.path().join("bare-output");
     fs::create_dir(&output_directory).expect("create bare output directory");
     let output = environment

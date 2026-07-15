@@ -86,7 +86,7 @@ pub(super) enum Command {
         shell_summary: bool,
         #[arg(conflicts_with_all = ["file", "stdin"], required_unless_present_any = ["file", "stdin"])]
         sql: Option<String>,
-        /// Read one SQL statement from a bounded local regular file.
+        /// Read one read-only query from a bounded local .aql file.
         #[arg(long, conflicts_with_all = ["sql", "stdin"])]
         file: Option<PathBuf>,
         /// Read one SQL statement from stdin.
