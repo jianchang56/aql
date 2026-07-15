@@ -141,6 +141,7 @@ pub(super) fn source_supports_table(capabilities: &[String], table: &str) -> boo
 
 pub(super) fn rewrite_control_query(sql: &str) -> Result<Option<String>, CliError> {
     let trimmed = sql.trim();
+    let statement_start = sql.len().saturating_sub(sql.trim_start().len());
     let statement = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
     let words = statement.split_whitespace().collect::<Vec<_>>();
     if words.len() == 2
@@ -156,21 +157,9 @@ pub(super) fn rewrite_control_query(sql: &str) -> Result<Option<String>, CliErro
     {
         let table = words[1].to_ascii_lowercase();
         if !QUERY_SCHEMAS.iter().any(|schema| schema.name == table) {
-            let location = statement.find(words[1]).map(|index| {
-                let prefix = &statement[..index];
-                let line = prefix
-                    .chars()
-                    .filter(|character| *character == '\n')
-                    .count() as u64
-                    + 1;
-                let column = prefix
-                    .rsplit_once('\n')
-                    .map_or(prefix, |(_, line)| line)
-                    .chars()
-                    .count() as u64
-                    + 1;
-                (line, column)
-            });
+            let location = statement
+                .find(words[1])
+                .map(|index| line_column(sql, statement_start + index));
             let error = invalid_argument(format!("unknown table `{table}`")).with_stage("control");
             return Err(match location {
                 Some((line, column)) => error.with_location(line, column),
@@ -183,4 +172,20 @@ pub(super) fn rewrite_control_query(sql: &str) -> Result<Option<String>, CliErro
         )));
     }
     Ok(None)
+}
+
+fn line_column(input: &str, byte_index: usize) -> (u64, u64) {
+    let prefix = &input[..byte_index];
+    let line = prefix
+        .chars()
+        .filter(|character| *character == '\n')
+        .count() as u64
+        + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, line)| line)
+        .chars()
+        .count() as u64
+        + 1;
+    (line, column)
 }

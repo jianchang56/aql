@@ -106,9 +106,10 @@ async fn ordering_warning_is_limited_to_unordered_pagination() {
 }
 
 #[tokio::test]
-async fn metadata_limit_reduces_record_budget_consumption() {
-    let sql = validate_read_only_sql("SELECT table_name FROM aql_tables LIMIT 1")
-        .expect("metadata query is valid");
+async fn metadata_rows_do_not_consume_source_record_budget() {
+    let sql =
+        validate_read_only_sql("SELECT table_name FROM aql_tables ORDER BY table_name LIMIT 1")
+            .expect("metadata query is valid");
     let options = QueryOptions {
         budget: ResourceBudget {
             max_records: 1,
@@ -134,7 +135,7 @@ async fn metadata_limit_reduces_record_budget_consumption() {
         .expect("metadata query prepares")
         .execute(vec![source])
         .await
-        .expect("LIMIT keeps metadata within the record budget");
+        .expect("internal metadata does not consume the source record budget");
     assert_eq!(
         result
             .batches

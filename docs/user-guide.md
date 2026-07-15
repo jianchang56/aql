@@ -77,6 +77,8 @@ AQL 拒绝多条 SQL、DML、DDL、COPY、ATTACH、外部文件或 URL、任意 
 
 只读元数据表包括 `aql_tables`、`aql_columns`、`aql_sources` 和 `aql_capabilities`，分别描述表、列、实际 source 和 source 能力。`SHOW TABLES;` 与 `DESCRIBE sessions;` 会重写到这些表，因此和普通查询共享授权、预算、deadline 与事务发布。
 
+元数据行由 AQL 内部生成，不计入面向 Agent source 扫描的 record 计数；查询仍受 deadline、取消、内存和输出预算约束。
+
 SQL 可以来自一个有界 regular file 或 stdin：
 
 ```bash
@@ -138,7 +140,7 @@ aql query -d codex \
 
 未加前缀时，`null`、`true`、`false` 和整数形状会自动绑定对应类型，其余值为文本。显式 `text:`、`int:`、`float:`、`bool:` 可指定类型。缺失、重复、未使用参数和非命名 placeholder 都会被拒绝。
 
-固定函数白名单包含 `lower`、`upper`、`length`、`substr`、`trim`、`replace`、`coalesce`、`nullif`、`date_trunc`、`date_part`、`round`、`sum`、`count`、`redact` 和 `mask_path`。隐私函数的参数策略固定，不能动态指定。
+固定函数白名单包含 `abs`、`avg`、`char_length`、`coalesce`、`concat`、`count`、`date_part`、`date_trunc`、`length`、`lower`、`max`、`min`、`nullif`、`replace`、`round`、`substr`、`substring`、`sum`、`trim`、`upper`、`redact` 和 `mask_path`。隐私函数的参数策略固定，不能动态指定。
 
 ## 输出
 

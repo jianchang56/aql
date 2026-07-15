@@ -295,14 +295,6 @@ impl AdapterBatchState {
         if let Some(limit) = self.limit {
             rows.truncate(limit);
         }
-        if let Err(error) = self
-            .binding
-            .options
-            .budget
-            .charge_records(rows.len() as u64)
-        {
-            return Some(Err(DataFusionError::External(Box::new(error))));
-        }
         let arrays = self
             .projection
             .iter()

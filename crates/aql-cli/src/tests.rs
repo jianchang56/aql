@@ -256,6 +256,9 @@ fn control_queries_rewrite_to_canonical_metadata_selects() {
     let multiline = rewrite_control_query("DESCRIBE\n  does_not_exist")
         .expect_err("multiline unknown control table is rejected");
     assert_eq!(error_location(&multiline), Some((2, 3)));
+    let leading = rewrite_control_query("\n\n  DESCRIBE does_not_exist")
+        .expect_err("leading whitespace preserves source location");
+    assert_eq!(error_location(&leading), Some((3, 12)));
     assert_eq!(
         rewrite_control_query("SHOW TABLES; SELECT 1").unwrap(),
         None
