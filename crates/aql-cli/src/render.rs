@@ -569,7 +569,8 @@ pub(super) fn arrow_json_value(
     row_index: usize,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     use datafusion::arrow::array::{
-        Array, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray,
+        Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+        TimestampMillisecondArray,
     };
     use datafusion::arrow::datatypes::DataType;
 
@@ -602,6 +603,24 @@ pub(super) fn arrow_json_value(
                 .value(row_index)
                 .into(),
         )),
+        DataType::Int32 => Ok(serde_json::Value::Number(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or("invalid Int32 Arrow array")?
+                .value(row_index)
+                .into(),
+        )),
+        DataType::Float64 => {
+            let value = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or("invalid Float64 Arrow array")?
+                .value(row_index);
+            let number = serde_json::Number::from_f64(value)
+                .ok_or("non-finite Float64 output is unsupported")?;
+            Ok(serde_json::Value::Number(number))
+        }
         DataType::Boolean => Ok(serde_json::Value::Bool(
             array
                 .as_any()
@@ -619,6 +638,6 @@ pub(super) fn arrow_json_value(
                 .ok_or("timestamp is outside the supported range")?;
             Ok(serde_json::Value::String(timestamp.to_rfc3339()))
         }
-        _ => Err("unsupported Arrow output type".into()),
+        data_type => Err(format!("unsupported Arrow output type: {data_type:?}").into()),
     }
 }

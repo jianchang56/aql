@@ -135,7 +135,7 @@ SELECT
   error_count
 FROM _aql_usage_records
 "#;
-const ALLOWED_FUNCTIONS: [&str; 20] = [
+const ALLOWED_FUNCTIONS: [&str; 22] = [
     "abs",
     "avg",
     "char_length",
@@ -154,6 +154,8 @@ const ALLOWED_FUNCTIONS: [&str; 20] = [
     "trim",
     "upper",
     "concat",
+    "replace",
+    "date_part",
     "redact",
     "mask_path",
 ];

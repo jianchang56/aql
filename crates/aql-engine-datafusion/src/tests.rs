@@ -1067,6 +1067,17 @@ fn read_only_firewall_rejects_disallowed_functions_and_complexity() {
 }
 
 #[test]
+fn common_string_and_time_functions_are_allowlisted() {
+    for sql in [
+        "SELECT replace(title, 'old', 'new') FROM sessions",
+        "SELECT date_part('year', created_at) FROM sessions",
+        "SELECT lower(agent_id), coalesce(model, 'unknown') FROM sessions",
+    ] {
+        validate_read_only_sql(sql).expect("common analysis function should be accepted");
+    }
+}
+
+#[test]
 fn static_query_schemas_cover_phase_one_and_phase_three_tables() {
     assert_eq!(
         QUERY_SCHEMAS

@@ -182,6 +182,17 @@ fn query_formats_bare_output_file_and_budgets_are_end_to_end() {
     assert!(stdout(&describe).contains("session_id"));
     assert!(stdout(&describe).contains("VARCHAR"));
 
+    let functions = environment.run([
+        "query",
+        "-d",
+        "codex",
+        "--output",
+        "json",
+        "SELECT replace(agent_id, 'codex', 'agent') AS normalized, date_part('year', created_at) AS year FROM sessions",
+    ]);
+    assert_success(&functions);
+    assert!(stdout(&functions).contains("agent"));
+
     let output_directory = environment.temporary.path().join("bare-output");
     fs::create_dir(&output_directory).expect("create bare output directory");
     let output = environment
