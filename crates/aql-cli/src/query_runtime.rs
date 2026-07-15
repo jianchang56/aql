@@ -136,7 +136,9 @@ pub(super) fn diagnostic_duration(enabled: bool, stage: &str, duration: Duration
 }
 
 pub(super) fn source_supports_table(capabilities: &[String], table: &str) -> bool {
-    table == "agents" || capabilities.iter().any(|candidate| candidate == table)
+    table == "agents"
+        || table.starts_with("aql_")
+        || capabilities.iter().any(|candidate| candidate == table)
 }
 
 pub(super) fn rewrite_control_query(sql: &str) -> Result<Option<String>, CliError> {

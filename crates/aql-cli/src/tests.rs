@@ -825,6 +825,8 @@ fn version_metadata_is_stable_and_host_clean() {
 #[test]
 fn agents_plan_capability_is_manifest_derived() {
     assert!(source_supports_table(&[], "agents"));
+    assert!(source_supports_table(&[], "aql_tables"));
+    assert!(source_supports_table(&[], "aql_columns"));
     assert!(!source_supports_table(&[], "sessions"));
     assert!(source_supports_table(&["sessions".to_string()], "sessions"));
 }
