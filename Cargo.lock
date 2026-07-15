@@ -183,6 +183,7 @@ dependencies = [
  "aql-config",
  "aql-engine-datafusion",
  "aql-model",
+ "aql-test-support",
  "chrono",
  "clap",
  "clap_complete",
