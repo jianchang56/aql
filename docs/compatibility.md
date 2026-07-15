@@ -8,12 +8,13 @@
 - 内置数据库为 `claude`、`codex`、`kimi`、`opencode` 和显式 `all`。
 - 配置数据库 schema 为 `aql-databases-v1`。
 - 查询是单条 read-only GenericDialect/DataFusion SELECT/CTE 或 EXPLAIN SELECT。
+- `--file` 只接受单条只读 `.aql` 查询；`.sql`、多语句和 mutation 不属于兼容入口。
 - 输出为 table、JSON、JSONL、始终公式安全的 CSV，或通过 `--output-file` 原子写文件。
 - 敏感授权只接受 `path`、`content`、`tool-input`、`tool-output`，且逐查询或逐 Shell session 生效。
 
 ## Canonical schema
 
-公开 schema 版本为 `aql-canonical-v0`。`SELECT *` 只展开 Safe 字段；显式敏感列必须在 source read 前完成授权。
+公开 schema 版本为 `aql-canonical-v0`。`SELECT *` 只展开 Safe 字段；显式敏感列必须在 source read 前完成授权。`aql_tables`、`aql_columns`、`aql_sources` 和 `aql_capabilities` 是只读元数据表，不暴露 Agent 私有路径或 payload。
 
 ## Claude Code
 

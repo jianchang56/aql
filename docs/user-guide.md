@@ -75,6 +75,8 @@ AQL 支持受限的只读 SQL：
 
 AQL 拒绝多条 SQL、DML、DDL、COPY、ATTACH、外部文件或 URL、任意 catalog、table function 和 shell 插值。
 
+只读元数据表包括 `aql_tables`、`aql_columns`、`aql_sources` 和 `aql_capabilities`，分别描述表、列、实际 source 和 source 能力。`SHOW TABLES;` 与 `DESCRIBE sessions;` 会重写到这些表，因此和普通查询共享授权、预算、deadline 与事务发布。
+
 SQL 可以来自一个有界 regular file 或 stdin：
 
 ```bash
@@ -83,6 +85,8 @@ printf '%s\n' 'SELECT COUNT(*) FROM sessions' | aql query -d codex --stdin
 ```
 
 直接参数、`--file` 和 `--stdin` 三者互斥；`--file` 只接受一个最大 64 KiB 的 `.aql` 只读脚本。
+
+显式分页使用 `ORDER BY ... LIMIT ... OFFSET ...`。缺少 `ORDER BY` 时会提示结果顺序不稳定，AQL 不会添加隐式排序。
 
 ## Schema 和示例
 
@@ -132,7 +136,9 @@ aql query -d codex \
   'SELECT session_id FROM sessions WHERE project = :project AND message_count >= :minimum AND archived != :active'
 ```
 
-未加前缀时，`null`、`true`、`false` 和整数形状会自动绑定对应类型，其余值为文本。显式 `text:` 可绑定文本 `true` 或 `42`。缺失、重复、未使用参数和非命名 placeholder 都会被拒绝。
+未加前缀时，`null`、`true`、`false` 和整数形状会自动绑定对应类型，其余值为文本。显式 `text:`、`int:`、`float:`、`bool:` 可指定类型。缺失、重复、未使用参数和非命名 placeholder 都会被拒绝。
+
+固定函数白名单包含 `lower`、`upper`、`length`、`substr`、`trim`、`replace`、`coalesce`、`nullif`、`date_trunc`、`date_part`、`round`、`sum` 和 `count`。
 
 ## 输出
 
@@ -202,4 +208,4 @@ aql query -d codex --diagnostics \
 aql --error-format json query -d missing 'SELECT COUNT(*) FROM sessions'
 ```
 
-JSON 包含 `category`、`message`、`hint` 和 `exit_code`。`--quiet` 只抑制非必要 warning 和 Shell 摘要，不隐藏错误或显式诊断。
+JSON 包含 `category`、`stage`、`message`、`hint`、`location` 和 `exit_code`；没有可靠位置时 `location` 为 null。`--quiet` 只抑制非必要 warning 和 Shell 摘要，不隐藏错误或显式诊断。

@@ -109,7 +109,7 @@ CSV 始终转义以 `= + - @ tab CR` 开头的普通文本，避免电子表格�
 
 错误和 `--diagnostics` 可以包含 Adapter、source ID、table、stage、预算计数和 format fingerprint，但不得包含 SQL literal、参数值、授权值、正文、工具 payload、真实路径或 host identity。
 
-JSON 错误固定包含 category、message、hint 和 exit_code。
+JSON 错误固定包含 category、stage、message、hint、location 和 exit_code；location 无可靠来源时为 null。AQL 不从 parser 错误文本猜测位置。
 
 ## 明确不支持
 
