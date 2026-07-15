@@ -1,10 +1,11 @@
 use super::*;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SqlParameter {
     Null,
     Bool(bool),
     Int64(i64),
+    Float64(f64),
     Text(String),
 }
 
@@ -49,6 +50,7 @@ pub fn bind_sql_parameters(
                 SqlParameter::Null => Value::Null,
                 SqlParameter::Bool(value) => Value::Boolean(*value),
                 SqlParameter::Int64(value) => Value::Number(value.to_string(), false),
+                SqlParameter::Float64(value) => Value::Number(value.to_string(), false),
                 SqlParameter::Text(value) => Value::SingleQuotedString(value.clone()),
             };
             self.used.insert(name);

@@ -172,6 +172,45 @@ fn query_formats_bare_output_file_and_budgets_are_end_to_end() {
     assert_success(&source_metadata);
     assert!(stdout(&source_metadata).contains("codex"));
 
+    let page = environment.run([
+        "query",
+        "-d",
+        "codex",
+        "--output",
+        "json",
+        "SELECT table_name FROM aql_tables ORDER BY table_name LIMIT 2 OFFSET 1",
+    ]);
+    assert_success(&page);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&page.stdout)
+            .expect("parse explicit page")
+            .as_array()
+            .expect("page is an array")
+            .len(),
+        2
+    );
+
+    let float_parameter = environment.run([
+        "query",
+        "-d",
+        "codex",
+        "--param",
+        "minimum=float:0.5",
+        "--output",
+        "json",
+        "SELECT session_id FROM sessions WHERE tokens_used > :minimum",
+    ]);
+    assert_success(&float_parameter);
+
+    let unordered = environment.run([
+        "query",
+        "-d",
+        "codex",
+        "SELECT session_id FROM sessions LIMIT 1",
+    ]);
+    assert_success(&unordered);
+    assert!(stderr(&unordered).contains("result ordering is unspecified"));
+
     let show_tables = environment.run(["query", "-d", "codex", "SHOW TABLES;"]);
     assert_success(&show_tables);
     assert!(stdout(&show_tables).contains("aql_columns"));

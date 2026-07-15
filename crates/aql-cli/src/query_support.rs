@@ -81,6 +81,15 @@ pub(super) fn parse_sql_parameters(
                     .parse()
                     .map_err(|_| invalid_argument("query int parameter must fit i64"))?,
             ),
+            value if value.starts_with("float:") => {
+                let number = value[6..]
+                    .parse::<f64>()
+                    .map_err(|_| invalid_argument("query float parameter must fit f64"))?;
+                if !number.is_finite() {
+                    return Err(invalid_argument("query float parameter must be finite"));
+                }
+                SqlParameter::Float64(number)
+            }
             value if value.starts_with("bool:") => match &value[5..] {
                 "true" => SqlParameter::Bool(true),
                 "false" => SqlParameter::Bool(false),

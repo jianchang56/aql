@@ -49,6 +49,23 @@ fn scalar_parameters_bind_only_value_placeholders() {
     assert!(bind_sql_parameters(&"x".repeat(MAX_SQL_BYTES + 1), &BTreeMap::new()).is_err());
 }
 
+#[test]
+fn limit_offset_and_float_parameters_remain_explicit() {
+    let sql = validate_read_only_sql(
+        "SELECT session_id FROM sessions ORDER BY session_id LIMIT 2 OFFSET 1",
+    )
+    .expect("explicit LIMIT/OFFSET is accepted");
+    let mut parameters = BTreeMap::new();
+    parameters.insert("ratio".to_string(), SqlParameter::Float64(1.5));
+    let bound = bind_sql_parameters(
+        "SELECT session_id FROM sessions WHERE tokens_used > :ratio",
+        &parameters,
+    )
+    .expect("float parameter binds as a scalar");
+    assert!(bound.contains("1.5"));
+    let _ = sql;
+}
+
 struct SyntheticSessionAdapter {
     session: SessionRecord,
 }

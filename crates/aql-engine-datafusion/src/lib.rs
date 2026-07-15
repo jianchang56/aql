@@ -1378,6 +1378,13 @@ pub async fn prepare_query(
     validate_plan_access(&plan, options.access)?;
     let plan_summary = summarize_plan(&plan, &options)?;
     let metadata = Arc::new(Mutex::new(QueryMetadata::default()));
+    if !plan_contains_ordering(&plan)? {
+        metadata
+            .lock()
+            .map_err(|_| DataFusionError::Execution("query metadata is unavailable".into()))?
+            .warnings
+            .push("result ordering is unspecified; add ORDER BY for stable pagination".to_string());
+    }
     Ok(PreparedQuery {
         context,
         plan,
@@ -1386,6 +1393,19 @@ pub async fn prepare_query(
         metadata,
         plan_summary,
     })
+}
+
+fn plan_contains_ordering(plan: &LogicalPlan) -> Result<bool> {
+    let mut found = false;
+    plan.apply(|node| {
+        if matches!(node, LogicalPlan::Sort(_)) {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    })?;
+    Ok(found)
 }
 
 pub async fn query_sessions(

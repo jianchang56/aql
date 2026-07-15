@@ -20,6 +20,7 @@ fn named_query_parameters_are_scalar_and_unique() {
         "name=example".to_string(),
         "count=42".to_string(),
         "enabled=true".to_string(),
+        "ratio=float:1.5".to_string(),
         "missing=null".to_string(),
         "reserved=text:true".to_string(),
         "numeric_text=text:42".to_string(),
@@ -31,6 +32,7 @@ fn named_query_parameters_are_scalar_and_unique() {
     );
     assert_eq!(parameters["count"], SqlParameter::Int64(42));
     assert_eq!(parameters["enabled"], SqlParameter::Bool(true));
+    assert_eq!(parameters["ratio"], SqlParameter::Float64(1.5));
     assert_eq!(parameters["missing"], SqlParameter::Null);
     assert_eq!(
         parameters["reserved"],
@@ -46,6 +48,7 @@ fn named_query_parameters_are_scalar_and_unique() {
         .expect_err("invalid explicit bool must fail");
     assert_eq!(error_exit_code(&error), 2);
     assert_eq!(error_category(&error), "invalid_request");
+    assert!(parse_sql_parameters(&["x=float:NaN".to_string()]).is_err());
 
     Cli::try_parse_from([
         "aql",
