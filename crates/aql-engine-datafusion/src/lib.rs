@@ -1422,22 +1422,6 @@ fn plan_contains_ordering(plan: &LogicalPlan) -> Result<bool> {
     Ok(found)
 }
 
-pub async fn query_sessions(
-    adapter: Arc<dyn AgentAdapter>,
-    source: SourceManifest,
-    sql: &ValidatedSql,
-    options: QueryOptions,
-) -> std::result::Result<Vec<RecordBatch>, QueryError> {
-    prepare_query(sql, options)
-        .await?
-        .execute(vec![FederatedSource {
-            adapter,
-            manifest: source,
-        }])
-        .await
-        .map(|result| result.batches)
-}
-
 fn summarize_plan(plan: &LogicalPlan, options: &QueryOptions) -> Result<PlanSummary> {
     let mut tables = BTreeSet::new();
     let mut columns = BTreeSet::new();

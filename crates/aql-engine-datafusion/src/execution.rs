@@ -437,19 +437,19 @@ impl AdapterBatchState {
                     .pushdown
                     .predicates
                     .iter()
-                    .map(|state| format!("{state:?}").to_ascii_lowercase())
+                    .map(|state| pushdown_state_name(*state).to_string())
                     .collect(),
                 limit_pushdown: result
                     .pushdown
                     .limit
-                    .map(|state| format!("{state:?}").to_ascii_lowercase()),
+                    .map(|state| pushdown_state_name(state).to_string()),
                 ordering_pushdown: result
                     .pushdown
                     .ordering
                     .iter()
-                    .map(|state| format!("{state:?}").to_ascii_lowercase())
+                    .map(|state| pushdown_state_name(*state).to_string())
                     .collect(),
-                snapshot_strength: format!("{:?}", result.snapshot.strength).to_ascii_lowercase(),
+                snapshot_strength: snapshot_strength_name(result.snapshot.strength).to_string(),
                 stale: result.snapshot.stale,
             });
             drop(metadata);
@@ -568,6 +568,22 @@ impl AdapterBatchState {
             )
         }));
         Ok(())
+    }
+}
+
+pub(super) fn pushdown_state_name(state: aql_adapter_api::PushdownState) -> &'static str {
+    match state {
+        aql_adapter_api::PushdownState::Exact => "exact",
+        aql_adapter_api::PushdownState::Inexact => "inexact",
+        aql_adapter_api::PushdownState::Unsupported => "unsupported",
+    }
+}
+
+pub(super) fn snapshot_strength_name(strength: aql_adapter_api::SnapshotStrength) -> &'static str {
+    match strength {
+        aql_adapter_api::SnapshotStrength::None => "none",
+        aql_adapter_api::SnapshotStrength::Weak => "weak",
+        aql_adapter_api::SnapshotStrength::Strong => "strong",
     }
 }
 

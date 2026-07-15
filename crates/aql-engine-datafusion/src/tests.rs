@@ -1187,6 +1187,34 @@ fn engine_errors_do_not_render_internal_details() {
 }
 
 #[test]
+fn diagnostic_enum_names_are_stable() {
+    assert_eq!(
+        execution::pushdown_state_name(PushdownState::Exact),
+        "exact"
+    );
+    assert_eq!(
+        execution::pushdown_state_name(PushdownState::Inexact),
+        "inexact"
+    );
+    assert_eq!(
+        execution::pushdown_state_name(PushdownState::Unsupported),
+        "unsupported"
+    );
+    assert_eq!(
+        execution::snapshot_strength_name(SnapshotStrength::None),
+        "none"
+    );
+    assert_eq!(
+        execution::snapshot_strength_name(SnapshotStrength::Weak),
+        "weak"
+    );
+    assert_eq!(
+        execution::snapshot_strength_name(SnapshotStrength::Strong),
+        "strong"
+    );
+}
+
+#[test]
 fn query_schemas_match_the_public_table_order() {
     assert_eq!(
         QUERY_SCHEMAS

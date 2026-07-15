@@ -99,7 +99,7 @@ pub(super) fn metadata_array(rows: &[Vec<MetadataCell>], index: usize) -> Result
         MetadataCell::Text(_) => Ok(Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| match row.get(index) {
-                    Some(MetadataCell::Text(value)) => Some(value.clone()),
+                    Some(MetadataCell::Text(value)) => Some(value.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
