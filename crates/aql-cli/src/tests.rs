@@ -246,6 +246,10 @@ fn control_queries_rewrite_to_canonical_metadata_selects() {
         Some("SELECT column_name, data_type, nullable, access_class FROM aql_columns WHERE table_name = 'sessions' ORDER BY ordinal_position".to_string())
     );
     assert!(rewrite_control_query("DESCRIBE does_not_exist").is_err());
+    let error = rewrite_control_query("DESCRIBE does_not_exist")
+        .expect_err("unknown control table is rejected");
+    assert_eq!(error_stage(&error), "control");
+    assert_eq!(error_location(&error), Some((1, 10)));
     assert_eq!(
         rewrite_control_query("SHOW TABLES; SELECT 1").unwrap(),
         None
@@ -876,6 +880,13 @@ fn stable_error_categories_have_stable_exit_codes() {
     let cancelled = query_cancelled();
     assert_eq!(error_category(&cancelled), "cancelled");
     assert_eq!(error_exit_code(&cancelled), 130);
+    let parameters = aql_engine_datafusion::QueryError::SqlRejected {
+        stage: "parameters",
+        reason: "synthetic",
+    };
+    assert_eq!(error_stage(&parameters), "parameters");
+    assert!(error_hint(&parameters).is_some());
+    assert_eq!(error_location(&parameters), None);
 }
 
 #[test]

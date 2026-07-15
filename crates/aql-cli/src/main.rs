@@ -78,6 +78,8 @@ struct CliError {
     kind: CliErrorKind,
     message: String,
     hint: CliErrorHint,
+    stage: &'static str,
+    location: Option<(u64, u64)>,
 }
 
 impl std::fmt::Display for CliError {
@@ -133,12 +135,24 @@ fn cli_error(kind: CliErrorKind, message: impl Into<String>) -> CliError {
         kind,
         message: message.into(),
         hint: CliErrorHint::None,
+        stage: "input",
+        location: None,
     }
 }
 
 impl CliError {
     fn with_hint(mut self, hint: CliErrorHint) -> Self {
         self.hint = hint;
+        self
+    }
+
+    fn with_stage(mut self, stage: &'static str) -> Self {
+        self.stage = stage;
+        self
+    }
+
+    fn with_location(mut self, line: u64, column: u64) -> Self {
+        self.location = Some((line, column));
         self
     }
 }
@@ -718,6 +732,25 @@ fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
             }
         };
     }
+    if let Some(aql_engine_datafusion::QueryError::SqlRejected { stage, .. }) =
+        error.downcast_ref::<aql_engine_datafusion::QueryError>()
+    {
+        return match *stage {
+            "parse" => Some("check the SQL syntax and pass exactly one query".to_string()),
+            "parameters" => Some(
+                "bind every :name once with --param NAME=VALUE and remove unused parameters"
+                    .to_string(),
+            ),
+            "allowlist" => Some(
+                "use one read-only canonical SELECT, SHOW TABLES, DESCRIBE or EXPLAIN query"
+                    .to_string(),
+            ),
+            "wildcard" => Some(
+                "select explicit canonical columns when wildcard scope is ambiguous".to_string(),
+            ),
+            _ => None,
+        };
+    }
     if let Some(aql_engine_datafusion::QueryError::AccessDenied(access)) =
         error.downcast_ref::<aql_engine_datafusion::QueryError>()
     {
@@ -801,9 +834,15 @@ fn render_error(error: &(dyn std::error::Error + 'static), format: ErrorFormat) 
     let category = error_category(error);
     let exit_code = error_exit_code(error);
     let hint = error_hint(error);
+    let stage = error_stage(error);
+    let location = error_location(error);
     match format {
         ErrorFormat::Text => {
             eprintln!("error_category={category}");
+            eprintln!("error_stage={stage}");
+            if let Some((line, column)) = location {
+                eprintln!("error_location=line:{line},column:{column}");
+            }
             eprintln!("error={error}");
             if let Some(hint) = hint {
                 eprintln!("hint={hint}");
@@ -814,13 +853,47 @@ fn render_error(error: &(dyn std::error::Error + 'static), format: ErrorFormat) 
                 "{}",
                 serde_json::json!({
                     "category": category,
+                    "stage": stage,
                     "message": error.to_string(),
                     "hint": hint,
+                    "location": location.map(|(line, column)| serde_json::json!({
+                        "line": line,
+                        "column": column,
+                    })),
                     "exit_code": exit_code,
                 })
             );
         }
     }
+}
+
+fn error_stage(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    if let Some(cli) = error.downcast_ref::<CliError>() {
+        return cli.stage;
+    }
+    if let Some(query) = error.downcast_ref::<aql_engine_datafusion::QueryError>() {
+        return match query {
+            aql_engine_datafusion::QueryError::SqlRejected { stage, .. } => stage,
+            aql_engine_datafusion::QueryError::AccessDenied(_) => "authorize",
+            aql_engine_datafusion::QueryError::Engine(_) => "execute",
+        };
+    }
+    if error
+        .downcast_ref::<aql_adapter_api::AdapterError>()
+        .is_some()
+    {
+        return "source";
+    }
+    if error.downcast_ref::<ConfigError>().is_some() {
+        return "config";
+    }
+    "internal"
+}
+
+fn error_location(error: &(dyn std::error::Error + 'static)) -> Option<(u64, u64)> {
+    error
+        .downcast_ref::<CliError>()
+        .and_then(|error| error.location)
 }
 
 fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {

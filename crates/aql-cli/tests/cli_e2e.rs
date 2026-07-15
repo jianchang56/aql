@@ -182,6 +182,22 @@ fn query_formats_bare_output_file_and_budgets_are_end_to_end() {
     assert!(stdout(&describe).contains("session_id"));
     assert!(stdout(&describe).contains("VARCHAR"));
 
+    let bad_describe = environment.run([
+        "--error-format",
+        "json",
+        "query",
+        "-d",
+        "codex",
+        "DESCRIBE missing_table",
+    ]);
+    assert_eq!(bad_describe.status.code(), Some(2));
+    let error: serde_json::Value =
+        serde_json::from_slice(&bad_describe.stderr).expect("parse structured SQL error");
+    assert_eq!(error["category"], "invalid_request");
+    assert_eq!(error["stage"], "control");
+    assert_eq!(error["location"]["line"], 1);
+    assert!(error["hint"].is_null());
+
     let functions = environment.run([
         "query",
         "-d",

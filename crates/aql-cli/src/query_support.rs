@@ -147,7 +147,10 @@ pub(super) fn rewrite_control_query(sql: &str) -> Result<Option<String>, CliErro
     {
         let table = words[1].to_ascii_lowercase();
         if !QUERY_SCHEMAS.iter().any(|schema| schema.name == table) {
-            return Err(invalid_argument(format!("unknown table `{table}`")));
+            let column = statement.find(words[1]).map_or(1, |index| index as u64 + 1);
+            return Err(invalid_argument(format!("unknown table `{table}`"))
+                .with_stage("control")
+                .with_location(1, column));
         }
         let escaped = table.replace('\'', "''");
         return Ok(Some(format!(
