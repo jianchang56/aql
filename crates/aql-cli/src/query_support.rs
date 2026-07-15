@@ -129,3 +129,30 @@ pub(super) fn diagnostic_duration(enabled: bool, stage: &str, duration: Duration
 pub(super) fn source_supports_table(capabilities: &[String], table: &str) -> bool {
     table == "agents" || capabilities.iter().any(|candidate| candidate == table)
 }
+
+pub(super) fn rewrite_control_query(sql: &str) -> Result<Option<String>, CliError> {
+    let trimmed = sql.trim();
+    let statement = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    let words = statement.split_whitespace().collect::<Vec<_>>();
+    if words.len() == 2
+        && words[0].eq_ignore_ascii_case("SHOW")
+        && words[1].eq_ignore_ascii_case("TABLES")
+    {
+        return Ok(Some(
+            "SELECT table_name, table_kind FROM aql_tables ORDER BY table_name".to_string(),
+        ));
+    }
+    if words.len() == 2
+        && (words[0].eq_ignore_ascii_case("DESCRIBE") || words[0].eq_ignore_ascii_case("DESC"))
+    {
+        let table = words[1].to_ascii_lowercase();
+        if !QUERY_SCHEMAS.iter().any(|schema| schema.name == table) {
+            return Err(invalid_argument(format!("unknown table `{table}`")));
+        }
+        let escaped = table.replace('\'', "''");
+        return Ok(Some(format!(
+            "SELECT column_name, data_type, nullable, access_class FROM aql_columns WHERE table_name = '{escaped}' ORDER BY ordinal_position"
+        )));
+    }
+    Ok(None)
+}

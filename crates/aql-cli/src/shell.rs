@@ -437,9 +437,14 @@ pub(super) async fn run_shell(
                     }
                 }
                 [show, tables] if show == "SHOW" && tables == "TABLES" => {
-                    println!("table");
-                    for schema in QUERY_SCHEMAS {
-                        println!("{}", schema.name);
+                    if let Err(error) = run_shell_query(
+                        selected_database.clone(),
+                        access.clone(),
+                        statement.clone(),
+                    )
+                    .await
+                    {
+                        eprintln!("{}", shell_query_error(error.as_ref()));
                     }
                 }
                 [show, access_word] if show == "SHOW" && access_word == "ACCESS" => {
@@ -460,20 +465,14 @@ pub(super) async fn run_shell(
                     );
                 }
                 [describe, table] if describe == "DESCRIBE" || describe == "DESC" => {
-                    let table = table.to_ascii_lowercase();
-                    if let Some(schema) = QUERY_SCHEMAS.iter().find(|schema| schema.name == table) {
-                        println!("column\ttype\tnullable\taccess");
-                        for column in schema.columns {
-                            println!(
-                                "{}\t{}\t{}\t{}",
-                                column.name,
-                                query_type_name(column.data_type),
-                                if column.nullable { "YES" } else { "NO" },
-                                access_class_name(column.access)
-                            );
-                        }
-                    } else {
-                        eprintln!("ERROR: Unknown table '{table}'. Run SHOW TABLES;");
+                    if let Err(error) = run_shell_query(
+                        selected_database.clone(),
+                        access.clone(),
+                        statement.clone(),
+                    )
+                    .await
+                    {
+                        eprintln!("{}", shell_query_error(error.as_ref()));
                     }
                 }
                 [revoke, all, for_word, session]
@@ -500,33 +499,13 @@ pub(super) async fn run_shell(
                     println!("SELECT ...; | WITH ... SELECT ...; | EXPLAIN SELECT ...; | EXIT;");
                 }
                 [first, ..] if first == "SELECT" || first == "WITH" || first == "EXPLAIN" => {
-                    let Some(database) = selected_database.clone() else {
-                        eprintln!(
-                            "ERROR: No database selected. Run SHOW DATABASES; and USE <database>;"
-                        );
-                        continue;
-                    };
-                    let query = Cli {
-                        error_format: ErrorFormat::Text,
-                        quiet: false,
-                        command: Some(Command::Query {
-                            database,
-                            output: Output::Table,
-                            output_file: None,
-                            access: access.clone(),
-                            param: Vec::new(),
-                            limits: ExecutionLimits {
-                                max_output_bytes: 64 * 1024 * 1024,
-                                timeout: Duration::from_secs(30),
-                            },
-                            diagnostics: false,
-                            shell_summary: true,
-                            sql: Some(statement),
-                            file: None,
-                            stdin: false,
-                        }),
-                    };
-                    if let Err(error) = Box::pin(run(query)).await {
+                    if let Err(error) = run_shell_query(
+                        selected_database.clone(),
+                        access.clone(),
+                        statement.clone(),
+                    )
+                    .await
+                    {
                         eprintln!("{}", shell_query_error(error.as_ref()));
                     }
                 }
@@ -556,6 +535,40 @@ pub(super) fn shell_query_error(error: &(dyn std::error::Error + 'static)) -> St
         );
     }
     format!("ERROR: {error}")
+}
+
+async fn run_shell_query(
+    database: Option<String>,
+    access: Vec<Access>,
+    statement: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database) = database else {
+        return Err(database_not_found(
+            "no database selected; run SHOW DATABASES; and USE <database>;",
+        )
+        .into());
+    };
+    Box::pin(run(Cli {
+        error_format: ErrorFormat::Text,
+        quiet: false,
+        command: Some(Command::Query {
+            database,
+            output: Output::Table,
+            output_file: None,
+            access,
+            param: Vec::new(),
+            limits: ExecutionLimits {
+                max_output_bytes: 64 * 1024 * 1024,
+                timeout: Duration::from_secs(30),
+            },
+            diagnostics: false,
+            shell_summary: true,
+            sql: Some(statement),
+            file: None,
+            stdin: false,
+        }),
+    }))
+    .await
 }
 
 pub(super) fn shell_prompt(selected_database: Option<&str>, access: &[Access]) -> String {

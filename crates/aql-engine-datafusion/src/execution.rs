@@ -4,6 +4,7 @@ use super::*;
 enum MetadataValue {
     Text(String),
     Bool(bool),
+    Int64(i64),
 }
 
 fn metadata_rows(table: &str, sources: &[FederatedSource]) -> Vec<Vec<MetadataValue>> {
@@ -27,15 +28,20 @@ fn metadata_rows(table: &str, sources: &[FederatedSource]) -> Vec<Vec<MetadataVa
         "aql_columns" => QUERY_SCHEMAS
             .iter()
             .flat_map(|schema| {
-                schema.columns.iter().map(move |column| {
-                    vec![
-                        MetadataValue::Text(schema.name.to_string()),
-                        MetadataValue::Text(column.name.to_string()),
-                        MetadataValue::Text(query_data_type_name(column.data_type).to_string()),
-                        MetadataValue::Bool(column.nullable),
-                        MetadataValue::Text(access_class_name(column.access).to_string()),
-                    ]
-                })
+                schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, column)| {
+                        vec![
+                            MetadataValue::Text(schema.name.to_string()),
+                            MetadataValue::Text(column.name.to_string()),
+                            MetadataValue::Int64(index as i64 + 1),
+                            MetadataValue::Text(query_data_type_name(column.data_type).to_string()),
+                            MetadataValue::Bool(column.nullable),
+                            MetadataValue::Text(access_class_name(column.access).to_string()),
+                        ]
+                    })
             })
             .collect(),
         "aql_sources" => sources
@@ -102,6 +108,14 @@ fn metadata_array(rows: &[Vec<MetadataValue>], index: usize) -> Result<ArrayRef>
             rows.iter()
                 .map(|row| match row.get(index) {
                     Some(MetadataValue::Bool(value)) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        ))),
+        MetadataValue::Int64(_) => Ok(Arc::new(Int64Array::from(
+            rows.iter()
+                .map(|row| match row.get(index) {
+                    Some(MetadataValue::Int64(value)) => Some(*value),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),

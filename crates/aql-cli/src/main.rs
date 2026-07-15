@@ -494,6 +494,7 @@ async fn execute_query(
     let parse_started = Instant::now();
     let sql = read_sql_input(sql, file, stdin)?;
     let query_started = Instant::now();
+    let sql = rewrite_control_query(&sql)?.unwrap_or(sql);
     let (sql, explain) = match explain_sql(&sql) {
         Some(inner) if !inner.is_empty() => (inner, true),
         Some(_) => {

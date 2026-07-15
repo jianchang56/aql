@@ -236,6 +236,23 @@ fn query_sql_inputs_are_mutually_exclusive_and_explain_is_plan_only() {
 }
 
 #[test]
+fn control_queries_rewrite_to_canonical_metadata_selects() {
+    assert_eq!(
+        rewrite_control_query("SHOW TABLES;").expect("SHOW TABLES rewrites"),
+        Some("SELECT table_name, table_kind FROM aql_tables ORDER BY table_name".to_string())
+    );
+    assert_eq!(
+        rewrite_control_query("DESC sessions").expect("DESC rewrites"),
+        Some("SELECT column_name, data_type, nullable, access_class FROM aql_columns WHERE table_name = 'sessions' ORDER BY ordinal_position".to_string())
+    );
+    assert!(rewrite_control_query("DESCRIBE does_not_exist").is_err());
+    assert_eq!(
+        rewrite_control_query("SHOW TABLES; SELECT 1").unwrap(),
+        None
+    );
+}
+
+#[test]
 fn sql_file_input_is_bounded_regular_and_no_follow() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let query = temporary

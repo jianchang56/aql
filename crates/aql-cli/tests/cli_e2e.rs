@@ -172,6 +172,16 @@ fn query_formats_bare_output_file_and_budgets_are_end_to_end() {
     assert_success(&source_metadata);
     assert!(stdout(&source_metadata).contains("codex"));
 
+    let show_tables = environment.run(["query", "-d", "codex", "SHOW TABLES;"]);
+    assert_success(&show_tables);
+    assert!(stdout(&show_tables).contains("aql_columns"));
+    assert!(stdout(&show_tables).contains("sessions"));
+
+    let describe = environment.run(["query", "-d", "codex", "DESCRIBE sessions;"]);
+    assert_success(&describe);
+    assert!(stdout(&describe).contains("session_id"));
+    assert!(stdout(&describe).contains("VARCHAR"));
+
     let output_directory = environment.temporary.path().join("bare-output");
     fs::create_dir(&output_directory).expect("create bare output directory");
     let output = environment

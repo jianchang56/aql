@@ -275,6 +275,13 @@ const AQL_COLUMNS_COLUMNS: &[QueryColumn] = &[
         FieldCost::Metadata,
     ),
     query_column(
+        "ordinal_position",
+        QueryDataType::Int64,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+    query_column(
         "data_type",
         QueryDataType::Text,
         false,
