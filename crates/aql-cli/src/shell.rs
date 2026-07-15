@@ -464,7 +464,7 @@ pub(super) async fn run_shell(
                         access.len(),
                     );
                 }
-                [describe, table] if describe == "DESCRIBE" || describe == "DESC" => {
+                [describe, _] if describe == "DESCRIBE" || describe == "DESC" => {
                     if let Err(error) = run_shell_query(
                         selected_database.clone(),
                         access.clone(),

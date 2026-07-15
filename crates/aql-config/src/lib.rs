@@ -715,8 +715,13 @@ fn validate_private_file(stat: &rustix::fs::Stat) -> Result<(), ConfigError> {
 }
 
 fn identity(stat: &rustix::fs::Stat) -> FileIdentity {
+    #[cfg(target_os = "linux")]
+    let device = stat.st_dev;
+    #[cfg(not(target_os = "linux"))]
+    let device = stat.st_dev as u64;
+
     FileIdentity {
-        device: stat.st_dev as u64,
+        device,
         inode: stat.st_ino,
     }
 }
