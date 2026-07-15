@@ -94,8 +94,12 @@ pub enum QueryError {
     },
     #[error("query references a field that requires --access {0}")]
     AccessDenied(&'static str),
-    #[error("query engine error: {0}")]
-    Engine(#[from] DataFusionError),
+    #[error("query engine execution failed")]
+    Engine(
+        #[from]
+        #[source]
+        DataFusionError,
+    ),
 }
 
 #[derive(Clone, Debug)]

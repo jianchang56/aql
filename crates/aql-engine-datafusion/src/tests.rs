@@ -670,7 +670,10 @@ async fn session_reconciliation_obeys_query_memory_budget() {
         panic!("reconciliation must respect the query memory pool");
     };
 
-    assert!(error.to_string().contains("Resources exhausted"));
+    assert!(matches!(
+        error,
+        QueryError::Engine(DataFusionError::ResourcesExhausted(_))
+    ));
 }
 
 #[tokio::test]
@@ -1172,6 +1175,15 @@ fn common_string_and_time_functions_are_allowlisted() {
     ] {
         validate_read_only_sql(sql).expect("common analysis function should be accepted");
     }
+}
+
+#[test]
+fn engine_errors_do_not_render_internal_details() {
+    let error = QueryError::Engine(DataFusionError::Plan(
+        "synthetic secret literal must stay internal".to_string(),
+    ));
+    assert_eq!(error.to_string(), "query engine execution failed");
+    assert!(std::error::Error::source(&error).is_some());
 }
 
 #[test]
