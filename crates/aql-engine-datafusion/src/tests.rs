@@ -66,6 +66,85 @@ fn limit_offset_and_float_parameters_remain_explicit() {
     let _ = sql;
 }
 
+#[tokio::test]
+async fn ordering_warning_is_limited_to_unordered_pagination() {
+    let source = FederatedSource {
+        adapter: Arc::new(CodexAdapter::new(b"synthetic-adapter".to_vec())),
+        manifest: SourceManifest {
+            source_id: SourceId::new("synthetic-source"),
+            agent_id: "codex".to_string(),
+            display_name: "Synthetic Codex".to_string(),
+            data_root_token: "root:synthetic".to_string(),
+            format_fingerprint: "synthetic-v1".to_string(),
+            capabilities: vec!["sessions".to_string()],
+            snapshot: Some(SnapshotToken::new("synthetic-snapshot")),
+            warnings: Vec::new(),
+        },
+    };
+    let count = validate_read_only_sql("SELECT COUNT(*) FROM aql_tables")
+        .expect("aggregate query is valid");
+    let count_result = prepare_query(&count, QueryOptions::default())
+        .await
+        .expect("aggregate query prepares")
+        .execute(vec![source.clone()])
+        .await
+        .expect("aggregate query executes");
+    assert!(count_result.metadata.warnings.is_empty());
+
+    let page = validate_read_only_sql("SELECT table_name FROM aql_tables LIMIT 1")
+        .expect("page query is valid");
+    let page_result = prepare_query(&page, QueryOptions::default())
+        .await
+        .expect("page query prepares")
+        .execute(vec![source])
+        .await
+        .expect("page query executes");
+    assert_eq!(
+        page_result.metadata.warnings,
+        vec!["result ordering is unspecified; add ORDER BY for stable pagination"]
+    );
+}
+
+#[tokio::test]
+async fn metadata_limit_reduces_record_budget_consumption() {
+    let sql = validate_read_only_sql("SELECT table_name FROM aql_tables LIMIT 1")
+        .expect("metadata query is valid");
+    let options = QueryOptions {
+        budget: ResourceBudget {
+            max_records: 1,
+            ..ResourceBudget::default()
+        },
+        ..QueryOptions::default()
+    };
+    let source = FederatedSource {
+        adapter: Arc::new(CodexAdapter::new(b"synthetic-adapter".to_vec())),
+        manifest: SourceManifest {
+            source_id: SourceId::new("synthetic-source"),
+            agent_id: "codex".to_string(),
+            display_name: "Synthetic Codex".to_string(),
+            data_root_token: "root:synthetic".to_string(),
+            format_fingerprint: "synthetic-v1".to_string(),
+            capabilities: vec!["sessions".to_string()],
+            snapshot: Some(SnapshotToken::new("synthetic-snapshot")),
+            warnings: Vec::new(),
+        },
+    };
+    let result = prepare_query(&sql, options)
+        .await
+        .expect("metadata query prepares")
+        .execute(vec![source])
+        .await
+        .expect("LIMIT keeps metadata within the record budget");
+    assert_eq!(
+        result
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        1
+    );
+}
+
 struct SyntheticSessionAdapter {
     session: SessionRecord,
 }

@@ -86,7 +86,7 @@ printf '%s\n' 'SELECT COUNT(*) FROM sessions' | aql query -d codex --stdin
 
 直接参数、`--file` 和 `--stdin` 三者互斥；`--file` 只接受一个最大 64 KiB 的 `.aql` 只读脚本。
 
-显式分页使用 `ORDER BY ... LIMIT ... OFFSET ...`。缺少 `ORDER BY` 时会提示结果顺序不稳定，AQL 不会添加隐式排序。
+显式分页使用 `ORDER BY ... LIMIT ... OFFSET ...`。分页查询缺少 `ORDER BY` 时会提示结果顺序不稳定，AQL 不会添加隐式排序。
 
 ## Schema 和示例
 
@@ -138,7 +138,7 @@ aql query -d codex \
 
 未加前缀时，`null`、`true`、`false` 和整数形状会自动绑定对应类型，其余值为文本。显式 `text:`、`int:`、`float:`、`bool:` 可指定类型。缺失、重复、未使用参数和非命名 placeholder 都会被拒绝。
 
-固定函数白名单包含 `lower`、`upper`、`length`、`substr`、`trim`、`replace`、`coalesce`、`nullif`、`date_trunc`、`date_part`、`round`、`sum` 和 `count`。
+固定函数白名单包含 `lower`、`upper`、`length`、`substr`、`trim`、`replace`、`coalesce`、`nullif`、`date_trunc`、`date_part`、`round`、`sum`、`count`、`redact` 和 `mask_path`。隐私函数的参数策略固定，不能动态指定。
 
 ## 输出
 

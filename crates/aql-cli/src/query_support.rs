@@ -156,10 +156,26 @@ pub(super) fn rewrite_control_query(sql: &str) -> Result<Option<String>, CliErro
     {
         let table = words[1].to_ascii_lowercase();
         if !QUERY_SCHEMAS.iter().any(|schema| schema.name == table) {
-            let column = statement.find(words[1]).map_or(1, |index| index as u64 + 1);
-            return Err(invalid_argument(format!("unknown table `{table}`"))
-                .with_stage("control")
-                .with_location(1, column));
+            let location = statement.find(words[1]).map(|index| {
+                let prefix = &statement[..index];
+                let line = prefix
+                    .chars()
+                    .filter(|character| *character == '\n')
+                    .count() as u64
+                    + 1;
+                let column = prefix
+                    .rsplit_once('\n')
+                    .map_or(prefix, |(_, line)| line)
+                    .chars()
+                    .count() as u64
+                    + 1;
+                (line, column)
+            });
+            let error = invalid_argument(format!("unknown table `{table}`")).with_stage("control");
+            return Err(match location {
+                Some((line, column)) => error.with_location(line, column),
+                None => error,
+            });
         }
         let escaped = table.replace('\'', "''");
         return Ok(Some(format!(

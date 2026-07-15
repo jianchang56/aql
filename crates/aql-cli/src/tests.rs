@@ -253,6 +253,9 @@ fn control_queries_rewrite_to_canonical_metadata_selects() {
         .expect_err("unknown control table is rejected");
     assert_eq!(error_stage(&error), "control");
     assert_eq!(error_location(&error), Some((1, 10)));
+    let multiline = rewrite_control_query("DESCRIBE\n  does_not_exist")
+        .expect_err("multiline unknown control table is rejected");
+    assert_eq!(error_location(&multiline), Some((2, 3)));
     assert_eq!(
         rewrite_control_query("SHOW TABLES; SELECT 1").unwrap(),
         None

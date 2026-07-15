@@ -47,6 +47,7 @@ use sqlparser::parser::Parser;
 
 mod arrays;
 mod execution;
+mod metadata;
 mod sql_firewall;
 
 use arrays::{agent_array, record_array};
@@ -1378,7 +1379,7 @@ pub async fn prepare_query(
     validate_plan_access(&plan, options.access)?;
     let plan_summary = summarize_plan(&plan, &options)?;
     let metadata = Arc::new(Mutex::new(QueryMetadata::default()));
-    if !plan_contains_ordering(&plan)? {
+    if plan_contains_pagination(&plan)? && !plan_contains_ordering(&plan)? {
         metadata
             .lock()
             .map_err(|_| DataFusionError::Execution("query metadata is unavailable".into()))?
@@ -1393,6 +1394,19 @@ pub async fn prepare_query(
         metadata,
         plan_summary,
     })
+}
+
+fn plan_contains_pagination(plan: &LogicalPlan) -> Result<bool> {
+    let mut found = false;
+    plan.apply(|node| {
+        if matches!(node, LogicalPlan::Limit(_)) {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    })?;
+    Ok(found)
 }
 
 fn plan_contains_ordering(plan: &LogicalPlan) -> Result<bool> {
