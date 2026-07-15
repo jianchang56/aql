@@ -7,11 +7,11 @@ version.workspace = true
 [dependencies]
 aql-adapter-api = { path = "../aql-adapter-api" }
 aql-model = { path = "../aql-model" }
-chrono = "0.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["raw_value"] }
-libc = "0.2"
-sha2 = "0.10"
+chrono.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+libc.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 aql-test-support = { path = "../aql-test-support" }

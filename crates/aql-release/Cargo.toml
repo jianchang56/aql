@@ -6,15 +6,15 @@ version.workspace = true
 publish = false
 
 [dependencies]
-clap = { version = "4.6.1", features = ["derive"] }
-flate2 = { version = "1.1.2", default-features = false, features = ["zlib-rs"] }
-hex = "0.4.3"
-rustix = { version = "1.1.4", features = ["fs", "process"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-sha2 = "0.10.9"
-tar = "0.4.44"
-tempfile = "3.27.0"
+clap = { workspace = true, features = ["derive"] }
+flate2 = { workspace = true, features = ["zlib-rs"] }
+hex.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

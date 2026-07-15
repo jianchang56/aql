@@ -12,7 +12,7 @@ aql-model = { path = "../aql-model" }
 aql-adapter-codex = { path = "../aql-adapter-codex" }
 aql-model = { path = "../aql-model" }
 aql-test-support = { path = "../aql-test-support" }
-chrono = "0.4"
+chrono.workspace = true
 
 [lints]
 workspace = true

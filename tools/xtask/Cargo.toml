@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 aql-test-support = { path = "../../crates/aql-test-support" }
-tempfile = "3.27.0"
+tempfile.workspace = true
 
 [lints]
 workspace = true

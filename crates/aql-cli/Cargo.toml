@@ -18,20 +18,20 @@ aql-catalog = { path = "../aql-catalog" }
 aql-config = { path = "../aql-config" }
 aql-engine-datafusion = { path = "../aql-engine-datafusion" }
 aql-model = { path = "../aql-model" }
-clap = { version = "4.5", features = ["derive", "env", "string"] }
-clap_complete = "4.5"
-clap_mangen = "0.2"
-chrono = "0.4"
-datafusion = { version = "54.0.0", default-features = false, features = ["sql"] }
-futures = "0.3"
-humantime = "2.3"
-rand = "0.9"
-rustyline = "15.0"
-rustix = { version = "1.1", features = ["fs"] }
-serde_json = "1.0"
-tempfile = "3.27.0"
-tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
-unicode-width = "0.2"
+clap = { workspace = true, features = ["derive", "env", "string"] }
+clap_complete.workspace = true
+clap_mangen.workspace = true
+chrono.workspace = true
+datafusion = { workspace = true, features = ["sql"] }
+futures.workspace = true
+humantime.workspace = true
+rand.workspace = true
+rustyline.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
+unicode-width.workspace = true
 
 [dev-dependencies]
 aql-test-support = { path = "../aql-test-support" }
