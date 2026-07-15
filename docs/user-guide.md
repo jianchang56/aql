@@ -16,7 +16,7 @@ aql shell -d codex
 |---|---|
 | `SHOW DATABASES;` | 列出数据库，不显示路径 |
 | `USE name;` | 显式选择数据库 |
-| `SHOW TABLES;` | 列出 canonical tables |
+| `SHOW TABLES;` | 列出 canonical 和 metadata tables |
 | `DESCRIBE table;` | 显示字段、类型和访问级别 |
 | `SHOW ACCESS;` | 显示当前临时授权 |
 | `SHOW STATUS;` | 显示数据库、授权和预算状态 |

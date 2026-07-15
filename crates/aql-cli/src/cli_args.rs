@@ -74,7 +74,7 @@ pub(super) enum Command {
         /// Grant access to sensitive column classes for this query only; repeat as needed.
         #[arg(long = "access", value_enum)]
         access: Vec<Access>,
-        /// Bind NAME=VALUE; use text:, int: or bool: to disambiguate values.
+        /// Bind NAME=VALUE; use text:, int:, float: or bool: to disambiguate values.
         #[arg(long = "param", value_name = "NAME=VALUE")]
         param: Vec<String>,
         #[command(flatten)]

@@ -105,7 +105,7 @@ aql query -d codex \
 | `session_edges` | 父子会话和子 Agent 关系 |
 | `artifacts` | 明确记录的 patch artifact |
 
-完整字段、类型和访问级别见 [Canonical Schema](docs/canonical-schema-v0.md)。`SELECT *` 只展开 Safe 字段。
+完整字段、类型和访问级别见 [Canonical Schema](docs/canonical-schema-v0.md)。除 canonical tables 外，还可以查询只读元数据表 `aql_tables`、`aql_columns`、`aql_sources` 和 `aql_capabilities`。`SELECT *` 只展开 Safe 字段。
 
 ## 敏感字段授权
 
@@ -146,7 +146,7 @@ aql query -d codex \
   'SELECT session_id FROM sessions WHERE project = :project AND message_count >= :minimum'
 ```
 
-支持 `null`、布尔、带符号 64 位整数和文本；`text:`、`int:`、`bool:` 可显式指定类型。参数不能替换表名、列名、函数或 SQL 片段。
+支持 `null`、布尔、带符号 64 位整数、有限浮点数和文本；`text:`、`int:`、`float:`、`bool:` 可显式指定类型。参数不能替换表名、列名、函数或 SQL 片段。
 
 ## 数据库
 
