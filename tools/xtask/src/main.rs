@@ -96,6 +96,22 @@ fn verify_workspace() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn verify_release() -> Result<(), Box<dyn std::error::Error>> {
+    run_cargo(&["build", "--locked", "-p", "aql-release"])?;
+    for command in ["build", "verify", "install", "uninstall", "formula"] {
+        let output = Command::new("target/debug/aql-release")
+            .args([command, "--help"])
+            .stdin(Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            return Err(
+                format!("aql-release {command} --help failed with {}", output.status).into(),
+            );
+        }
+        let help = String::from_utf8(output.stdout)?;
+        if !help.contains("Usage:") {
+            return Err(format!("aql-release {command} --help omitted Usage").into());
+        }
+    }
     run_cargo(&["test", "--locked", "-p", "aql-release"])?;
     Ok(())
 }
