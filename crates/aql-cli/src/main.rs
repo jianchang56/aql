@@ -30,20 +30,20 @@ use rustyline::validate::Validator;
 use rustyline::{Context, Helper};
 
 mod cli_args;
-mod command_output;
+mod command_artifacts;
 mod database;
 mod output;
-mod query_support;
+mod query_runtime;
 mod render;
 mod shell;
 
 use cli_args::*;
-use command_output::*;
+use command_artifacts::*;
 use database::*;
 #[cfg(test)]
 use output::SecureOutputFile;
 use output::TransactionalOutput;
-use query_support::*;
+use query_runtime::*;
 use render::StreamingRenderer;
 #[cfg(test)]
 use render::{
@@ -421,7 +421,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             stdin,
         } => {
             execute_query(
-                QueryExecution {
+                QueryRequest {
                     database,
                     output,
                     output_file,
@@ -457,7 +457,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct QueryExecution {
+struct QueryRequest {
     database: String,
     output: Output,
     output_file: Option<PathBuf>,
@@ -472,10 +472,10 @@ struct QueryExecution {
 }
 
 async fn execute_query(
-    request: QueryExecution,
+    request: QueryRequest,
     quiet: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let QueryExecution {
+    let QueryRequest {
         database,
         output,
         output_file,
@@ -523,7 +523,7 @@ async fn execute_query(
         }
         None => (sql.as_str(), false),
     };
-    let bound_sql = bind_sql_parameters(sql, &parse_sql_parameters(&param)?)?;
+    let bound_sql = bind_sql_parameters(sql, &parse_query_parameters(&param)?)?;
     let validated_sql = validate_read_only_sql(&bound_sql)?;
     ensure_before_deadline(deadline)?;
     diagnostic_timing(diagnostics, "parse", parse_started);

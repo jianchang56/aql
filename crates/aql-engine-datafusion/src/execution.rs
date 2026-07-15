@@ -273,7 +273,7 @@ impl AdapterBatchState {
         let arrays = self
             .projection
             .iter()
-            .map(|index| agent_array(self.table.columns[*index].name, &manifests))
+            .map(|index| agents_array(self.table.columns[*index].name, &manifests))
             .collect::<Result<Vec<_>>>();
         Some(arrays.and_then(|arrays| {
             RecordBatch::try_new_with_options(
@@ -291,14 +291,14 @@ impl AdapterBatchState {
             return None;
         }
         self.metadata_emitted = true;
-        let mut rows = metadata::rows(self.table.name, &self.binding.sources);
+        let mut rows = metadata::metadata_rows(self.table.name, &self.binding.sources);
         if let Some(limit) = self.limit {
             rows.truncate(limit);
         }
         let arrays = self
             .projection
             .iter()
-            .map(|index| metadata::array(&rows, *index))
+            .map(|index| metadata::metadata_array(&rows, *index))
             .collect::<Result<Vec<_>>>();
         Some(arrays.and_then(|arrays| {
             RecordBatch::try_new_with_options(

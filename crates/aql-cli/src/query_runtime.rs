@@ -50,7 +50,7 @@ pub(super) fn ensure_before_deadline(deadline: Instant) -> Result<(), Box<dyn st
     }
 }
 
-pub(super) fn parse_sql_parameters(
+pub(super) fn parse_query_parameters(
     values: &[String],
 ) -> Result<std::collections::BTreeMap<String, SqlParameter>, CliError> {
     let mut parameters = std::collections::BTreeMap::new();

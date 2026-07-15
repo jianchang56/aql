@@ -1,20 +1,20 @@
 use super::*;
 
 #[derive(Clone)]
-pub(super) enum MetadataValue {
+pub(super) enum MetadataCell {
     Text(String),
     Bool(bool),
     Int64(i64),
 }
 
-pub(super) fn rows(table: &str, sources: &[FederatedSource]) -> Vec<Vec<MetadataValue>> {
+pub(super) fn metadata_rows(table: &str, sources: &[FederatedSource]) -> Vec<Vec<MetadataCell>> {
     match table {
         "aql_tables" => QUERY_SCHEMAS
             .iter()
             .map(|schema| {
                 vec![
-                    MetadataValue::Text(schema.name.to_string()),
-                    MetadataValue::Text(
+                    MetadataCell::Text(schema.name.to_string()),
+                    MetadataCell::Text(
                         if schema.name.starts_with("aql_") {
                             "metadata"
                         } else {
@@ -34,12 +34,12 @@ pub(super) fn rows(table: &str, sources: &[FederatedSource]) -> Vec<Vec<Metadata
                     .enumerate()
                     .map(move |(index, column)| {
                         vec![
-                            MetadataValue::Text(schema.name.to_string()),
-                            MetadataValue::Text(column.name.to_string()),
-                            MetadataValue::Int64(index as i64 + 1),
-                            MetadataValue::Text(data_type_name(column.data_type).to_string()),
-                            MetadataValue::Bool(column.nullable),
-                            MetadataValue::Text(access_class_name(column.access).to_string()),
+                            MetadataCell::Text(schema.name.to_string()),
+                            MetadataCell::Text(column.name.to_string()),
+                            MetadataCell::Int64(index as i64 + 1),
+                            MetadataCell::Text(data_type_name(column.data_type).to_string()),
+                            MetadataCell::Bool(column.nullable),
+                            MetadataCell::Text(access_class_name(column.access).to_string()),
                         ]
                     })
             })
@@ -48,11 +48,11 @@ pub(super) fn rows(table: &str, sources: &[FederatedSource]) -> Vec<Vec<Metadata
             .iter()
             .map(|source| {
                 vec![
-                    MetadataValue::Text(source.manifest.source_id.to_string()),
-                    MetadataValue::Text(source.manifest.agent_id.clone()),
-                    MetadataValue::Text(source.manifest.display_name.clone()),
-                    MetadataValue::Text(source.manifest.format_fingerprint.clone()),
-                    MetadataValue::Text(
+                    MetadataCell::Text(source.manifest.source_id.to_string()),
+                    MetadataCell::Text(source.manifest.agent_id.clone()),
+                    MetadataCell::Text(source.manifest.display_name.clone()),
+                    MetadataCell::Text(source.manifest.format_fingerprint.clone()),
+                    MetadataCell::Text(
                         if source.manifest.snapshot.is_some() {
                             "weak"
                         } else {
@@ -71,9 +71,9 @@ pub(super) fn rows(table: &str, sources: &[FederatedSource]) -> Vec<Vec<Metadata
                     .filter(|schema| !schema.name.starts_with("aql_"))
                     .map(move |schema| {
                         vec![
-                            MetadataValue::Text(source.manifest.source_id.to_string()),
-                            MetadataValue::Text(schema.name.to_string()),
-                            MetadataValue::Bool(
+                            MetadataCell::Text(source.manifest.source_id.to_string()),
+                            MetadataCell::Text(schema.name.to_string()),
+                            MetadataCell::Bool(
                                 schema.name == "agents"
                                     || source
                                         .manifest
@@ -89,33 +89,33 @@ pub(super) fn rows(table: &str, sources: &[FederatedSource]) -> Vec<Vec<Metadata
     }
 }
 
-pub(super) fn array(rows: &[Vec<MetadataValue>], index: usize) -> Result<ArrayRef> {
+pub(super) fn metadata_array(rows: &[Vec<MetadataCell>], index: usize) -> Result<ArrayRef> {
     let Some(first) = rows.first().and_then(|row| row.get(index)) else {
         return Err(DataFusionError::Plan(
             "metadata column is unavailable".to_string(),
         ));
     };
     match first {
-        MetadataValue::Text(_) => Ok(Arc::new(StringArray::from(
+        MetadataCell::Text(_) => Ok(Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| match row.get(index) {
-                    Some(MetadataValue::Text(value)) => Some(value.clone()),
+                    Some(MetadataCell::Text(value)) => Some(value.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
         ))),
-        MetadataValue::Bool(_) => Ok(Arc::new(BooleanArray::from(
+        MetadataCell::Bool(_) => Ok(Arc::new(BooleanArray::from(
             rows.iter()
                 .map(|row| match row.get(index) {
-                    Some(MetadataValue::Bool(value)) => Some(*value),
+                    Some(MetadataCell::Bool(value)) => Some(*value),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
         ))),
-        MetadataValue::Int64(_) => Ok(Arc::new(Int64Array::from(
+        MetadataCell::Int64(_) => Ok(Arc::new(Int64Array::from(
             rows.iter()
                 .map(|row| match row.get(index) {
-                    Some(MetadataValue::Int64(value)) => Some(*value),
+                    Some(MetadataCell::Int64(value)) => Some(*value),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),

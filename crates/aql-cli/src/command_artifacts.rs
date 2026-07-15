@@ -1,10 +1,10 @@
 use super::*;
 
-pub(super) fn generated_command() -> clap::Command {
+pub(super) fn public_command() -> clap::Command {
     Cli::command().name("aql")
 }
 
-pub(super) fn build_metadata() -> serde_json::Value {
+pub(super) fn version_metadata() -> serde_json::Value {
     serde_json::json!({
         "canonical_schema": "aql-canonical-v0",
         "config_schema": CONFIG_SCHEMA_VERSION,
@@ -15,7 +15,7 @@ pub(super) fn build_metadata() -> serde_json::Value {
 }
 
 pub(super) fn render_version(output: VersionOutput) -> Result<String, Box<dyn std::error::Error>> {
-    let metadata = build_metadata();
+    let metadata = version_metadata();
     Ok(match output {
         VersionOutput::Json => serde_json::to_string(&metadata)?,
         VersionOutput::Text => format!(
@@ -35,7 +35,7 @@ pub(super) fn render_version(output: VersionOutput) -> Result<String, Box<dyn st
 }
 
 pub(super) fn render_completions(shell: CompletionShell) -> Vec<u8> {
-    let mut command = generated_command();
+    let mut command = public_command();
     let mut rendered = Vec::new();
     clap_complete::generate(
         clap_complete::Shell::from(shell),
@@ -48,6 +48,6 @@ pub(super) fn render_completions(shell: CompletionShell) -> Vec<u8> {
 
 pub(super) fn render_manpage() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut rendered = Vec::new();
-    clap_mangen::Man::new(generated_command()).render(&mut rendered)?;
+    clap_mangen::Man::new(public_command()).render(&mut rendered)?;
     Ok(rendered)
 }

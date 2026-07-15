@@ -50,7 +50,7 @@ mod execution;
 mod metadata;
 mod sql_firewall;
 
-use arrays::{agent_array, record_array};
+use arrays::{agents_array, record_array};
 #[cfg(test)]
 use execution::expr_to_predicate;
 use execution::{Binding, DeferredTable};
@@ -65,7 +65,7 @@ const MAX_EXPRESSIONS: usize = 256;
 const MAX_CTES: usize = 32;
 const MAX_JOINS: usize = 16;
 const QUERY_MEMORY_BYTES: usize = 256 * 1024 * 1024;
-const CANONICAL_TABLES: [&str; 11] = [
+const QUERY_TABLE_NAMES: [&str; 11] = [
     "aql_tables",
     "aql_columns",
     "aql_sources",
@@ -201,7 +201,7 @@ const fn query_column(
     }
 }
 
-const AGENT_QUERY_COLUMNS: &[QueryColumn] = &[
+const AGENTS_QUERY_COLUMNS: &[QueryColumn] = &[
     query_column(
         "source_id",
         QueryDataType::Text,
@@ -964,7 +964,7 @@ pub const QUERY_SCHEMAS: &[QueryTableSchema] = &[
     },
     QueryTableSchema {
         name: "agents",
-        columns: AGENT_QUERY_COLUMNS,
+        columns: AGENTS_QUERY_COLUMNS,
     },
     QueryTableSchema {
         name: "sessions",

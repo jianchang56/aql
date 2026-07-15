@@ -1175,7 +1175,7 @@ fn common_string_and_time_functions_are_allowlisted() {
 }
 
 #[test]
-fn static_query_schemas_cover_phase_one_and_phase_three_tables() {
+fn query_schemas_match_the_public_table_order() {
     assert_eq!(
         QUERY_SCHEMAS
             .iter()

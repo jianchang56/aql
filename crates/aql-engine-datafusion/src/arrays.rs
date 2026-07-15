@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn agent_array(column: &str, sources: &[SourceManifest]) -> Result<ArrayRef> {
+pub(super) fn agents_array(column: &str, sources: &[SourceManifest]) -> Result<ArrayRef> {
     let values = sources
         .iter()
         .map(|source| match column {

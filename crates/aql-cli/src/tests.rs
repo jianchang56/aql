@@ -16,7 +16,7 @@ impl Write for BrokenWriter {
 
 #[test]
 fn named_query_parameters_are_scalar_and_unique() {
-    let parameters = parse_sql_parameters(&[
+    let parameters = parse_query_parameters(&[
         "name=example".to_string(),
         "count=42".to_string(),
         "enabled=true".to_string(),
@@ -42,13 +42,13 @@ fn named_query_parameters_are_scalar_and_unique() {
         parameters["numeric_text"],
         SqlParameter::Text("42".to_string())
     );
-    assert!(parse_sql_parameters(&["1bad=value".to_string()]).is_err());
-    assert!(parse_sql_parameters(&["x=1".to_string(), "x=2".to_string()]).is_err());
-    let error = parse_sql_parameters(&["x=bool:yes".to_string()])
+    assert!(parse_query_parameters(&["1bad=value".to_string()]).is_err());
+    assert!(parse_query_parameters(&["x=1".to_string(), "x=2".to_string()]).is_err());
+    let error = parse_query_parameters(&["x=bool:yes".to_string()])
         .expect_err("invalid explicit bool must fail");
     assert_eq!(error_exit_code(&error), 2);
     assert_eq!(error_category(&error), "invalid_request");
-    assert!(parse_sql_parameters(&["x=float:NaN".to_string()]).is_err());
+    assert!(parse_query_parameters(&["x=float:NaN".to_string()]).is_err());
 
     Cli::try_parse_from([
         "aql",
@@ -118,7 +118,7 @@ fn database_cli_is_short_clear_and_mutually_exclusive() {
 
 #[test]
 fn public_help_exposes_only_the_focused_command_surface() {
-    let help = generated_command().render_long_help().to_string();
+    let help = public_command().render_long_help().to_string();
     assert!(help.contains("database"));
     assert!(help.contains("schema"));
     assert!(help.contains("examples"));
@@ -719,8 +719,8 @@ fn csv_output_rejects_controls_and_inconsistent_schemas() {
 
 #[test]
 fn generated_release_docs_are_deterministic_and_exclude_internal_arguments() {
-    generated_command().debug_assert();
-    let generated = generated_command();
+    public_command().debug_assert();
+    let generated = public_command();
     let generated_query = generated
         .get_subcommands()
         .find(|command| command.get_name() == "query")

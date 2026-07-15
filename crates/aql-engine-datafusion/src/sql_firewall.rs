@@ -607,7 +607,7 @@ impl Visitor for ReadOnlyVisitor {
             return Self::reject("dynamic table names are not allowed");
         };
         let normalized = name.value.to_ascii_lowercase();
-        if CANONICAL_TABLES.contains(&normalized.as_str()) || self.ctes.contains(&normalized) {
+        if QUERY_TABLE_NAMES.contains(&normalized.as_str()) || self.ctes.contains(&normalized) {
             ControlFlow::Continue(())
         } else {
             Self::reject("only canonical AQL tables and query CTEs are allowed")
