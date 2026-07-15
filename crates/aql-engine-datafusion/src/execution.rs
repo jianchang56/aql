@@ -1,6 +1,136 @@
 use super::*;
 
 #[derive(Clone)]
+enum MetadataValue {
+    Text(String),
+    Bool(bool),
+}
+
+fn metadata_rows(table: &str, sources: &[FederatedSource]) -> Vec<Vec<MetadataValue>> {
+    match table {
+        "aql_tables" => QUERY_SCHEMAS
+            .iter()
+            .map(|schema| {
+                vec![
+                    MetadataValue::Text(schema.name.to_string()),
+                    MetadataValue::Text(
+                        if schema.name.starts_with("aql_") {
+                            "metadata"
+                        } else {
+                            "canonical"
+                        }
+                        .to_string(),
+                    ),
+                ]
+            })
+            .collect(),
+        "aql_columns" => QUERY_SCHEMAS
+            .iter()
+            .flat_map(|schema| {
+                schema.columns.iter().map(move |column| {
+                    vec![
+                        MetadataValue::Text(schema.name.to_string()),
+                        MetadataValue::Text(column.name.to_string()),
+                        MetadataValue::Text(query_data_type_name(column.data_type).to_string()),
+                        MetadataValue::Bool(column.nullable),
+                        MetadataValue::Text(access_class_name(column.access).to_string()),
+                    ]
+                })
+            })
+            .collect(),
+        "aql_sources" => sources
+            .iter()
+            .map(|source| {
+                vec![
+                    MetadataValue::Text(source.manifest.source_id.to_string()),
+                    MetadataValue::Text(source.manifest.agent_id.clone()),
+                    MetadataValue::Text(source.manifest.display_name.clone()),
+                    MetadataValue::Text(source.manifest.format_fingerprint.clone()),
+                    MetadataValue::Text(
+                        if source.manifest.snapshot.is_some() {
+                            "weak"
+                        } else {
+                            "unavailable"
+                        }
+                        .to_string(),
+                    ),
+                ]
+            })
+            .collect(),
+        "aql_capabilities" => sources
+            .iter()
+            .flat_map(|source| {
+                QUERY_SCHEMAS
+                    .iter()
+                    .filter(|schema| !schema.name.starts_with("aql_"))
+                    .map(move |schema| {
+                        vec![
+                            MetadataValue::Text(source.manifest.source_id.to_string()),
+                            MetadataValue::Text(schema.name.to_string()),
+                            MetadataValue::Bool(
+                                schema.name == "agents"
+                                    || source
+                                        .manifest
+                                        .capabilities
+                                        .iter()
+                                        .any(|capability| capability == schema.name),
+                            ),
+                        ]
+                    })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn metadata_array(rows: &[Vec<MetadataValue>], index: usize) -> Result<ArrayRef> {
+    let Some(first) = rows.first().and_then(|row| row.get(index)) else {
+        return Err(DataFusionError::Plan(
+            "metadata column is unavailable".to_string(),
+        ));
+    };
+    match first {
+        MetadataValue::Text(_) => Ok(Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| match row.get(index) {
+                    Some(MetadataValue::Text(value)) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        ))),
+        MetadataValue::Bool(_) => Ok(Arc::new(BooleanArray::from(
+            rows.iter()
+                .map(|row| match row.get(index) {
+                    Some(MetadataValue::Bool(value)) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        ))),
+    }
+}
+
+fn query_data_type_name(data_type: QueryDataType) -> &'static str {
+    match data_type {
+        QueryDataType::Text => "VARCHAR",
+        QueryDataType::Int64 => "BIGINT",
+        QueryDataType::Bool => "BOOLEAN",
+        QueryDataType::Timestamp => "TIMESTAMP",
+        QueryDataType::Json => "JSON",
+    }
+}
+
+fn access_class_name(access: AccessClass) -> &'static str {
+    match access {
+        AccessClass::Safe => "safe",
+        AccessClass::Path => "path",
+        AccessClass::Content => "content",
+        AccessClass::ToolInput => "tool-input",
+        AccessClass::ToolOutput => "tool-output",
+        AccessClass::Secret => "secret",
+    }
+}
+
+#[derive(Clone)]
 pub(super) struct Binding {
     pub(super) sources: Vec<FederatedSource>,
     pub(super) options: QueryOptions,
@@ -183,6 +313,7 @@ struct AdapterBatchState {
     seen: BTreeSet<String>,
     emitted: usize,
     agents_emitted: bool,
+    metadata_emitted: bool,
     finished: bool,
 }
 
@@ -221,6 +352,7 @@ impl AdapterBatchState {
             seen: BTreeSet::new(),
             emitted: 0,
             agents_emitted: false,
+            metadata_emitted: false,
             finished: false,
         }
     }
@@ -228,6 +360,9 @@ impl AdapterBatchState {
     fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
         if self.finished {
             return None;
+        }
+        if self.table.name.starts_with("aql_") {
+            return self.next_metadata_batch();
         }
         if self.table.name == "agents" {
             return self.next_agents_batch();
@@ -275,6 +410,36 @@ impl AdapterBatchState {
                 self.schema.clone(),
                 arrays,
                 &RecordBatchOptions::new().with_row_count(Some(self.binding.sources.len())),
+            )
+            .map_err(Into::into)
+        }))
+    }
+
+    fn next_metadata_batch(&mut self) -> Option<Result<RecordBatch>> {
+        self.finished = true;
+        if self.metadata_emitted {
+            return None;
+        }
+        self.metadata_emitted = true;
+        let rows = metadata_rows(self.table.name, &self.binding.sources);
+        if let Err(error) = self
+            .binding
+            .options
+            .budget
+            .charge_records(rows.len() as u64)
+        {
+            return Some(Err(DataFusionError::External(Box::new(error))));
+        }
+        let arrays = self
+            .projection
+            .iter()
+            .map(|index| metadata_array(&rows, *index))
+            .collect::<Result<Vec<_>>>();
+        Some(arrays.and_then(|arrays| {
+            RecordBatch::try_new_with_options(
+                self.schema.clone(),
+                arrays,
+                &RecordBatchOptions::new().with_row_count(Some(rows.len())),
             )
             .map_err(Into::into)
         }))

@@ -1074,6 +1074,10 @@ fn static_query_schemas_cover_phase_one_and_phase_three_tables() {
             .map(|schema| schema.name)
             .collect::<Vec<_>>(),
         vec![
+            "aql_tables",
+            "aql_columns",
+            "aql_sources",
+            "aql_capabilities",
             "agents",
             "sessions",
             "messages",

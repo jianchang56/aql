@@ -141,6 +141,37 @@ fn query_formats_bare_output_file_and_budgets_are_end_to_end() {
     assert!(stdout(&table).contains("| session_id"));
     assert!(stdout(&table).contains("session-minimal"));
 
+    let metadata = environment.run([
+        "query",
+        "-d",
+        "codex",
+        "--output",
+        "json",
+        "SELECT table_name FROM aql_tables ORDER BY table_name",
+    ]);
+    assert_success(&metadata);
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&metadata.stdout).expect("parse metadata output");
+    let table_names = metadata
+        .as_array()
+        .expect("metadata output is an array")
+        .iter()
+        .filter_map(|row| row["table_name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(table_names.contains(&"aql_columns"));
+    assert!(table_names.contains(&"sessions"));
+
+    let source_metadata = environment.run([
+        "query",
+        "-d",
+        "codex",
+        "--output",
+        "json",
+        "SELECT agent_id, format_fingerprint FROM aql_sources",
+    ]);
+    assert_success(&source_metadata);
+    assert!(stdout(&source_metadata).contains("codex"));
+
     let output_directory = environment.temporary.path().join("bare-output");
     fs::create_dir(&output_directory).expect("create bare output directory");
     let output = environment

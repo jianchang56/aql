@@ -64,7 +64,11 @@ const MAX_EXPRESSIONS: usize = 256;
 const MAX_CTES: usize = 32;
 const MAX_JOINS: usize = 16;
 const QUERY_MEMORY_BYTES: usize = 256 * 1024 * 1024;
-const CANONICAL_TABLES: [&str; 7] = [
+const CANONICAL_TABLES: [&str; 11] = [
+    "aql_tables",
+    "aql_columns",
+    "aql_sources",
+    "aql_capabilities",
     "agents",
     "sessions",
     "messages",
@@ -233,6 +237,120 @@ const AGENT_QUERY_COLUMNS: &[QueryColumn] = &[
     query_column(
         "capabilities",
         QueryDataType::Json,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+];
+
+const AQL_TABLES_COLUMNS: &[QueryColumn] = &[
+    query_column(
+        "table_name",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+    query_column(
+        "table_kind",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+];
+const AQL_COLUMNS_COLUMNS: &[QueryColumn] = &[
+    query_column(
+        "table_name",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+    query_column(
+        "column_name",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+    query_column(
+        "data_type",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+    query_column(
+        "nullable",
+        QueryDataType::Bool,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+    query_column(
+        "access_class",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+];
+const AQL_SOURCES_COLUMNS: &[QueryColumn] = &[
+    query_column(
+        "source_id",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+    query_column(
+        "agent_id",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+    query_column(
+        "display_name",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+    query_column(
+        "format_fingerprint",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+    query_column(
+        "snapshot_state",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+];
+const AQL_CAPABILITIES_COLUMNS: &[QueryColumn] = &[
+    query_column(
+        "source_id",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+    query_column(
+        "table_name",
+        QueryDataType::Text,
+        false,
+        AccessClass::Safe,
+        FieldCost::Metadata,
+    ),
+    query_column(
+        "supported",
+        QueryDataType::Bool,
         false,
         AccessClass::Safe,
         FieldCost::Metadata,
@@ -818,6 +936,22 @@ const ARTIFACT_QUERY_COLUMNS: &[QueryColumn] = &[
 ];
 
 pub const QUERY_SCHEMAS: &[QueryTableSchema] = &[
+    QueryTableSchema {
+        name: "aql_tables",
+        columns: AQL_TABLES_COLUMNS,
+    },
+    QueryTableSchema {
+        name: "aql_columns",
+        columns: AQL_COLUMNS_COLUMNS,
+    },
+    QueryTableSchema {
+        name: "aql_sources",
+        columns: AQL_SOURCES_COLUMNS,
+    },
+    QueryTableSchema {
+        name: "aql_capabilities",
+        columns: AQL_CAPABILITIES_COLUMNS,
+    },
     QueryTableSchema {
         name: "agents",
         columns: AGENT_QUERY_COLUMNS,
