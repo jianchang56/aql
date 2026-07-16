@@ -6,12 +6,15 @@
 
 #![deny(missing_docs)]
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
-use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use aql_fs::{FileIdentity, identity, open_absolute_dir, open_file, set_mode, set_open_mode, sync_dir};
+use cap_std::fs::{Dir, Metadata, OpenOptions};
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -76,9 +79,6 @@ pub enum ConfigError {
     /// A standard filesystem operation failed.
     #[error("AQL config I/O failed")]
     Io(#[from] std::io::Error),
-    /// A no-follow platform filesystem operation failed.
-    #[error("AQL config platform operation failed")]
-    Platform(#[from] rustix::io::Errno),
 }
 
 /// One explicitly configured member of a named database.
@@ -117,16 +117,10 @@ impl Default for ConfigFile {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
-
 /// Open handle to an identity-checked private configuration store.
 pub struct ConfigStore {
     root: PathBuf,
-    directory: Arc<OwnedFd>,
+    directory: Arc<Dir>,
     identity: FileIdentity,
 }
 
@@ -135,7 +129,8 @@ pub struct ConfigStore {
 /// Dropping the value releases the process lock. Mutation methods consume the
 /// lock so one capability cannot authorize multiple writes.
 pub struct ConfigWriteLock {
-    directory: Arc<OwnedFd>,
+    directory: Arc<Dir>,
+    identity: FileIdentity,
     file: File,
     released: bool,
 }
@@ -150,7 +145,7 @@ impl ConfigStore {
         let prospective = prospective_root(root)?;
         validate_no_overlap(&prospective, protected_roots)?;
         let (root, directory, created) = open_or_create_private_root(&prospective)?;
-        let stat = rustix::fs::fstat(&directory)?;
+        let stat = directory.dir_metadata()?;
         validate_private_directory(&stat)?;
         if created {
             ensure_ownership_marker(&directory)?;
@@ -172,14 +167,11 @@ impl ConfigStore {
             ConfigError::Io(ref value) if value.kind() == std::io::ErrorKind::NotFound => {
                 ConfigError::Missing
             }
-            ConfigError::Platform(value) if value == rustix::io::Errno::NOENT => {
-                ConfigError::Missing
-            }
             other => other,
         })?;
         validate_no_overlap(&root, protected_roots)?;
         let directory = open_directory_chain(&root)?;
-        let stat = rustix::fs::fstat(&directory)?;
+        let stat = directory.dir_metadata()?;
         validate_private_directory(&stat)?;
         ensure_existing_ownership_marker(&directory)?;
         let store = Self {
@@ -229,34 +221,33 @@ impl ConfigStore {
     /// identity have been validated.
     pub fn acquire_write_lock(&self) -> Result<ConfigWriteLock, ConfigError> {
         self.validate_identity()?;
-        let descriptor = rustix::fs::openat(
-            &self.directory,
-            LOCK_FILE,
-            rustix::fs::OFlags::RDWR
-                | rustix::fs::OFlags::CREATE
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::from_raw_mode(0o600),
-        )?;
-        validate_private_file(&rustix::fs::fstat(&descriptor)?)?;
-        if let Err(error) = rustix::fs::flock(
-            &descriptor,
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        ) {
-            if error == rustix::io::Errno::WOULDBLOCK {
+        acquire_process_lock(self.identity)?;
+        let mut process_guard = ProcessLockGuard {
+            identity: self.identity,
+            armed: true,
+        };
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        set_open_mode(&mut options, 0o600);
+        let descriptor = open_file(&self.directory, Path::new(LOCK_FILE), options)?;
+        validate_private_file(&descriptor.metadata()?)?;
+        let mut file = descriptor.into_std();
+        if let Err(error) = file.try_lock_exclusive() {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
                 return Err(ConfigError::LockHeld);
             }
             return Err(error.into());
         }
-        let mut file: File = descriptor.into();
         file.set_len(0)?;
         writeln!(file, "pid={}", std::process::id())?;
         file.sync_all()?;
         let lock = ConfigWriteLock {
             directory: self.directory.clone(),
+            identity: self.identity,
             file,
             released: false,
         };
+        process_guard.armed = false;
         self.remove_abandoned_temps()?;
         self.validate_known_entries(true)?;
         Ok(lock)
@@ -316,13 +307,13 @@ impl ConfigStore {
     }
 
     fn validate_identity(&self) -> Result<(), ConfigError> {
-        let current = rustix::fs::fstat(&self.directory)?;
+        let current = self.directory.dir_metadata()?;
         validate_private_directory(&current)?;
         if identity(&current) != self.identity {
             return Err(ConfigError::StateChanged);
         }
         let path = open_directory_chain(&self.root)?;
-        let path_stat = rustix::fs::fstat(&path)?;
+        let path_stat = path.dir_metadata()?;
         validate_private_directory(&path_stat)?;
         if identity(&path_stat) != self.identity {
             return Err(ConfigError::StateChanged);
@@ -340,26 +331,23 @@ impl ConfigStore {
 
     fn read_config(&self) -> Result<ConfigFile, ConfigError> {
         self.validate_identity()?;
-        let descriptor = rustix::fs::openat(
-            &self.directory,
-            CONFIG_FILE,
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )
-        .map_err(|error| {
-            if error == rustix::io::Errno::NOENT {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let descriptor = open_file(&self.directory, Path::new(CONFIG_FILE), options).map_err(
+            |error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
                 ConfigError::Missing
             } else {
-                ConfigError::Platform(error)
+                ConfigError::Io(error)
             }
         })?;
-        let stat = rustix::fs::fstat(&descriptor)?;
+        let stat = descriptor.metadata()?;
         validate_private_file(&stat)?;
-        if stat.st_size < 0 || stat.st_size as u64 > MAX_CONFIG_BYTES {
+        if stat.len() > MAX_CONFIG_BYTES {
             return Err(ConfigError::InvalidConfig);
         }
-        let mut bytes = Vec::with_capacity(stat.st_size as usize);
-        let mut file: File = descriptor.into();
+        let mut bytes = Vec::with_capacity(stat.len() as usize);
+        let mut file = descriptor.into_std();
         Read::by_ref(&mut file)
             .take(MAX_CONFIG_BYTES + 1)
             .read_to_end(&mut bytes)?;
@@ -380,62 +368,46 @@ impl ConfigStore {
             return Err(ConfigError::InvalidConfig);
         }
         self.validate_identity()?;
-        let existing = match rustix::fs::statat(
-            &self.directory,
-            CONFIG_FILE,
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        ) {
+        let existing = match self.directory.symlink_metadata(CONFIG_FILE) {
             Ok(stat) => {
                 validate_private_file(&stat)?;
                 Some(identity(&stat))
             }
-            Err(error) if error == rustix::io::Errno::NOENT => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
         let temporary_name = format!("{TEMP_PREFIX}{:032x}{TEMP_SUFFIX}", rand::random::<u128>());
-        let descriptor = rustix::fs::openat(
-            &self.directory,
-            temporary_name.as_str(),
-            rustix::fs::OFlags::WRONLY
-                | rustix::fs::OFlags::CREATE
-                | rustix::fs::OFlags::EXCL
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::from_raw_mode(0o600),
-        )?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        set_open_mode(&mut options, 0o600);
+        let descriptor = open_file(&self.directory, Path::new(&temporary_name), options)?;
         let mut guard = TemporaryFile {
             directory: self.directory.clone(),
             name: temporary_name.clone(),
             committed: false,
         };
-        let mut file: File = descriptor.into();
+        let mut file = descriptor.into_std();
         file.write_all(encoded.as_bytes())?;
         file.sync_all()?;
         self.validate_identity()?;
         match (
             existing,
-            rustix::fs::statat(
-                &self.directory,
-                CONFIG_FILE,
-                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-            ),
+            self.directory.symlink_metadata(CONFIG_FILE),
         ) {
-            (None, Err(error)) if error == rustix::io::Errno::NOENT => {
-                rustix::fs::renameat_with(
-                    &self.directory,
+            (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.directory.hard_link(
                     temporary_name.as_str(),
                     &self.directory,
                     CONFIG_FILE,
-                    rustix::fs::RenameFlags::NOREPLACE,
                 )?;
+                self.directory.remove_file(temporary_name.as_str())?;
             }
             (Some(expected), Ok(actual)) => {
                 validate_private_file(&actual)?;
                 if identity(&actual) != expected {
                     return Err(ConfigError::StateChanged);
                 }
-                rustix::fs::renameat(
-                    &self.directory,
+                self.directory.rename(
                     temporary_name.as_str(),
                     &self.directory,
                     CONFIG_FILE,
@@ -443,37 +415,33 @@ impl ConfigStore {
             }
             _ => return Err(ConfigError::StateChanged),
         }
-        rustix::fs::fsync(&self.directory)?;
+        sync_dir(&self.directory)?;
         guard.committed = true;
         Ok(())
     }
 
     fn remove_abandoned_temps(&self) -> Result<(), ConfigError> {
         self.validate_identity()?;
-        for entry in fs::read_dir(&self.root)? {
+        for entry in self.directory.read_dir(".")? {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 return Err(ConfigError::UnknownFile);
             };
             if is_temporary_name(name) {
-                let stat = rustix::fs::statat(
-                    &self.directory,
-                    name,
-                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-                )?;
+                let stat = self.directory.symlink_metadata(name)?;
                 validate_private_file(&stat)?;
-                rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty())?;
+                self.directory.remove_file(name)?;
             }
         }
-        rustix::fs::fsync(&self.directory)?;
+        sync_dir(&self.directory)?;
         self.validate_identity()
     }
 
     fn validate_known_entries(&self, allow_missing_config: bool) -> Result<(), ConfigError> {
         self.validate_identity()?;
         let mut config_seen = false;
-        for entry in fs::read_dir(&self.root)? {
+        for entry in self.directory.read_dir(".")? {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
@@ -483,8 +451,7 @@ impl ConfigStore {
             {
                 return Err(ConfigError::UnknownFile);
             }
-            let stat =
-                rustix::fs::statat(&self.directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+            let stat = self.directory.symlink_metadata(name)?;
             validate_private_file(&stat)?;
             config_seen |= name == CONFIG_FILE;
         }
@@ -500,7 +467,8 @@ impl ConfigWriteLock {
     /// Flushes lock state and explicitly releases the exclusive lock.
     pub fn release(mut self) -> Result<(), ConfigError> {
         self.file.sync_all()?;
-        rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock)?;
+        self.file.unlock()?;
+        release_process_lock(self.identity);
         self.released = true;
         Ok(())
     }
@@ -509,13 +477,46 @@ impl ConfigWriteLock {
 impl Drop for ConfigWriteLock {
     fn drop(&mut self) {
         if !self.released {
-            let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+            let _ = self.file.unlock();
+            release_process_lock(self.identity);
+        }
+    }
+}
+
+fn process_locks() -> &'static Mutex<HashSet<FileIdentity>> {
+    static LOCKS: OnceLock<Mutex<HashSet<FileIdentity>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn acquire_process_lock(identity: FileIdentity) -> Result<(), ConfigError> {
+    let mut locks = process_locks().lock().map_err(|_| ConfigError::LockHeld)?;
+    if !locks.insert(identity) {
+        return Err(ConfigError::LockHeld);
+    }
+    Ok(())
+}
+
+fn release_process_lock(identity: FileIdentity) {
+    if let Ok(mut locks) = process_locks().lock() {
+        locks.remove(&identity);
+    }
+}
+
+struct ProcessLockGuard {
+    identity: FileIdentity,
+    armed: bool,
+}
+
+impl Drop for ProcessLockGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            release_process_lock(self.identity);
         }
     }
 }
 
 struct TemporaryFile {
-    directory: Arc<OwnedFd>,
+    directory: Arc<Dir>,
     name: String,
     committed: bool,
 }
@@ -523,11 +524,7 @@ struct TemporaryFile {
 impl Drop for TemporaryFile {
     fn drop(&mut self) {
         if !self.committed {
-            let _ = rustix::fs::unlinkat(
-                &self.directory,
-                self.name.as_str(),
-                rustix::fs::AtFlags::empty(),
-            );
+            let _ = self.directory.remove_file(self.name.as_str());
         }
     }
 }
@@ -647,91 +644,47 @@ fn prospective_root(path: &Path) -> Result<PathBuf, ConfigError> {
 }
 
 fn canonicalize_no_symlink(path: &Path) -> Result<PathBuf, ConfigError> {
-    drop(open_directory_chain(path)?);
+    drop(open_absolute_dir(path)?);
     let canonical = fs::canonicalize(path)?;
     Ok(canonical)
 }
 
-fn open_or_create_private_root(path: &Path) -> Result<(PathBuf, OwnedFd, bool), ConfigError> {
+fn open_or_create_private_root(path: &Path) -> Result<(PathBuf, Dir, bool), ConfigError> {
     let parent = path.parent().ok_or(ConfigError::UnsafeRoot)?;
     let name = path
         .file_name()
         .filter(|name| !name.is_empty())
         .ok_or(ConfigError::UnsafeRoot)?;
-    let parent_directory = open_directory_chain(parent)?;
-    let created = match rustix::fs::mkdirat(
-        &parent_directory,
-        name,
-        rustix::fs::Mode::from_raw_mode(0o700),
-    ) {
-        Ok(()) => true,
-        Err(error) if error == rustix::io::Errno::EXIST => false,
+    let parent_directory = open_absolute_dir(parent)?;
+    let created = match parent_directory.create_dir(name) {
+        Ok(()) => {
+            set_mode(path, 0o700)?;
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(error) => return Err(error.into()),
     };
-    let directory = rustix::fs::openat(
-        &parent_directory,
-        name,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )?;
-    validate_private_directory(&rustix::fs::fstat(&directory)?)?;
+    let directory = aql_fs::open_relative_dir(&parent_directory, Path::new(name))?;
+    validate_private_directory(&directory.dir_metadata()?)?;
     Ok((path.to_path_buf(), directory, created))
 }
 
-fn open_directory_chain(path: &Path) -> Result<OwnedFd, ConfigError> {
-    if !path.is_absolute() {
-        return Err(ConfigError::UnsafeRoot);
-    }
-    let mut directory = rustix::fs::openat(
-        rustix::fs::CWD,
-        "/",
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )?;
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => {
-                directory = rustix::fs::openat(
-                    &directory,
-                    name,
-                    rustix::fs::OFlags::RDONLY
-                        | rustix::fs::OFlags::DIRECTORY
-                        | rustix::fs::OFlags::NOFOLLOW
-                        | rustix::fs::OFlags::CLOEXEC,
-                    rustix::fs::Mode::empty(),
-                )?;
-            }
-            _ => return Err(ConfigError::UnsafeRoot),
-        }
-    }
-    Ok(directory)
+fn open_directory_chain(path: &Path) -> Result<Dir, ConfigError> {
+    open_absolute_dir(path).map_err(ConfigError::Io)
 }
 
-fn ensure_ownership_marker(directory: &OwnedFd) -> Result<(), ConfigError> {
-    match rustix::fs::openat(
-        directory,
-        OWNERSHIP_FILE,
-        rustix::fs::OFlags::WRONLY
-            | rustix::fs::OFlags::CREATE
-            | rustix::fs::OFlags::EXCL
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::from_raw_mode(0o600),
-    ) {
+fn ensure_ownership_marker(directory: &Dir) -> Result<(), ConfigError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    set_open_mode(&mut options, 0o600);
+    match open_file(directory, Path::new(OWNERSHIP_FILE), options) {
         Ok(descriptor) => {
-            let mut file: File = descriptor.into();
+            let mut file = descriptor.into_std();
             file.write_all(OWNERSHIP_MARKER)?;
             file.sync_all()?;
-            rustix::fs::fsync(directory)?;
+            sync_dir(directory)?;
         }
-        Err(error) if error == rustix::io::Errno::EXIST => {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             ensure_existing_ownership_marker(directory)?;
         }
         Err(error) => return Err(error.into()),
@@ -739,23 +692,19 @@ fn ensure_ownership_marker(directory: &OwnedFd) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn ensure_existing_ownership_marker(directory: &OwnedFd) -> Result<(), ConfigError> {
-    let descriptor = rustix::fs::openat(
-        directory,
-        OWNERSHIP_FILE,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )
-    .map_err(|error| {
-        if error == rustix::io::Errno::NOENT {
+fn ensure_existing_ownership_marker(directory: &Dir) -> Result<(), ConfigError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    let descriptor = open_file(directory, Path::new(OWNERSHIP_FILE), options).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
             ConfigError::InvalidOwnershipMarker
         } else {
-            ConfigError::Platform(error)
+            ConfigError::Io(error)
         }
     })?;
-    validate_private_file(&rustix::fs::fstat(&descriptor)?)?;
+    validate_private_file(&descriptor.metadata()?)?;
     let mut marker = Vec::new();
-    let mut file: File = descriptor.into();
+    let mut file = descriptor.into_std();
     Read::by_ref(&mut file)
         .take(OWNERSHIP_MARKER.len() as u64 + 1)
         .read_to_end(&mut marker)?;
@@ -765,34 +714,18 @@ fn ensure_existing_ownership_marker(directory: &OwnedFd) -> Result<(), ConfigErr
     Ok(())
 }
 
-fn validate_private_directory(stat: &rustix::fs::Stat) -> Result<(), ConfigError> {
-    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory
-        || stat.st_mode & 0o077 != 0
-    {
+fn validate_private_directory(metadata: &Metadata) -> Result<(), ConfigError> {
+    if !metadata.is_dir() || aql_fs::mode(metadata).is_some_and(|mode| mode & 0o077 != 0) {
         return Err(ConfigError::UnsafeRoot);
     }
     Ok(())
 }
 
-fn validate_private_file(stat: &rustix::fs::Stat) -> Result<(), ConfigError> {
-    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
-        || stat.st_mode & 0o077 != 0
-    {
+fn validate_private_file(metadata: &Metadata) -> Result<(), ConfigError> {
+    if !metadata.is_file() || aql_fs::mode(metadata).is_some_and(|mode| mode & 0o077 != 0) {
         return Err(ConfigError::UnsafeRoot);
     }
     Ok(())
-}
-
-fn identity(stat: &rustix::fs::Stat) -> FileIdentity {
-    #[cfg(target_os = "linux")]
-    let device = stat.st_dev;
-    #[cfg(not(target_os = "linux"))]
-    let device = stat.st_dev as u64;
-
-    FileIdentity {
-        device,
-        inode: stat.st_ino,
-    }
 }
 
 fn is_temporary_name(name: &str) -> bool {
@@ -805,9 +738,31 @@ fn is_temporary_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{PermissionsExt, symlink};
-
     use super::*;
+
+    #[cfg(unix)]
+    fn symlink_file(source: &Path, target: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(source, target)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(source: &Path, target: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(source, target)
+    }
+
+    #[cfg(unix)]
+    fn symlink_dir(source: &Path, target: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(source, target)
+    }
+
+    #[cfg(windows)]
+    fn symlink_dir(source: &Path, target: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(source, target)
+    }
+
+    fn synthetic(name: &str) -> PathBuf {
+        std::env::temp_dir().join("aql-config-synthetic").join(name)
+    }
 
     fn root() -> PathBuf {
         let temporary = fs::canonicalize(std::env::temp_dir()).expect("temp root canonicalizes");
@@ -817,8 +772,7 @@ mod tests {
             rand::random::<u64>()
         ));
         fs::create_dir(&root).expect("test parent is created");
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-            .expect("test parent is private");
+        set_mode(&root, 0o700).expect("test parent is private");
         root
     }
 
@@ -851,7 +805,7 @@ mod tests {
             members: (0..=MAX_MEMBERS_PER_DATABASE)
                 .map(|index| DatabaseMember {
                     adapter_id: "codex".to_string(),
-                    root: PathBuf::from(format!("/synthetic/{index}")),
+                    root: synthetic(&index.to_string()),
                 })
                 .collect(),
         };
@@ -863,7 +817,7 @@ mod tests {
             name: "daily".to_string(),
             members: vec![DatabaseMember {
                 adapter_id: "unknown".to_string(),
-                root: PathBuf::from("/synthetic"),
+                root: synthetic("unknown"),
             }],
         };
         assert!(matches!(
@@ -874,7 +828,7 @@ mod tests {
             name: "claude".to_string(),
             members: vec![DatabaseMember {
                 adapter_id: "claude-code".to_string(),
-                root: PathBuf::from("/synthetic/claude"),
+                root: synthetic("claude"),
             }],
         };
         assert!(validate_database_shape(&claude).is_ok());
@@ -885,8 +839,7 @@ mod tests {
         let root = root();
         let unowned = root.join("unowned");
         fs::create_dir(&unowned).expect("unowned directory creates");
-        fs::set_permissions(&unowned, fs::Permissions::from_mode(0o700))
-            .expect("unowned directory is private");
+        set_mode(&unowned, 0o700).expect("unowned directory is private");
         assert!(matches!(
             ConfigStore::create(&unowned, &[]),
             Err(ConfigError::InvalidOwnershipMarker)
@@ -895,10 +848,9 @@ mod tests {
 
         let real_parent = root.join("real-parent");
         fs::create_dir(&real_parent).expect("real parent creates");
-        fs::set_permissions(&real_parent, fs::Permissions::from_mode(0o700))
-            .expect("real parent is private");
+        set_mode(&real_parent, 0o700).expect("real parent is private");
         let linked_parent = root.join("linked-parent");
-        symlink(&real_parent, &linked_parent).expect("parent symlink creates");
+        symlink_dir(&real_parent, &linked_parent).expect("parent symlink creates");
         assert!(ConfigStore::create(&linked_parent.join("config"), &[]).is_err());
         assert!(!real_parent.join("config").exists());
         fs::remove_dir_all(root).expect("test root is removed");
@@ -917,17 +869,22 @@ mod tests {
         assert_eq!(store.list().expect("databases list").len(), 1);
         let bytes = fs::read(config_root.join(CONFIG_FILE)).expect("config is readable");
         assert!(bytes.starts_with(b"schema_version = \"aql-databases-v1\""));
-        assert_eq!(
-            fs::metadata(config_root.join(CONFIG_FILE))
-                .expect("config metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(config_root.join(CONFIG_FILE))
+                    .expect("config metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         let lock = store.acquire_write_lock().expect("writer locks");
         store.remove("daily", lock).expect("database removes");
         assert!(store.list().expect("databases list").is_empty());
+        drop(store);
         fs::remove_dir_all(root).expect("test root is removed");
     }
 
@@ -958,17 +915,14 @@ mod tests {
             "schema_version = \"future\"\ndatabases = []\n",
         )
         .expect("future config writes");
-        fs::set_permissions(
-            config_root.join(CONFIG_FILE),
-            fs::Permissions::from_mode(0o600),
-        )
-        .expect("future config is private");
+        set_mode(&config_root.join(CONFIG_FILE), 0o600).expect("future config is private");
         assert!(matches!(store.list(), Err(ConfigError::UnsupportedSchema)));
         fs::write(config_root.join("unknown"), b"user file").expect("unknown file writes");
         assert!(matches!(
             ConfigStore::open_existing(&config_root, &[]),
             Err(ConfigError::UnknownFile)
         ));
+        drop(store);
         fs::remove_dir_all(root).expect("test root is removed");
     }
 
@@ -986,22 +940,29 @@ mod tests {
 
         let outside = root.join("outside");
         fs::write(&outside, b"outside").expect("outside file writes");
-        symlink(&outside, config_root.join(CONFIG_FILE)).expect("config symlink creates");
+        symlink_file(&outside, &config_root.join(CONFIG_FILE)).expect("config symlink creates");
         assert!(store.list().is_err());
         fs::remove_file(config_root.join(CONFIG_FILE)).expect("symlink removes");
 
-        fs::set_permissions(&config_root, fs::Permissions::from_mode(0o777))
-            .expect("permissions change");
-        assert!(matches!(store.list(), Err(ConfigError::UnsafeRoot)));
-        fs::set_permissions(&config_root, fs::Permissions::from_mode(0o700))
-            .expect("permissions restore");
+        #[cfg(unix)]
+        {
+            set_mode(&config_root, 0o777).expect("permissions change");
+            assert!(matches!(store.list(), Err(ConfigError::UnsafeRoot)));
+            set_mode(&config_root, 0o700).expect("permissions restore");
+        }
 
         let moved = root.join("moved");
-        fs::rename(&config_root, &moved).expect("config root moves");
-        fs::create_dir(&config_root).expect("replacement root creates");
-        fs::set_permissions(&config_root, fs::Permissions::from_mode(0o700))
-            .expect("replacement root is private");
-        assert!(matches!(store.list(), Err(ConfigError::StateChanged)));
+        match fs::rename(&config_root, &moved) {
+            Ok(()) => {
+                fs::create_dir(&config_root).expect("replacement root creates");
+                set_mode(&config_root, 0o700).expect("replacement root is private");
+                assert!(matches!(store.list(), Err(ConfigError::StateChanged)));
+            }
+            Err(_) => {
+                assert!(store.validate_identity().is_ok());
+            }
+        }
+        drop(store);
         fs::remove_dir_all(root).expect("test root is removed");
     }
 
@@ -1011,11 +972,7 @@ mod tests {
         let config_root = root.join("config");
         let store = ConfigStore::create(&config_root, &[]).expect("config store creates");
         let oversized = File::create(config_root.join(CONFIG_FILE)).expect("config creates");
-        fs::set_permissions(
-            config_root.join(CONFIG_FILE),
-            fs::Permissions::from_mode(0o600),
-        )
-        .expect("config is private");
+        set_mode(&config_root.join(CONFIG_FILE), 0o600).expect("config is private");
         oversized
             .set_len(MAX_CONFIG_BYTES + 1)
             .expect("config grows");
@@ -1023,11 +980,11 @@ mod tests {
         fs::remove_file(config_root.join(CONFIG_FILE)).expect("oversized config removes");
         let abandoned = config_root.join(format!("{TEMP_PREFIX}{:032x}{TEMP_SUFFIX}", 1));
         fs::write(&abandoned, b"partial").expect("abandoned temp writes");
-        fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o600))
-            .expect("abandoned temp is private");
+        set_mode(&abandoned, 0o600).expect("abandoned temp is private");
         let lock = store.acquire_write_lock().expect("writer recovers temp");
         assert!(!abandoned.exists());
         lock.release().expect("writer unlocks");
+        drop(store);
         fs::remove_dir_all(root).expect("test root is removed");
     }
 }

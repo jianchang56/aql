@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/aql-fs",
     "crates/aql-model",
     "crates/aql-adapter-api",
     "crates/aql-catalog",
@@ -24,6 +25,8 @@ version = "0.1.0"
 
 [workspace.dependencies]
 async-trait = "0.1"
+cap-fs-ext = "4.0.2"
+cap-std = "4.0.2"
 chrono = "0.4"
 clap = "4.6.2"
 clap_complete = "4.6.7"
@@ -31,6 +34,7 @@ clap_mangen = "0.3.0"
 datafusion = { version = "54.0.0", default-features = false }
 flate2 = { version = "1.1.9", default-features = false }
 futures = "0.3"
+fs2 = "0.4.3"
 hex = "0.4"
 hmac = "0.13"
 humantime = "2.4"
