@@ -267,23 +267,16 @@ pub fn rename_noreplace(from_dir: &Dir, from: &Path, to_dir: &Dir, to: &Path) ->
 
 /// Atomically renames an ambient path while refusing to replace an existing target.
 pub fn rename_ambient_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let from_parent = open_dir(from.parent().ok_or_else(invalid_path)?)?;
-        let to_parent = open_dir(to.parent().ok_or_else(invalid_path)?)?;
-        let from_name = from.file_name().ok_or_else(invalid_path)?;
-        let to_name = to.file_name().ok_or_else(invalid_path)?;
-        rename_noreplace(
-            &from_parent,
-            Path::new(from_name),
-            &to_parent,
-            Path::new(to_name),
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::rename(from, to)
-    }
+    let from_parent = open_dir(from.parent().ok_or_else(invalid_path)?)?;
+    let to_parent = open_dir(to.parent().ok_or_else(invalid_path)?)?;
+    let from_name = from.file_name().ok_or_else(invalid_path)?;
+    let to_name = to.file_name().ok_or_else(invalid_path)?;
+    rename_noreplace(
+        &from_parent,
+        Path::new(from_name),
+        &to_parent,
+        Path::new(to_name),
+    )
 }
 
 fn split_absolute(path: &Path) -> io::Result<(PathBuf, Vec<&OsStr>)> {
