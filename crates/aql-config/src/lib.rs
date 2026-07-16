@@ -1,4 +1,10 @@
 //! Private, versioned storage for named AQL databases.
+//!
+//! The store owns a private directory, rejects symlinks and unexpected files,
+//! validates database-member overlap before publication, and uses a
+//! non-blocking process lock plus atomic replacement for writes.
+
+#![deny(missing_docs)]
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -9,9 +15,13 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Current on-disk schema identifier for configured databases.
 pub const CONFIG_SCHEMA_VERSION: &str = "aql-databases-v1";
+/// Maximum accepted serialized configuration size.
 pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+/// Maximum configured databases in one store.
 pub const MAX_DATABASES: usize = 64;
+/// Maximum source members in one configured database.
 pub const MAX_MEMBERS_PER_DATABASE: usize = 16;
 
 const CONFIG_FILE: &str = "config.toml";
@@ -21,51 +31,73 @@ const OWNERSHIP_MARKER: &[u8] = b"aql-databases-owned-v1\n";
 const TEMP_PREFIX: &str = ".config-building-";
 const TEMP_SUFFIX: &str = ".toml";
 
+/// Sanitized failures returned by the private configuration store.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    /// The store or required configuration file does not exist.
     #[error("AQL config is missing")]
     Missing,
+    /// The store path, type, ownership, or permissions are unsafe.
     #[error("AQL config root has unsafe permissions, type, or path components")]
     UnsafeRoot,
+    /// The store or a database member overlaps protected data.
     #[error("AQL config root overlaps protected data")]
     RootOverlap,
+    /// The store is not marked as owned by AQL.
     #[error("AQL config ownership marker is missing or invalid")]
     InvalidOwnershipMarker,
+    /// The private store contains a file outside its fixed allowlist.
     #[error("AQL config contains unknown files")]
     UnknownFile,
+    /// The configuration exceeds limits or violates its structural contract.
     #[error("AQL config schema or contents are invalid")]
     InvalidConfig,
+    /// The stored schema version is not supported.
     #[error("AQL config schema is unsupported")]
     UnsupportedSchema,
+    /// A database name violates the public naming grammar.
     #[error("AQL database name is invalid")]
     InvalidDatabaseName,
+    /// A database with the requested name already exists.
     #[error("AQL database already exists")]
     DatabaseExists,
+    /// The requested configured database does not exist.
     #[error("AQL database is missing")]
     DatabaseMissing,
+    /// A database member has an unknown adapter, unsafe root, or invalid count.
     #[error("AQL database member is invalid")]
     InvalidMember,
+    /// Another process currently owns the non-blocking write lock.
     #[error("AQL config writer is already active")]
     LockHeld,
+    /// Store identity changed during an operation.
     #[error("AQL config changed during the operation")]
     StateChanged,
+    /// A standard filesystem operation failed.
     #[error("AQL config I/O failed")]
     Io(#[from] std::io::Error),
+    /// A no-follow platform filesystem operation failed.
     #[error("AQL config platform operation failed")]
     Platform(#[from] rustix::io::Errno),
 }
 
+/// One explicitly configured member of a named database.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseMember {
+    /// Stable adapter identifier.
     pub adapter_id: String,
+    /// Absolute, normalized source root.
     pub root: PathBuf,
 }
 
+/// A user-defined database composed of one or more explicit source members.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Database {
+    /// Public database name used with `aql -d`.
     pub name: String,
+    /// Explicit, non-overlapping source members.
     pub members: Vec<DatabaseMember>,
 }
 
@@ -91,12 +123,17 @@ struct FileIdentity {
     inode: u64,
 }
 
+/// Open handle to an identity-checked private configuration store.
 pub struct ConfigStore {
     root: PathBuf,
     directory: Arc<OwnedFd>,
     identity: FileIdentity,
 }
 
+/// Exclusive write capability acquired from a [`ConfigStore`].
+///
+/// Dropping the value releases the process lock. Mutation methods consume the
+/// lock so one capability cannot authorize multiple writes.
 pub struct ConfigWriteLock {
     directory: Arc<OwnedFd>,
     file: File,
@@ -104,6 +141,11 @@ pub struct ConfigWriteLock {
 }
 
 impl ConfigStore {
+    /// Creates or opens an AQL-owned private store at `root`.
+    ///
+    /// The root must not overlap any protected Agent or AQL data root. Existing
+    /// directories are accepted only when they contain the exact ownership
+    /// marker and allowed files.
     pub fn create(root: &Path, protected_roots: &[PathBuf]) -> Result<Self, ConfigError> {
         let prospective = prospective_root(root)?;
         validate_no_overlap(&prospective, protected_roots)?;
@@ -124,6 +166,7 @@ impl ConfigStore {
         Ok(store)
     }
 
+    /// Opens an existing AQL-owned private store without creating files.
     pub fn open_existing(root: &Path, protected_roots: &[PathBuf]) -> Result<Self, ConfigError> {
         let root = canonicalize_no_symlink(root).map_err(|error| match error {
             ConfigError::Io(ref value) if value.kind() == std::io::ErrorKind::NotFound => {
@@ -148,15 +191,18 @@ impl ConfigStore {
         Ok(store)
     }
 
+    /// Returns the canonical configuration root.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Lists configured databases in deterministic name order.
     pub fn list(&self) -> Result<Vec<Database>, ConfigError> {
         Ok(self.read_config()?.databases)
     }
 
+    /// Returns one configured database by exact name.
     pub fn get(&self, name: &str) -> Result<Database, ConfigError> {
         validate_database_name(name)?;
         self.read_config()?
@@ -166,6 +212,7 @@ impl ConfigStore {
             .ok_or(ConfigError::DatabaseMissing)
     }
 
+    /// Returns a database after revalidating all member roots and overlaps.
     pub fn get_validated(
         &self,
         name: &str,
@@ -176,6 +223,10 @@ impl ConfigStore {
         Ok(database)
     }
 
+    /// Acquires the store's non-blocking exclusive write lock.
+    ///
+    /// Abandoned temporary files are removed only after the lock and store
+    /// identity have been validated.
     pub fn acquire_write_lock(&self) -> Result<ConfigWriteLock, ConfigError> {
         self.validate_identity()?;
         let descriptor = rustix::fs::openat(
@@ -211,6 +262,9 @@ impl ConfigStore {
         Ok(lock)
     }
 
+    /// Atomically adds a validated configured database.
+    ///
+    /// The consumed lock must have been acquired from this store.
     pub fn add(
         &self,
         database: Database,
@@ -239,6 +293,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Atomically removes a configured database by exact name.
     pub fn remove(&self, name: &str, lock: ConfigWriteLock) -> Result<(), ConfigError> {
         self.validate_lock(&lock)?;
         validate_database_name(name)?;
@@ -442,6 +497,7 @@ impl ConfigStore {
 }
 
 impl ConfigWriteLock {
+    /// Flushes lock state and explicitly releases the exclusive lock.
     pub fn release(mut self) -> Result<(), ConfigError> {
         self.file.sync_all()?;
         rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock)?;
@@ -532,6 +588,19 @@ fn validate_database_shape(database: &Database) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Validates the public configured-database naming grammar.
+///
+/// Names are 1–64 ASCII characters, start with a lowercase letter, and contain
+/// only lowercase letters, digits, `_`, or `-`.
+///
+/// # Examples
+///
+/// ```
+/// use aql_config::validate_database_name;
+///
+/// assert!(validate_database_name("local-agents").is_ok());
+/// assert!(validate_database_name("Local Agents").is_err());
+/// ```
 pub fn validate_database_name(name: &str) -> Result<(), ConfigError> {
     let bytes = name.as_bytes();
     if bytes.is_empty()

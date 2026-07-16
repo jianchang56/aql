@@ -1,3 +1,12 @@
+//! Read-only canonical SQL planning and execution for AQL.
+//!
+//! The engine validates one SELECT/CTE query, rewrites safe wildcards,
+//! authorizes canonical columns before adapters read sensitive data, binds
+//! explicitly probed sources, and executes under shared resource limits with
+//! transactional result publication delegated to the caller.
+
+#![deny(missing_docs)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{
@@ -161,27 +170,42 @@ const ALLOWED_FUNCTIONS: [&str; 22] = [
     "mask_path",
 ];
 
+/// Logical data types exposed by AQL's canonical query schema.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryDataType {
+    /// UTF-8 text.
     Text,
+    /// Signed 64-bit integer.
     Int64,
+    /// Boolean value.
     Bool,
+    /// UTC timestamp with millisecond precision.
     Timestamp,
+    /// JSON value serialized through Arrow's text representation.
     Json,
 }
 
+/// Public metadata for one canonical query column.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryColumn {
+    /// Stable SQL column name.
     pub name: &'static str,
+    /// Logical column type.
     pub data_type: QueryDataType,
+    /// Whether SQL `NULL` is permitted.
     pub nullable: bool,
+    /// Grant required before the source value may be read.
     pub access: AccessClass,
+    /// Expected scan or computation cost.
     pub cost: FieldCost,
 }
 
+/// Public schema for one canonical or AQL metadata table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryTableSchema {
+    /// Stable SQL table name.
     pub name: &'static str,
+    /// Ordered public columns.
     pub columns: &'static [QueryColumn],
 }
 
@@ -945,6 +969,7 @@ const ARTIFACT_QUERY_COLUMNS: &[QueryColumn] = &[
     ),
 ];
 
+/// Canonical schemas accepted by the SQL firewall and registered in DataFusion.
 pub const QUERY_SCHEMAS: &[QueryTableSchema] = &[
     QueryTableSchema {
         name: "aql_tables",
@@ -1142,12 +1167,18 @@ fn apply_string_udf(
     }
 }
 
+/// Per-query authorization, budget, cancellation, memory, and redaction settings.
 #[derive(Clone)]
 pub struct QueryOptions {
+    /// Session grants available to projection authorization.
     pub access: AccessGrant,
+    /// Shared source and output resource budget.
     pub budget: ResourceBudget,
+    /// Shared cooperative cancellation token.
     pub cancellation: CancellationToken,
+    /// Maximum in-memory bytes available to DataFusion.
     pub max_memory_bytes: usize,
+    /// Installation-local salt used by privacy functions.
     pub redaction_salt: Vec<u8>,
 }
 
@@ -1163,6 +1194,7 @@ impl Default for QueryOptions {
     }
 }
 
+/// Authorized logical query ready to bind to explicitly probed sources.
 pub struct PreparedQuery {
     context: SessionContext,
     plan: LogicalPlan,
@@ -1172,50 +1204,82 @@ pub struct PreparedQuery {
     plan_summary: PlanSummary,
 }
 
+/// Query-wide diagnostics and final resource usage.
 #[derive(Clone, Debug, Default)]
 pub struct QueryMetadata {
+    /// Bound installation-scoped source IDs.
     pub source_ids: Vec<String>,
+    /// Sanitized warnings emitted by probes, scans, and reconciliation.
     pub warnings: Vec<String>,
+    /// Per-table, per-source scan diagnostics.
     pub scans: Vec<ScanMetadata>,
+    /// Canonical records consumed after stream completion.
     pub records_scanned: u64,
+    /// Source bytes read after stream completion.
     pub bytes_read: u64,
+    /// Output bytes charged by the renderer.
     pub output_bytes: u64,
 }
 
+/// Diagnostics for one adapter scan participating in a query.
 #[derive(Clone, Debug)]
 pub struct ScanMetadata {
+    /// Canonical table scanned.
     pub table: String,
+    /// Installation-scoped source ID.
     pub source_id: String,
+    /// Accuracy reported for each predicate pushdown.
     pub predicate_pushdown: Vec<String>,
+    /// Accuracy reported for limit pushdown.
     pub limit_pushdown: Option<String>,
+    /// Accuracy reported for each ordering pushdown.
     pub ordering_pushdown: Vec<String>,
+    /// Snapshot consistency reported by the adapter.
     pub snapshot_strength: String,
+    /// Whether the adapter reported a stale snapshot.
     pub stale: bool,
 }
 
+/// Explain-style summary produced before any source is bound or opened.
 #[derive(Clone, Debug, Default)]
 pub struct PlanSummary {
+    /// Canonical tables referenced by the plan.
     pub tables: Vec<String>,
+    /// Canonical columns referenced directly or through expressions.
     pub columns: Vec<String>,
+    /// Access classes required by the plan.
     pub required_access: Vec<String>,
+    /// Human-readable reasons each access class is required.
     pub access_reasons: Vec<String>,
+    /// Planner hints that may be offered to adapters.
     pub pushdown: Vec<String>,
+    /// Shared record limit.
     pub max_records: u64,
+    /// Shared source-byte limit.
     pub max_bytes_read: u64,
+    /// Shared output-byte limit.
     pub max_output_bytes: u64,
+    /// DataFusion memory limit.
     pub max_memory_bytes: usize,
 }
 
+/// Fully materialized query batches and finalized metadata.
 pub struct QueryResult {
+    /// Arrow record batches in query order.
     pub batches: Vec<RecordBatch>,
+    /// Metadata finalized after consuming the complete stream.
     pub metadata: QueryMetadata,
 }
 
+/// Streaming query output and a handle that finalizes metadata at EOF.
 pub struct StreamingQueryResult {
+    /// Arrow record-batch stream.
     pub stream: SendableRecordBatchStream,
+    /// Metadata handle that succeeds only after `stream` reaches EOF.
     pub metadata: QueryMetadataHandle,
 }
 
+/// Finalizes resource usage and diagnostics after a stream reaches EOF.
 pub struct QueryMetadataHandle {
     metadata: Arc<Mutex<QueryMetadata>>,
     options: QueryOptions,
@@ -1223,6 +1287,10 @@ pub struct QueryMetadataHandle {
 }
 
 impl QueryMetadataHandle {
+    /// Returns finalized metadata after the associated stream was fully consumed.
+    ///
+    /// Returns [`QueryError::SqlRejected`] if a caller attempts to publish
+    /// metadata for a partial stream.
     pub fn finish(self) -> std::result::Result<QueryMetadata, QueryError> {
         if !self.stream_complete.load(Ordering::Acquire) {
             return Err(sql_rejected(
@@ -1245,9 +1313,12 @@ impl QueryMetadataHandle {
     }
 }
 
+/// One adapter permanently bound to the manifest it produced during probing.
 #[derive(Clone)]
 pub struct FederatedSource {
+    /// Adapter that produced and owns the manifest.
     pub adapter: Arc<dyn AgentAdapter>,
+    /// Manifest to scan through `adapter`.
     pub manifest: SourceManifest,
 }
 
@@ -1261,11 +1332,16 @@ impl std::fmt::Debug for PreparedQuery {
 }
 
 impl PreparedQuery {
+    /// Returns the authorized, source-free plan summary.
     #[must_use]
     pub fn plan_summary(&self) -> &PlanSummary {
         &self.plan_summary
     }
 
+    /// Executes the query and materializes all Arrow batches.
+    ///
+    /// No partial result is returned if binding, scanning, execution, or stream
+    /// finalization fails.
     pub async fn execute(
         self,
         sources: Vec<FederatedSource>,
@@ -1278,6 +1354,10 @@ impl PreparedQuery {
         })
     }
 
+    /// Executes the query as a lazy Arrow stream.
+    ///
+    /// Every supplied manifest must remain paired with the adapter that probed
+    /// it. Metadata can be finalized only after the returned stream reaches EOF.
     pub async fn execute_stream(
         self,
         sources: Vec<FederatedSource>,
@@ -1335,6 +1415,10 @@ impl PreparedQuery {
     }
 }
 
+/// Validates, authorizes, and plans one query without opening Agent sources.
+///
+/// The returned [`PreparedQuery`] can be inspected through
+/// [`PreparedQuery::plan_summary`] before explicitly probed sources are bound.
 pub async fn prepare_query(
     sql: &ValidatedSql,
     options: QueryOptions,

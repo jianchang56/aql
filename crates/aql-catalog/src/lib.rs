@@ -1,4 +1,10 @@
 //! Source catalog and canonical-record reconciliation.
+//!
+//! Reconciliation merges observations of the same canonical session while
+//! retaining provenance and reporting conflicts instead of silently choosing a
+//! source value.
+
+#![deny(missing_docs)]
 
 use std::collections::BTreeMap;
 
@@ -7,29 +13,44 @@ use aql_model::{CanonicalRecord, EntityId, SessionRecord, SnapshotState};
 pub use aql_adapter_api as adapter_api;
 pub use aql_model as model;
 
+/// Stable category for a reconciliation warning.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogWarningKind {
+    /// Two observations disagree about a canonical field.
     FieldConflict,
+    /// At least one observation came from a stale source snapshot.
     StaleSnapshot,
 }
 
+/// Non-fatal issue detected while reconciling canonical entities.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogWarning {
+    /// Stable warning category.
     pub kind: CatalogWarningKind,
+    /// Canonical entity affected by the warning.
     pub entity_id: EntityId,
+    /// Conflicting canonical field, or `None` for entity-wide warnings.
     pub field: Option<String>,
 }
 
+/// Sessions and warnings produced by one reconciliation pass.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReconcileResult {
+    /// One merged record per canonical session ID.
     pub records: Vec<SessionRecord>,
+    /// Conflicts and stale-snapshot observations encountered during the pass.
     pub warnings: Vec<CatalogWarning>,
 }
 
+/// Stateless reconciler for canonical records from multiple bound sources.
 #[derive(Default)]
 pub struct Catalog;
 
 impl Catalog {
+    /// Reconciles session records by canonical ID and source authority.
+    ///
+    /// Non-session records are ignored. Conflicting values emit warnings; the
+    /// value with the strongest recorded provenance is retained.
     #[must_use]
     pub fn reconcile_sessions(&self, records: Vec<CanonicalRecord>) -> ReconcileResult {
         let mut sessions: BTreeMap<EntityId, SessionRecord> = BTreeMap::new();

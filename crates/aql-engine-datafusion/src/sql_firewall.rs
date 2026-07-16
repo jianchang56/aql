@@ -1,14 +1,37 @@
 use super::*;
 
+/// Scalar value accepted for a named SQL parameter.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SqlParameter {
+    /// SQL `NULL`.
     Null,
+    /// Boolean value.
     Bool(bool),
+    /// Signed 64-bit integer.
     Int64(i64),
+    /// Finite or non-finite 64-bit floating-point value accepted by sqlparser.
     Float64(f64),
+    /// UTF-8 text escaped as a SQL string literal by sqlparser.
     Text(String),
 }
 
+/// Binds every named `:parameter` placeholder to a scalar SQL literal.
+///
+/// Binding operates on the parsed AST, not string interpolation. Missing,
+/// positional, or unused parameters are rejected.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::BTreeMap;
+/// use aql_engine_datafusion::{SqlParameter, bind_sql_parameters};
+///
+/// let sql = bind_sql_parameters(
+///     "SELECT session_id FROM sessions WHERE agent_id = :agent",
+///     &BTreeMap::from([("agent".to_string(), SqlParameter::Text("codex".into()))]),
+/// ).unwrap();
+/// assert!(sql.contains("'codex'"));
+/// ```
 pub fn bind_sql_parameters(
     sql: &str,
     parameters: &BTreeMap<String, SqlParameter>,
@@ -85,15 +108,21 @@ pub fn bind_sql_parameters(
     Ok(statement.to_string())
 }
 
+/// Sanitized query validation, authorization, and execution failures.
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
+    /// The query violated a fixed validation or lifecycle contract.
     #[error("SQL rejected at stage {stage}: {reason}")]
     SqlRejected {
+        /// Stable validation stage.
         stage: &'static str,
+        /// Stable, non-sensitive rejection reason.
         reason: &'static str,
     },
+    /// The query references a canonical field without its required grant.
     #[error("query references a field that requires --access {0}")]
     AccessDenied(&'static str),
+    /// DataFusion failed after AQL validation and authorization.
     #[error("query engine execution failed")]
     Engine(
         #[from]
@@ -102,18 +131,34 @@ pub enum QueryError {
     ),
 }
 
+/// Parsed, single-statement SQL that passed AQL's read-only firewall.
 #[derive(Clone, Debug)]
 pub struct ValidatedSql {
     statement: Statement,
 }
 
 impl ValidatedSql {
+    /// Returns the parser-normalized SQL representation.
     #[must_use]
     pub fn normalized_sql(&self) -> String {
         self.statement.to_string()
     }
 }
 
+/// Parses and validates exactly one read-only canonical SELECT or CTE query.
+///
+/// The firewall rejects writes, external tables, catalog qualification, table
+/// functions, non-allowlisted functions, unsafe wildcards, and excessive query
+/// complexity. Safe wildcards are expanded before the value is returned.
+///
+/// # Examples
+///
+/// ```
+/// use aql_engine_datafusion::validate_read_only_sql;
+///
+/// assert!(validate_read_only_sql("SELECT session_id FROM sessions").is_ok());
+/// assert!(validate_read_only_sql("DELETE FROM sessions").is_err());
+/// ```
 pub fn validate_read_only_sql(sql: &str) -> std::result::Result<ValidatedSql, QueryError> {
     if sql.len() > MAX_SQL_BYTES {
         return Err(sql_rejected(
