@@ -1,5 +1,7 @@
 //! Read-only Codex adapter.
 
+#![deny(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
@@ -31,6 +33,7 @@ use rollout::{ParsedArtifactChange, ParsedPayload, ReadFields, parse_next};
 pub use aql_adapter_api as adapter_api;
 pub use aql_model as model;
 
+/// Read-only adapter for Codex session metadata, rollout streams, and artifacts.
 pub struct CodexAdapter {
     installation_salt: Vec<u8>,
     observer: Option<Arc<dyn FileAccessObserver>>,
@@ -322,6 +325,7 @@ impl Iterator for RolloutRecordStream {
 }
 
 impl CodexAdapter {
+    /// Creates an adapter using an installation-local salt for stable source IDs.
     #[must_use]
     pub fn new(installation_salt: impl Into<Vec<u8>>) -> Self {
         Self {
@@ -331,6 +335,7 @@ impl CodexAdapter {
         }
     }
 
+    /// Installs a source-access observer used by contract tests and audits.
     #[must_use]
     pub fn with_observer(mut self, observer: Arc<dyn FileAccessObserver>) -> Self {
         self.observer = Some(observer);

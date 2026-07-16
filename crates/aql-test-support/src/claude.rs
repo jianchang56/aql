@@ -9,6 +9,7 @@ const MAIN_SESSION: &str = "11111111-1111-4111-8111-111111111111";
 const OTHER_SESSION: &str = "22222222-2222-4222-8222-222222222222";
 const PROJECT: &str = "synthetic-project";
 
+/// Generates all deterministic Claude Code transcript fixture scenarios.
 pub fn generate_claude(output: &Path) -> TestResult {
     reset_output(output)?;
 

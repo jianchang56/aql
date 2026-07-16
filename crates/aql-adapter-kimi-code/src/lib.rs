@@ -1,5 +1,7 @@
 //! Read-only adapter for the pinned Kimi Code 0.23.3 local format.
 
+#![deny(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -29,6 +31,7 @@ type LocatedSession = (PathBuf, SessionKey);
 
 mod wire;
 
+/// Read-only adapter for Kimi Code indexes, session state, and declared wire streams.
 pub struct KimiCodeAdapter {
     installation_salt: Vec<u8>,
     roots: Mutex<BTreeMap<SourceId, RootBinding>>,
@@ -152,6 +155,7 @@ struct IndexEntry {
 }
 
 impl KimiCodeAdapter {
+    /// Creates an adapter using an installation-local salt for stable source IDs.
     #[must_use]
     pub fn new(installation_salt: impl Into<Vec<u8>>) -> Self {
         Self {

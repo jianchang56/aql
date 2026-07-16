@@ -8,6 +8,7 @@ use crate::{TestResult, copy_tree, make_private_tree, reset_output};
 
 const SCHEMA: &str = include_str!("../assets/opencode-schema.sql");
 
+/// Generates all deterministic OpenCode SQLite and WAL fixture scenarios.
 pub fn generate_opencode(output: &Path) -> TestResult {
     reset_output(output)?;
 

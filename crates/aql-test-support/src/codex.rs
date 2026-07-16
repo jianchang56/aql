@@ -12,6 +12,10 @@ const ASSISTANT_MESSAGE: &str = r#"{"timestamp":"2026-01-01T00:00:02Z","type":"r
 const TOOL_CALL: &str = r#"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"function_call","name":"example_tool","call_id":"call-fixture-1","arguments":"{\"value\":\"synthetic\"}"}}"#;
 const TOOL_OUTPUT: &str = r#"{"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-fixture-1","output":"Synthetic tool output"}}"#;
 
+/// Generates deterministic Codex database, index, and rollout fixture scenarios.
+///
+/// `large_metadata_count` controls the bounded large-index scenario used by
+/// streaming and performance tests.
 pub fn generate_codex(output: &Path, large_metadata_count: usize) -> TestResult {
     reset_output(output)?;
 

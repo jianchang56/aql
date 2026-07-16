@@ -1,3 +1,11 @@
+//! Deterministic AQL archive, verification, installation, and uninstall tooling.
+//!
+//! Release archives contain an exact allowlist, canonical manifest, fixed
+//! ownership metadata, deterministic gzip/tar headers, and no source-adjacent
+//! writes. Verification always precedes installation.
+
+#![deny(missing_docs)]
+
 use flate2::{Compression, Decompress, FlushDecompress, GzBuilder, Status};
 use rustix::fd::OwnedFd;
 use rustix::fs::{
@@ -15,8 +23,10 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use tar::{Archive, Builder, EntryType, Header};
 
+/// Public package name embedded in release manifests and archive roots.
 pub const PACKAGE: &str = "aql";
 const BUILD_PACKAGE: &str = "aql";
+/// Exact release payload and required Unix mode for each installed file.
 pub const PAYLOAD: [(&str, u32); 9] = [
     ("bin/aql", 0o755),
     ("share/bash-completion/completions/aql", 0o644),
@@ -31,11 +41,14 @@ pub const PAYLOAD: [(&str, u32); 9] = [
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 512 * 1024 * 1024;
 
+/// Result type used by release operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Sanitized release-tool error suitable for CLI display.
 #[derive(Debug)]
 pub struct Error(String);
 impl Error {
+    /// Creates a release error from a non-sensitive message.
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -98,12 +111,17 @@ struct Uninstall {
     version: String,
 }
 
+/// Verified archive digest, payload, and canonical manifest.
 pub struct Verified {
+    /// Lowercase SHA-256 digest of the complete archive.
     pub digest: String,
+    /// Verified payload bytes keyed by allowlisted relative path.
     pub payload: BTreeMap<String, Vec<u8>>,
+    /// Canonical serialized release manifest.
     pub manifest: Vec<u8>,
 }
 
+/// Validates a numeric `MAJOR.MINOR.PATCH` release version.
 pub fn validate_version(value: &str) -> Result<()> {
     let parts = value.split('.').collect::<Vec<_>>();
     if parts.len() == 3
@@ -116,6 +134,7 @@ pub fn validate_version(value: &str) -> Result<()> {
         fail("version must be numeric MAJOR.MINOR.PATCH")
     }
 }
+/// Validates one of AQL's four supported release target names.
 pub fn validate_target(value: &str) -> Result<()> {
     if matches!(
         value,
@@ -206,6 +225,10 @@ fn binary(binary: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// Builds a deterministic `tar.gz` release archive in memory.
+///
+/// The binary's structured version metadata must match `version` and `target`.
+/// Inputs are restricted to the fixed [`PAYLOAD`] allowlist.
 pub fn build(
     repository: &Path,
     binary_path: &Path,
@@ -298,6 +321,9 @@ pub fn build(
     Ok(gzip.finish()?)
 }
 
+/// Verifies an archive's digest, encoding, manifest, paths, modes, and payload.
+///
+/// No archive content is returned unless every entry passes validation.
 pub fn verify(path: &Path, expected: &str, version: &str, target: &str) -> Result<Verified> {
     validate_version(version)?;
     validate_target(target)?;
@@ -435,6 +461,9 @@ fn decode_gzip(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Atomically publishes a new local file with the requested Unix mode.
+///
+/// Publication fails if `path` already exists.
 pub fn publish(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let parent = path
         .parent()
@@ -659,6 +688,9 @@ fn files() -> Vec<String> {
     out
 }
 
+/// Verifies and atomically installs an archive into a new destination prefix.
+///
+/// When `plan` is true, validation runs without creating the destination.
 pub fn install(
     archive: &Path,
     digest: &str,
@@ -762,6 +794,7 @@ pub fn install(
     revalidate(&ids)
 }
 
+/// Removes a verified AQL installation without touching foreign or replaced files.
 pub fn uninstall(destination: &Path) -> Result<bool> {
     let ids = prefix(destination, true)?;
     let root = open_directory(destination)?;

@@ -1,3 +1,10 @@
+//! Deterministic synthetic fixture generators for every supported Agent format.
+//!
+//! Fixtures contain only reserved synthetic values and are safe for adapter,
+//! security, and performance tests. Generators replace only their explicit
+//! output directory and never inspect real Agent data.
+
+#![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
 mod claude;
@@ -13,6 +20,7 @@ pub use codex::generate_codex;
 pub use kimi::generate_kimi;
 pub use opencode::generate_opencode;
 
+/// Fallible result returned by fixture generators.
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn reset_output(output: &Path) -> TestResult {

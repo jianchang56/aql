@@ -8,6 +8,7 @@ use crate::{TestResult, copy_tree, make_private_tree, reset_output};
 const DEFAULT_BUCKET: &str = "wd_workspace_84b61923346a";
 const DEFAULT_WORKDIR: &str = "/synthetic/workspace";
 
+/// Generates all deterministic Kimi Code index, state, and wire fixture scenarios.
 pub fn generate_kimi(output: &Path) -> TestResult {
     reset_output(output)?;
 

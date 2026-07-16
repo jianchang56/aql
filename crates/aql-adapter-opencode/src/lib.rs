@@ -1,5 +1,7 @@
 //! Read-only adapter for the pinned OpenCode 1.17.18 local SQLite format.
 
+#![deny(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -345,6 +347,7 @@ struct ToolRange {
     end: i64,
 }
 
+/// Read-only adapter for the pinned OpenCode SQLite schema and active WAL view.
 pub struct OpenCodeAdapter {
     installation_salt: Vec<u8>,
     observer: Option<Arc<dyn FileAccessObserver>>,
@@ -352,6 +355,7 @@ pub struct OpenCodeAdapter {
 }
 
 impl OpenCodeAdapter {
+    /// Creates an adapter using an installation-local salt for stable source IDs.
     #[must_use]
     pub fn new(installation_salt: impl Into<Vec<u8>>) -> Self {
         Self {
@@ -361,6 +365,7 @@ impl OpenCodeAdapter {
         }
     }
 
+    /// Installs a source-access observer used by contract tests and audits.
     #[must_use]
     pub fn with_observer(mut self, observer: Arc<dyn FileAccessObserver>) -> Self {
         self.observer = Some(observer);

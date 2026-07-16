@@ -1,5 +1,7 @@
 //! Read-only adapter for the observed Claude Code 2.x local transcript format.
 
+#![deny(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -26,6 +28,7 @@ pub(crate) const MAX_RECORD_BYTES: usize = 1024 * 1024;
 pub(crate) type MainTranscripts = BTreeSet<(String, String)>;
 type TranscriptInventory = (Vec<TranscriptDescriptor>, MainTranscripts);
 
+/// Read-only adapter for bounded Claude Code project transcripts.
 pub struct ClaudeCodeAdapter {
     installation_salt: Vec<u8>,
     roots: Mutex<BTreeMap<SourceId, RootBinding>>,
@@ -92,6 +95,7 @@ struct EdgeStream {
 }
 
 impl ClaudeCodeAdapter {
+    /// Creates an adapter using an installation-local salt for stable source IDs.
     #[must_use]
     pub fn new(installation_salt: impl Into<Vec<u8>>) -> Self {
         Self {
