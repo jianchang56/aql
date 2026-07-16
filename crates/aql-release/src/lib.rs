@@ -810,7 +810,7 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
             return fail("installed manifest entry is invalid");
         }
         let (content, stat, identity) = read_managed_file(&root, Path::new(relative), MAX_ARCHIVE)?;
-        if aql_fs::mode(&stat).is_some_and(|actual| actual != mode)
+        if aql_fs::mode(&stat).is_some_and(|actual| actual & 0o777 != mode)
             || content.len() != entry.size
             || hex::encode(Sha256::digest(&content)) != entry.sha256
         {
