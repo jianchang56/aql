@@ -48,8 +48,8 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install 1.96.1 --profile minimal --no-self-update
-          rustup override set 1.96.1
+          rustup toolchain install 1.97.0 --profile minimal --no-self-update
+          rustup override set 1.97.0
       - name: Verify tag version
         run: |
           version=${GITHUB_REF_NAME#v}
@@ -104,8 +104,8 @@ jobs:
           merge-multiple: true
       - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install 1.96.1 --profile minimal --no-self-update
-          rustup override set 1.96.1
+          rustup toolchain install 1.97.0 --profile minimal --no-self-update
+          rustup override set 1.97.0
       - name: Reverify every archive and generate Homebrew formula
         run: |
           version=${GITHUB_REF_NAME#v}

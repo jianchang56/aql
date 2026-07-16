@@ -2,7 +2,7 @@
 
 ## 从源码构建
 
-要求 Rust `1.96.1`：
+要求 Rust `1.97.0`：
 
 ```bash
 cargo build --locked --release -p aql

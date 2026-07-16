@@ -29,7 +29,7 @@ AQL 不上传数据，不调用 Agent 程序，不读取认证配置，也不会
 
 ## 安装
 
-当前版本需要 Rust `1.96.1`：
+当前版本需要 Rust `1.97.0`：
 
 ```bash
 cargo build --locked --release -p aql
