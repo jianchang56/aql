@@ -126,9 +126,10 @@ impl ClaudeCodeAdapter {
         let path = path.canonicalize().map_err(|_| AdapterError::NotFound {
             stage: "claude_root_canonicalize".to_string(),
         })?;
-        let root_identity = aql_fs::directory_identity(&path).map_err(|_| AdapterError::NotFound {
-            stage: "claude_root_identity".to_string(),
-        })?;
+        let root_identity =
+            aql_fs::directory_identity(&path).map_err(|_| AdapterError::NotFound {
+                stage: "claude_root_identity".to_string(),
+            })?;
         let projects = path.join("projects");
         let projects_metadata =
             fs::symlink_metadata(&projects).map_err(|_| AdapterError::UnsupportedFormat {
@@ -139,11 +140,10 @@ impl ClaudeCodeAdapter {
                 stage: "claude_projects_type".to_string(),
             });
         }
-        let projects_identity = aql_fs::directory_identity(&projects).map_err(|_| {
-            AdapterError::UnsupportedFormat {
+        let projects_identity =
+            aql_fs::directory_identity(&projects).map_err(|_| AdapterError::UnsupportedFormat {
                 stage: "claude_projects_identity".to_string(),
-            }
-        })?;
+            })?;
         Ok(RootBinding {
             path,
             identity: root_identity,
@@ -589,8 +589,7 @@ pub(crate) fn validate_root_identity(root: &RootBinding) -> Result<(), AdapterEr
         fs::symlink_metadata(&root.projects).map_err(|_| AdapterError::SnapshotUnavailable)?;
     if root_metadata.file_type().is_symlink()
         || !root_metadata.is_dir()
-        || aql_fs::directory_identity(&root.path)
-            .map_err(|_| AdapterError::SnapshotUnavailable)?
+        || aql_fs::directory_identity(&root.path).map_err(|_| AdapterError::SnapshotUnavailable)?
             != root.identity
         || projects_metadata.file_type().is_symlink()
         || !projects_metadata.is_dir()
@@ -641,8 +640,7 @@ pub(crate) fn open_transcript(
     })?;
     if before.file_type().is_symlink()
         || !before.is_file()
-        || aql_fs::file_identity(&descriptor.path)
-            .map_err(|_| AdapterError::SnapshotUnavailable)?
+        || aql_fs::file_identity(&descriptor.path).map_err(|_| AdapterError::SnapshotUnavailable)?
             != descriptor.identity
         || before.len() < descriptor.len
     {
@@ -650,10 +648,11 @@ pub(crate) fn open_transcript(
     }
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true);
-    let file = aql_fs::open_ambient_file(&descriptor.path, options)
-        .map_err(|_| AdapterError::PermissionDenied {
+    let file = aql_fs::open_ambient_file(&descriptor.path, options).map_err(|_| {
+        AdapterError::PermissionDenied {
             stage: "claude_transcript_open".to_string(),
-        })?;
+        }
+    })?;
     let opened = file
         .metadata()
         .map_err(|_| AdapterError::PermissionDenied {

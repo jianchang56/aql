@@ -1,11 +1,22 @@
-#![cfg(unix)]
-
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+#[cfg(unix)]
 use std::thread;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
+
+fn symlink_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, target)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(source, target)
+    }
+}
 
 struct TestEnvironment {
     temporary: tempfile::TempDir,
@@ -438,7 +449,7 @@ fn timeout_symlink_and_parent_replacement_publish_nothing() {
     let outside = environment.temporary.path().join("outside.json");
     fs::write(&outside, b"unchanged").expect("create outside target");
     let link = environment.temporary.path().join("result-link.json");
-    std::os::unix::fs::symlink(&outside, &link).expect("create output symlink");
+    symlink_file(&outside, &link).expect("create output symlink");
     let symlinked = environment.run([
         "query".into(),
         "-d".into(),
@@ -454,9 +465,13 @@ fn timeout_symlink_and_parent_replacement_publish_nothing() {
         b"unchanged"
     );
 
+    #[cfg(unix)]
     let output_directory = environment.temporary.path().join("replace-parent");
+    #[cfg(unix)]
     fs::create_dir(&output_directory).expect("create output parent");
+    #[cfg(unix)]
     let target = output_directory.join("result.json");
+    #[cfg(unix)]
     let mut child = environment
         .command()
         .env("AQL_MAX_RECORDS", "100000")
@@ -474,19 +489,28 @@ fn timeout_symlink_and_parent_replacement_publish_nothing() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn parent replacement query");
+    #[cfg(unix)]
     wait_for_pending_output(&output_directory, &mut child);
+    #[cfg(unix)]
     let displaced = environment
         .temporary
         .path()
         .join("replace-parent-displaced");
+    #[cfg(unix)]
     fs::rename(&output_directory, &displaced).expect("move original output parent");
+    #[cfg(unix)]
     fs::create_dir(&output_directory).expect("replace output parent");
+    #[cfg(unix)]
     let replaced = child
         .wait_with_output()
         .expect("wait for parent replacement query");
+    #[cfg(unix)]
     assert!(!replaced.status.success());
+    #[cfg(unix)]
     assert!(replaced.stdout.is_empty());
+    #[cfg(unix)]
     assert!(!target.exists());
+    #[cfg(unix)]
     assert!(
         fs::read_dir(&displaced)
             .expect("list displaced output parent")
@@ -496,6 +520,7 @@ fn timeout_symlink_and_parent_replacement_publish_nothing() {
     );
 }
 
+#[cfg(unix)]
 fn wait_for_pending_output(directory: &Path, child: &mut std::process::Child) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

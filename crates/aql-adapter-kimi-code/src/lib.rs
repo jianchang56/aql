@@ -297,9 +297,7 @@ impl KimiCodeAdapter {
             .map_err(|_| AdapterError::PermissionDenied {
                 stage: "kimi_state_revalidate".to_string(),
             })?;
-        if after.len() != metadata.len()
-            || bytes.len() as u64 != metadata.len()
-        {
+        if after.len() != metadata.len() || bytes.len() as u64 != metadata.len() {
             return Err(AdapterError::SnapshotUnavailable);
         }
         validate_session_chain(root, path)?;
@@ -458,9 +456,7 @@ impl KimiCodeAdapter {
             .map_err(|_| AdapterError::PermissionDenied {
                 stage: "kimi_index_revalidate".to_string(),
             })?;
-        if after.len() != metadata.len()
-            || bytes.len() as u64 != metadata.len()
-        {
+        if after.len() != metadata.len() || bytes.len() as u64 != metadata.len() {
             return Err(AdapterError::SnapshotUnavailable);
         }
         let sessions_root = root.path.join("sessions");
@@ -873,8 +869,7 @@ fn validate_root_identity(root: &RootBinding) -> Result<(), AdapterError> {
         fs::symlink_metadata(&root.path).map_err(|_| AdapterError::SnapshotUnavailable)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
-        || aql_fs::directory_identity(&root.path)
-            .map_err(|_| AdapterError::SnapshotUnavailable)?
+        || aql_fs::directory_identity(&root.path).map_err(|_| AdapterError::SnapshotUnavailable)?
             != root.identity
     {
         return Err(AdapterError::SnapshotUnavailable);
@@ -917,13 +912,18 @@ fn open_regular_no_follow(
     }
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true);
-    let file = aql_fs::open_ambient_file(path, options)
-        .map_err(|_| AdapterError::PermissionDenied {
+    let file =
+        aql_fs::open_ambient_file(path, options).map_err(|_| AdapterError::PermissionDenied {
             stage: format!("{stage}_open"),
         })?;
-    let identity = aql_fs::identity(&file.metadata().map_err(|_| AdapterError::PermissionDenied {
-        stage: format!("{stage}_metadata"),
-    })?);
+    let identity =
+        aql_fs::identity(
+            &file
+                .metadata()
+                .map_err(|_| AdapterError::PermissionDenied {
+                    stage: format!("{stage}_metadata"),
+                })?,
+        );
     let file = file.into_std();
     let opened = file
         .metadata()

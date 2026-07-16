@@ -17,7 +17,9 @@ aql-adapter-opencode = { path = "../aql-adapter-opencode" }
 aql-catalog = { path = "../aql-catalog" }
 aql-config = { path = "../aql-config" }
 aql-engine-datafusion = { path = "../aql-engine-datafusion" }
+aql-fs = { path = "../aql-fs" }
 aql-model = { path = "../aql-model" }
+cap-std.workspace = true
 clap = { workspace = true, features = ["derive", "env", "string"] }
 clap_complete.workspace = true
 clap_mangen.workspace = true
@@ -27,7 +29,6 @@ futures.workspace = true
 humantime.workspace = true
 rand.workspace = true
 rustyline.workspace = true
-rustix = { workspace = true, features = ["fs"] }
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }

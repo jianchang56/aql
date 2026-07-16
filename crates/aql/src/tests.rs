@@ -2,6 +2,28 @@ use super::*;
 use datafusion::arrow::array::{BooleanArray, Int64Array, StringArray, TimestampMillisecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
+fn symlink_file(source: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, target)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(source, target)
+    }
+}
+
+fn symlink_dir(source: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, target)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(source, target)
+    }
+}
+
 struct BrokenWriter;
 
 impl Write for BrokenWriter {
@@ -279,7 +301,7 @@ fn sql_file_input_is_bounded_regular_and_no_follow() {
         "SELECT 1"
     );
     let link = temporary.path().join("query-link.aql");
-    std::os::unix::fs::symlink(&query, &link).expect("query symlink");
+    symlink_file(&query, &link).expect("query symlink");
     assert!(read_sql_input(None, Some(link), false).is_err());
     let sql_file = temporary.path().join("query.sql");
     fs::write(&sql_file, b"SELECT 1").expect("write legacy SQL extension");
@@ -289,8 +311,7 @@ fn sql_file_input_is_bounded_regular_and_no_follow() {
     let nested_query = real_directory.join("nested.sql");
     fs::write(&nested_query, b"SELECT 2").expect("write nested query");
     let directory_link = temporary.path().join("directory-link");
-    std::os::unix::fs::symlink(&real_directory, &directory_link)
-        .expect("intermediate directory symlink");
+    symlink_dir(&real_directory, &directory_link).expect("intermediate directory symlink");
     assert!(
         read_sql_input(None, Some(directory_link.join("nested.sql")), false).is_err(),
         "SQL file paths must reject intermediate directory symlinks"
@@ -533,7 +554,6 @@ fn streaming_renderers_preserve_multi_batch_format_boundaries() {
     assert_eq!(table, expected);
 }
 
-#[cfg(unix)]
 #[test]
 fn streaming_render_failure_never_publishes_the_output_target() {
     let root =
@@ -902,8 +922,6 @@ fn stable_error_categories_have_stable_exit_codes() {
 
 #[test]
 fn installation_salt_uses_private_no_follow_state() {
-    use std::os::unix::fs::{PermissionsExt, symlink};
-
     let root = std::env::temp_dir().join(format!(
         "aql-installation-salt-{:016x}",
         rand::random::<u64>()
@@ -915,28 +933,30 @@ fn installation_salt_uses_private_no_follow_state() {
     let second = load_or_create_installation_salt(&state_root).expect("salt is reloaded");
     assert_eq!(first, second);
     assert_eq!(first.len(), 32);
+    #[cfg(unix)]
     assert_eq!(
-        fs::metadata(&state_root)
-            .expect("state root metadata")
-            .permissions()
-            .mode()
-            & 0o777,
+        std::os::unix::fs::PermissionsExt::mode(
+            &fs::metadata(&state_root)
+                .expect("state root metadata")
+                .permissions()
+        ) & 0o777,
         0o700
     );
     let salt_path = state_root.join("installation.key");
+    #[cfg(unix)]
     assert_eq!(
-        fs::metadata(&salt_path)
-            .expect("salt metadata")
-            .permissions()
-            .mode()
-            & 0o777,
+        std::os::unix::fs::PermissionsExt::mode(
+            &fs::metadata(&salt_path)
+                .expect("salt metadata")
+                .permissions()
+        ) & 0o777,
         0o600
     );
 
     fs::remove_file(&salt_path).expect("remove private salt");
     let outside = root.join("outside.key");
     fs::write(&outside, [7_u8; 32]).expect("create outside file");
-    symlink(&outside, &salt_path).expect("create salt symlink");
+    symlink_file(&outside, &salt_path).expect("create salt symlink");
     assert!(load_or_create_installation_salt(&state_root).is_err());
     assert_eq!(
         fs::read(&outside).expect("outside file remains"),
@@ -946,17 +966,14 @@ fn installation_salt_uses_private_no_follow_state() {
     let real_parent = root.join("real-parent");
     fs::create_dir(&real_parent).expect("create real parent");
     let linked_parent = root.join("linked-parent");
-    symlink(&real_parent, &linked_parent).expect("create intermediate symlink");
+    symlink_dir(&real_parent, &linked_parent).expect("create intermediate symlink");
     assert!(load_or_create_installation_salt(&linked_parent.join("state")).is_err());
     assert!(!real_parent.join("state").exists());
     fs::remove_dir_all(root).expect("clean synthetic state");
 }
 
-#[cfg(unix)]
 #[test]
 fn secure_output_is_private_atomic_and_never_overwrites() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root =
         std::env::temp_dir().join(format!("aql-secure-output-{:016x}", rand::random::<u64>()));
     fs::create_dir(&root).expect("create synthetic output directory");
@@ -966,12 +983,13 @@ fn secure_output_is_private_atomic_and_never_overwrites() {
     output.writer().write_all(b"first").expect("write temp");
     output.commit().expect("atomic initial commit");
     assert_eq!(fs::read(&target).expect("read committed file"), b"first");
+    #[cfg(unix)]
     assert_eq!(
-        fs::metadata(&target)
-            .expect("stat committed file")
-            .permissions()
-            .mode()
-            & 0o777,
+        std::os::unix::fs::PermissionsExt::mode(
+            &fs::metadata(&target)
+                .expect("stat committed file")
+                .permissions()
+        ) & 0o777,
         0o600
     );
     assert!(SecureOutputFile::create(&target).is_err());
@@ -982,18 +1000,15 @@ fn secure_output_is_private_atomic_and_never_overwrites() {
     fs::remove_dir_all(root).expect("clean synthetic output directory");
 }
 
-#[cfg(unix)]
 #[test]
 fn secure_output_rejects_symlinks_and_cleans_abandoned_temps() {
-    use std::os::unix::fs::symlink;
-
     let root =
         std::env::temp_dir().join(format!("aql-secure-output-{:016x}", rand::random::<u64>()));
     fs::create_dir(&root).expect("create synthetic output directory");
     let outside = root.join("outside.json");
     fs::write(&outside, b"outside").expect("create outside file");
     let link = root.join("link.json");
-    symlink(&outside, &link).expect("create synthetic symlink");
+    symlink_file(&outside, &link).expect("create synthetic symlink");
     assert!(SecureOutputFile::create(&link).is_err());
     assert_eq!(
         fs::read(&outside).expect("outside remains readable"),
@@ -1021,13 +1036,12 @@ fn secure_output_rejects_symlinks_and_cleans_abandoned_temps() {
     let real_parent = root.join("real-parent");
     fs::create_dir(&real_parent).expect("create real parent");
     let linked_parent = root.join("linked-parent");
-    symlink(&real_parent, &linked_parent).expect("create intermediate directory symlink");
+    symlink_dir(&real_parent, &linked_parent).expect("create intermediate directory symlink");
     assert!(SecureOutputFile::create(&linked_parent.join("nested.json")).is_err());
 
     fs::remove_dir_all(root).expect("clean synthetic output directory");
 }
 
-#[cfg(unix)]
 #[test]
 fn secure_output_detects_target_and_parent_replacement() {
     let root =
@@ -1043,18 +1057,23 @@ fn secure_output_detects_target_and_parent_replacement() {
     assert!(output.commit().is_err());
     assert_eq!(fs::read(&target).expect("read changed target"), b"attacker");
 
-    let parent_target = root.join("parent.json");
-    let mut parent_output =
-        SecureOutputFile::create(&parent_target).expect("open parent test output");
-    parent_output
-        .writer()
-        .write_all(b"new")
-        .expect("write parent test output");
-    let moved = root.with_extension("moved");
-    fs::rename(&root, &moved).expect("move original directory");
-    fs::create_dir(&root).expect("replace directory path");
-    assert!(parent_output.commit().is_err());
-    assert!(!parent_target.exists());
-    fs::remove_dir_all(root).expect("clean replacement directory");
-    fs::remove_dir_all(moved).expect("clean original directory");
+    #[cfg(unix)]
+    {
+        let parent_target = root.join("parent.json");
+        let mut parent_output =
+            SecureOutputFile::create(&parent_target).expect("open parent test output");
+        parent_output
+            .writer()
+            .write_all(b"new")
+            .expect("write parent test output");
+        let moved = root.with_extension("moved");
+        fs::rename(&root, &moved).expect("move original directory");
+        fs::create_dir(&root).expect("replace directory path");
+        assert!(parent_output.commit().is_err());
+        assert!(!parent_target.exists());
+        fs::remove_dir_all(root).expect("clean replacement directory");
+        fs::remove_dir_all(moved).expect("clean original directory");
+    }
+    #[cfg(windows)]
+    fs::remove_dir_all(root).expect("clean output directory");
 }

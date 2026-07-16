@@ -12,7 +12,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use aql_fs::{FileIdentity, identity, open_absolute_dir, open_file, set_mode, set_open_mode, sync_dir};
+use aql_fs::{
+    FileIdentity, identity, open_absolute_dir, open_file, set_mode, set_open_mode, sync_dir,
+};
 use cap_std::fs::{Dir, Metadata, OpenOptions};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -333,14 +335,14 @@ impl ConfigStore {
         self.validate_identity()?;
         let mut options = OpenOptions::new();
         options.read(true);
-        let descriptor = open_file(&self.directory, Path::new(CONFIG_FILE), options).map_err(
-            |error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ConfigError::Missing
-            } else {
-                ConfigError::Io(error)
-            }
-        })?;
+        let descriptor =
+            open_file(&self.directory, Path::new(CONFIG_FILE), options).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    ConfigError::Missing
+                } else {
+                    ConfigError::Io(error)
+                }
+            })?;
         let stat = descriptor.metadata()?;
         validate_private_file(&stat)?;
         if stat.len() > MAX_CONFIG_BYTES {
@@ -390,16 +392,10 @@ impl ConfigStore {
         file.write_all(encoded.as_bytes())?;
         file.sync_all()?;
         self.validate_identity()?;
-        match (
-            existing,
-            self.directory.symlink_metadata(CONFIG_FILE),
-        ) {
+        match (existing, self.directory.symlink_metadata(CONFIG_FILE)) {
             (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.directory.hard_link(
-                    temporary_name.as_str(),
-                    &self.directory,
-                    CONFIG_FILE,
-                )?;
+                self.directory
+                    .hard_link(temporary_name.as_str(), &self.directory, CONFIG_FILE)?;
                 self.directory.remove_file(temporary_name.as_str())?;
             }
             (Some(expected), Ok(actual)) => {
@@ -407,11 +403,8 @@ impl ConfigStore {
                 if identity(&actual) != expected {
                     return Err(ConfigError::StateChanged);
                 }
-                self.directory.rename(
-                    temporary_name.as_str(),
-                    &self.directory,
-                    CONFIG_FILE,
-                )?;
+                self.directory
+                    .rename(temporary_name.as_str(), &self.directory, CONFIG_FILE)?;
             }
             _ => return Err(ConfigError::StateChanged),
         }

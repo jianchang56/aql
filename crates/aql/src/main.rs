@@ -27,6 +27,7 @@ use aql_engine_datafusion::{
     prepare_query, validate_read_only_sql,
 };
 use aql_model::AccessClass;
+use cap_std::fs::OpenOptions as CapOpenOptions;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::StreamExt;
@@ -193,41 +194,16 @@ fn read_sql_input(
         {
             return Err(sql_input_error("--file accepts only .aql scripts").into());
         }
-        let directory_flags = rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC;
-        let mut directory = rustix::fs::openat(
-            rustix::fs::CWD,
-            if path.is_absolute() { "/" } else { "." },
-            directory_flags,
-            rustix::fs::Mode::empty(),
-        )?;
-        for component in &components[..components.len() - 1] {
-            match component {
-                std::path::Component::RootDir | std::path::Component::CurDir => {}
-                std::path::Component::Normal(name) => {
-                    directory = rustix::fs::openat(
-                        &directory,
-                        PathBuf::from(name),
-                        directory_flags,
-                        rustix::fs::Mode::empty(),
-                    )?;
-                }
-                _ => {
-                    return Err(
-                        sql_input_error("SQL file path must not contain parent traversal").into(),
-                    );
-                }
-            }
+        if components
+            .iter()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(sql_input_error("SQL file path must not contain parent traversal").into());
         }
-        let descriptor = rustix::fs::openat(
-            &directory,
-            PathBuf::from(file_name),
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )?;
-        let mut file = fs::File::from(descriptor);
+        let mut options = CapOpenOptions::new();
+        options.read(true);
+        let descriptor = aql_fs::open_ambient_file(&path, options)?;
+        let mut file = descriptor.into_std();
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() > MAX_SQL_INPUT_BYTES {
             return Err(sql_input_error("SQL file must be a bounded regular file").into());
@@ -949,8 +925,7 @@ fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
             | ConfigError::DatabaseMissing
             | ConfigError::LockHeld
             | ConfigError::StateChanged
-            | ConfigError::Io(_)
-            | ConfigError::Platform(_) => 4,
+            | ConfigError::Io(_) => 4,
         };
     }
     1
@@ -1000,7 +975,7 @@ fn error_category(error: &(dyn std::error::Error + 'static)) -> &'static str {
             | ConfigError::InvalidConfig
             | ConfigError::UnsupportedSchema
             | ConfigError::StateChanged => "state_integrity",
-            ConfigError::Io(_) | ConfigError::Platform(_) => "state_unavailable",
+            ConfigError::Io(_) => "state_unavailable",
         };
     }
     "internal"
@@ -1161,64 +1136,9 @@ fn installation_salt() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     load_or_create_installation_salt(&state_root)
 }
 
-#[cfg(unix)]
 fn load_or_create_installation_salt(
     state_root: &std::path::Path,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    use rustix::fs::{Mode, OFlags};
-
-    let directory = open_or_create_private_state_root(state_root)?;
-    let directory_stat = rustix::fs::fstat(&directory)?;
-    if rustix::fs::FileType::from_raw_mode(directory_stat.st_mode)
-        != rustix::fs::FileType::Directory
-        || directory_stat.st_mode & 0o077 != 0
-    {
-        return Err(state_integrity("AQL state root has unsafe permissions or type").into());
-    }
-
-    match rustix::fs::openat(
-        &directory,
-        "installation.key",
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(descriptor) => read_private_installation_salt(descriptor),
-        Err(error) if error == rustix::io::Errno::NOENT => {
-            let salt: [u8; 32] = rand::random();
-            let descriptor = match rustix::fs::openat(
-                &directory,
-                "installation.key",
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::from_raw_mode(0o600),
-            ) {
-                Ok(descriptor) => descriptor,
-                Err(error) if error == rustix::io::Errno::EXIST => {
-                    let descriptor = rustix::fs::openat(
-                        &directory,
-                        "installation.key",
-                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    )?;
-                    return read_private_installation_salt(descriptor);
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let mut file: fs::File = descriptor.into();
-            file.write_all(&salt)?;
-            file.sync_all()?;
-            rustix::fs::fsync(&directory)?;
-            Ok(salt.to_vec())
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-#[cfg(unix)]
-fn open_or_create_private_state_root(
-    state_root: &std::path::Path,
-) -> Result<std::os::fd::OwnedFd, Box<dyn std::error::Error>> {
-    use rustix::fs::{Mode, OFlags};
-
     if !state_root.is_absolute()
         || state_root.components().any(|component| {
             matches!(
@@ -1226,50 +1146,78 @@ fn open_or_create_private_state_root(
                 std::path::Component::CurDir | std::path::Component::ParentDir
             )
         })
+        || !state_root
+            .components()
+            .any(|component| matches!(component, std::path::Component::Normal(_)))
     {
         return Err(state_integrity("AQL state root must be normalized and absolute").into());
     }
-    let components = state_root
-        .components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(name) => Some(name),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if components.is_empty() {
-        return Err(state_integrity("AQL state root cannot be the filesystem root").into());
+    let directory = aql_fs::open_or_create_absolute_dir(state_root, 0o700)?;
+    let directory_stat = directory.dir_metadata()?;
+    if !directory_stat.is_dir()
+        || !aql_fs::owned_by_current_user(&directory_stat)
+        || aql_fs::mode(&directory_stat).is_some_and(|mode| mode & 0o077 != 0)
+    {
+        return Err(state_integrity("AQL state root has unsafe permissions or type").into());
     }
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut directory = rustix::fs::openat(rustix::fs::CWD, "/", flags, Mode::empty())?;
-    for component in components {
-        match rustix::fs::openat(&directory, component, flags, Mode::empty()) {
-            Ok(next) => directory = next,
-            Err(error) if error == rustix::io::Errno::NOENT => {
-                match rustix::fs::mkdirat(&directory, component, Mode::from_raw_mode(0o700)) {
-                    Ok(()) => {}
-                    Err(error) if error == rustix::io::Errno::EXIST => {}
-                    Err(error) => return Err(error.into()),
-                }
-                directory = rustix::fs::openat(&directory, component, flags, Mode::empty())?;
-            }
-            Err(error) => return Err(error.into()),
+
+    let mut read_options = CapOpenOptions::new();
+    read_options.read(true);
+    match aql_fs::open_file(
+        &directory,
+        std::path::Path::new("installation.key"),
+        read_options,
+    ) {
+        Ok(descriptor) => {
+            let metadata = descriptor.metadata()?;
+            read_private_installation_salt(descriptor.into_std(), &metadata)
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let salt: [u8; 32] = rand::random();
+            let mut create_options = CapOpenOptions::new();
+            create_options.write(true).create_new(true);
+            aql_fs::set_open_mode(&mut create_options, 0o600);
+            match aql_fs::open_file(
+                &directory,
+                std::path::Path::new("installation.key"),
+                create_options,
+            ) {
+                Ok(descriptor) => {
+                    let mut file = descriptor.into_std();
+                    file.write_all(&salt)?;
+                    file.sync_all()?;
+                    aql_fs::sync_dir(&directory)?;
+                    Ok(salt.to_vec())
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let mut options = CapOpenOptions::new();
+                    options.read(true);
+                    let descriptor = aql_fs::open_file(
+                        &directory,
+                        std::path::Path::new("installation.key"),
+                        options,
+                    )?;
+                    let metadata = descriptor.metadata()?;
+                    read_private_installation_salt(descriptor.into_std(), &metadata)
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
     }
-    Ok(directory)
 }
 
-#[cfg(unix)]
 fn read_private_installation_salt(
-    descriptor: std::os::fd::OwnedFd,
+    mut file: fs::File,
+    stat: &cap_std::fs::Metadata,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let stat = rustix::fs::fstat(&descriptor)?;
-    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
-        || stat.st_mode & 0o077 != 0
+    if !stat.is_file()
+        || !aql_fs::owned_by_current_user(stat)
+        || aql_fs::mode(stat).is_some_and(|mode| mode & 0o077 != 0)
     {
         return Err(state_integrity("installation salt has unsafe permissions or type").into());
     }
     let mut salt = Vec::with_capacity(32);
-    let mut file: fs::File = descriptor.into();
     file.read_to_end(&mut salt)?;
     if salt.len() != 32 {
         return Err(state_integrity("installation salt has an invalid length").into());
@@ -1277,32 +1225,21 @@ fn read_private_installation_salt(
     Ok(salt)
 }
 
-#[cfg(not(unix))]
-fn load_or_create_installation_salt(
-    state_root: &std::path::Path,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    fs::create_dir_all(state_root)?;
-    let salt_path = state_root.join("installation.key");
-    match fs::read(&salt_path) {
-        Ok(salt) if salt.len() == 32 => Ok(salt),
-        Ok(_) => Err(state_integrity("installation salt has an invalid length").into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let salt: [u8; 32] = rand::random();
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(salt_path)?;
-            file.write_all(&salt)?;
-            file.sync_all()?;
-            Ok(salt.to_vec())
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
 fn aql_state_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(if let Some(path) = std::env::var_os("AQL_HOME") {
         PathBuf::from(path)
+    } else if cfg!(windows) {
+        if let Some(path) = std::env::var_os("LOCALAPPDATA") {
+            PathBuf::from(path).join("aql")
+        } else if let Some(path) = std::env::var_os("APPDATA") {
+            PathBuf::from(path).join("aql")
+        } else {
+            PathBuf::from(
+                std::env::var_os("USERPROFILE")
+                    .ok_or_else(|| state_unavailable("USERPROFILE is not set"))?,
+            )
+            .join("AppData/Local/aql")
+        }
     } else if cfg!(target_os = "macos") {
         PathBuf::from(std::env::var_os("HOME").ok_or_else(|| state_unavailable("HOME is not set"))?)
             .join("Library/Application Support/aql")

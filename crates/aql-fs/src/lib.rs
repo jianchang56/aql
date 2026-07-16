@@ -71,6 +71,30 @@ pub fn open_absolute_dir(path: &Path) -> io::Result<Dir> {
     Ok(directory)
 }
 
+/// Opens an absolute directory, creating missing components without following
+/// symlinks and applying the requested private mode where supported.
+pub fn open_or_create_absolute_dir(path: &Path, mode: u32) -> io::Result<Dir> {
+    let (root, components) = split_absolute(path)?;
+    let mut directory = Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+    for component in components {
+        match directory.open_dir_nofollow(component) {
+            Ok(next) => directory = next,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut builder = cap_std::fs::DirBuilder::new();
+                set_dir_builder_mode(&mut builder, mode);
+                match directory.create_dir_with(component, &builder) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+                directory = directory.open_dir_nofollow(component)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(directory)
+}
+
 /// Opens a normalized directory, relative paths being anchored at the current directory.
 pub fn open_dir(path: &Path) -> io::Result<Dir> {
     if path.is_absolute() {
@@ -179,6 +203,18 @@ pub fn set_open_mode(options: &mut OpenOptions, mode: u32) {
     }
 }
 
+fn set_dir_builder_mode(builder: &mut cap_std::fs::DirBuilder, mode: u32) {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::DirBuilderExt as _;
+        builder.mode(mode);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (builder, mode);
+    }
+}
+
 /// Returns Unix permission bits when available.
 #[must_use]
 pub fn mode(metadata: &Metadata) -> Option<u32> {
@@ -210,12 +246,7 @@ pub fn owned_by_current_user(metadata: &Metadata) -> bool {
 }
 
 /// Atomically renames a directory entry while refusing to replace an existing target.
-pub fn rename_noreplace(
-    from_dir: &Dir,
-    from: &Path,
-    to_dir: &Dir,
-    to: &Path,
-) -> io::Result<()> {
+pub fn rename_noreplace(from_dir: &Dir, from: &Path, to_dir: &Dir, to: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::fd::AsFd as _;
@@ -302,6 +333,9 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory");
         std::fs::create_dir(temporary.path().join("child")).expect("child directory");
         open_absolute_dir(temporary.path()).expect("absolute directory opens");
+        open_or_create_absolute_dir(&temporary.path().join("created/nested"), 0o700)
+            .expect("missing absolute directories are created");
+        assert!(temporary.path().join("created/nested").is_dir());
         let root = Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority())
             .expect("temporary capability");
         open_relative_dir(&root, Path::new("child")).expect("relative directory opens");

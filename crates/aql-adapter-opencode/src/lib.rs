@@ -395,8 +395,8 @@ impl OpenCodeAdapter {
         safe_file(&database, "opencode_database")?;
         let wal_identity = optional_file_identity(&path.join("opencode.db-wal"), "opencode_wal")?;
         let shm_identity = optional_file_identity(&path.join("opencode.db-shm"), "opencode_shm")?;
-        let root_identity = aql_fs::directory_identity(&path)
-            .map_err(|_| AdapterError::SnapshotUnavailable)?;
+        let root_identity =
+            aql_fs::directory_identity(&path).map_err(|_| AdapterError::SnapshotUnavailable)?;
         let database_identity =
             aql_fs::file_identity(&database).map_err(|_| AdapterError::SnapshotUnavailable)?;
         Ok(RootBinding {

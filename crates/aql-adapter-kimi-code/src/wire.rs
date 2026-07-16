@@ -883,9 +883,7 @@ fn read_agent_state(
     let after = file
         .metadata()
         .map_err(|_| AdapterError::SnapshotUnavailable)?;
-    if after.len() != metadata.len()
-        || bytes.len() as u64 != metadata.len()
-    {
+    if after.len() != metadata.len() || bytes.len() as u64 != metadata.len() {
         return Err(AdapterError::SnapshotUnavailable);
     }
     validate_session_chain(root, session)?;

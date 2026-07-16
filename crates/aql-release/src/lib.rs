@@ -6,9 +6,9 @@
 
 #![deny(missing_docs)]
 
-use flate2::{Compression, Decompress, FlushDecompress, GzBuilder, Status};
 use aql_fs::{FileIdentity, identity};
 use cap_std::fs::{Dir, Metadata as CapMetadata, OpenOptions as CapOpenOptions};
+use flate2::{Compression, Decompress, FlushDecompress, GzBuilder, Status};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -611,10 +611,7 @@ fn read_managed_file(
     options.read(true);
     let descriptor = aql_fs::open_file(&parent, Path::new(&name), options)?;
     let before = descriptor.metadata()?;
-    if !before.is_file()
-        || !aql_fs::owned_by_current_user(&before)
-        || before.len() > limit
-    {
+    if !before.is_file() || !aql_fs::owned_by_current_user(&before) || before.len() > limit {
         return fail("unsafe installed file");
     }
     let expected_identity = identity(&before);
@@ -676,10 +673,7 @@ pub fn install(
             .find(|v| v.0 == relative)
             .map(|v| v.1)
             .ok_or_else(|| Error::new("unexpected payload"))?;
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
         aql_fs::set_file_mode(&f, mode)?;
         f.write_all(bytes)?;
         f.sync_all()?;
@@ -699,10 +693,7 @@ pub fn install(
         version: version.into(),
     };
     let path = stage.path().join("UNINSTALL_MANIFEST");
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
     aql_fs::set_file_mode(&f, 0o600)?;
     f.write_all(&canonical(&uninstall)?)?;
     f.sync_all()?;
@@ -725,8 +716,7 @@ pub fn install(
     let expected_parent = ids
         .last()
         .ok_or_else(|| Error::new("prefix parent identity is missing"))?;
-    if current_parent_identity != expected_parent.1
-    {
+    if current_parent_identity != expected_parent.1 {
         return fail("prefix parent changed before publication");
     }
     let stage_name = stage
@@ -738,7 +728,7 @@ pub fn install(
         .ok_or_else(|| Error::new("prefix name is missing"))?;
     let _ = (stage_name, destination_name);
     aql_fs::rename_ambient_noreplace(stage.path(), destination)
-    .map_err(|e| Error::new(format!("atomic publish failed: {e}")))?;
+        .map_err(|e| Error::new(format!("atomic publish failed: {e}")))?;
     let _ = stage.keep();
     aql_fs::sync_dir(&parent_descriptor)?;
     revalidate(&ids)
@@ -757,11 +747,8 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
     }
     let mut manifest_options = CapOpenOptions::new();
     manifest_options.read(true);
-    let manifest_descriptor = aql_fs::open_file(
-        &root,
-        Path::new("UNINSTALL_MANIFEST"),
-        manifest_options,
-    )?;
+    let manifest_descriptor =
+        aql_fs::open_file(&root, Path::new("UNINSTALL_MANIFEST"), manifest_options)?;
     let manifest_stat = manifest_descriptor.metadata()?;
     if !manifest_stat.is_file()
         || !aql_fs::owned_by_current_user(&manifest_stat)
@@ -838,8 +825,7 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
         let expected = identities
             .get(relative)
             .ok_or_else(|| Error::new("installed file identity is missing"))?;
-        if !stat.is_file() || identity(&stat) != expected.0
-        {
+        if !stat.is_file() || identity(&stat) != expected.0 {
             return fail("installed file was replaced");
         }
     }
@@ -849,8 +835,7 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
         let expected = identities
             .get(relative)
             .ok_or_else(|| Error::new("installed file identity is missing"))?;
-        if !stat.is_file() || identity(&stat) != expected.0
-        {
+        if !stat.is_file() || identity(&stat) != expected.0 {
             return fail("installed file changed during uninstall");
         }
         parent.remove_file(&name)?;
