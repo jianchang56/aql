@@ -450,10 +450,7 @@ fn wire_path(output: &Path, fixture: &str, bucket: &str, session: &str) -> PathB
     session_dir(output, fixture, bucket, session).join("agents/main/wire.jsonl")
 }
 
-#[cfg(unix)]
 fn create_symlink_fixtures(output: &Path) -> TestResult {
-    use std::os::unix::fs::symlink;
-
     basic(output, "symlink-state", "session-symlink-state")?;
     fs::write(
         output.join("symlink-state/outside.json"),
@@ -466,7 +463,7 @@ fn create_symlink_fixtures(output: &Path) -> TestResult {
         "session-symlink-state",
     );
     fs::remove_file(&state)?;
-    symlink("../../../outside.json", state)?;
+    super::symlink_file(Path::new("../../../outside.json"), &state)?;
     manifest(output, "symlink-state", "rejected", 1)?;
 
     basic(output, "symlink-wire", "session-symlink-wire")?;
@@ -481,7 +478,7 @@ fn create_symlink_fixtures(output: &Path) -> TestResult {
         "session-symlink-wire",
     );
     fs::remove_file(&wire)?;
-    symlink("../../../../../outside-wire.jsonl", wire)?;
+    super::symlink_file(Path::new("../../../../../outside-wire.jsonl"), &wire)?;
     manifest(output, "symlink-wire", "rejected", 1)?;
 
     basic(output, "symlink-agent-dir", "session-symlink-agent")?;
@@ -495,7 +492,10 @@ fn create_symlink_fixtures(output: &Path) -> TestResult {
         session.join("agents/main"),
         output.join("symlink-agent-dir/outside-agent"),
     )?;
-    symlink("../../../../outside-agent", session.join("agents/main"))?;
+    super::symlink_dir(
+        Path::new("../../../../outside-agent"),
+        &session.join("agents/main"),
+    )?;
     manifest(output, "symlink-agent-dir", "rejected", 1)?;
 
     create_root(output, "symlink-sessions-dir")?;
@@ -503,15 +503,10 @@ fn create_symlink_fixtures(output: &Path) -> TestResult {
         output.join("symlink-sessions-dir/sessions"),
         output.join("symlink-sessions-dir/outside-sessions"),
     )?;
-    symlink(
-        "outside-sessions",
-        output.join("symlink-sessions-dir/sessions"),
+    super::symlink_dir(
+        Path::new("outside-sessions"),
+        &output.join("symlink-sessions-dir/sessions"),
     )?;
     manifest(output, "symlink-sessions-dir", "rejected", 1)?;
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn create_symlink_fixtures(_output: &Path) -> TestResult {
-    Err("Kimi symlink fixtures require Unix".into())
 }

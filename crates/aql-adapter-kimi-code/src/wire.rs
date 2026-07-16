@@ -17,8 +17,8 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use super::{
-    FileIdentity, KimiCodeAdapter, RootBinding, SafeAgent, file_identity, normalize_limit,
-    open_regular_no_follow, projected, validate_agents, validate_directory, validate_session_chain,
+    FileIdentity, KimiCodeAdapter, RootBinding, SafeAgent, normalize_limit, open_regular_no_follow,
+    projected, validate_agents, validate_directory, validate_session_chain,
     validate_workdir_bucket,
 };
 
@@ -118,6 +118,7 @@ struct WireStream {
 
 struct WireFile {
     reader: BufReader<Take<File>>,
+    path: PathBuf,
     identity: FileIdentity,
     expected_len: u64,
     metadata_seen: bool,
@@ -239,6 +240,7 @@ impl WireStream {
                 }
                 self.current = Some(WireFile {
                     reader: BufReader::new(file.take(metadata.len())),
+                    path,
                     identity,
                     expected_len: metadata.len(),
                     metadata_seen: false,
@@ -704,8 +706,16 @@ impl Iterator for WireStream {
                             return Some(Err(AdapterError::SnapshotUnavailable));
                         }
                     };
-                    if file_identity(&metadata) != current.identity
-                        || metadata.len() < current.expected_len
+                    let path_identity = match aql_fs::file_identity(&current.path) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            self.finished = true;
+                            return Some(Err(AdapterError::SnapshotUnavailable));
+                        }
+                    };
+                    if metadata.len() < current.expected_len
+                        || path_identity != current.identity
+                        || validate_wire_chain(&self.root, &current.path).is_err()
                     {
                         self.finished = true;
                         return Some(Err(AdapterError::SnapshotUnavailable));
@@ -856,7 +866,7 @@ fn read_agent_state(
 ) -> Result<AgentState, AdapterError> {
     validate_session_chain(root, session)?;
     let path = session.join("state.json");
-    let (mut file, metadata, identity) = open_regular_no_follow(&path, "kimi_state")?;
+    let (mut file, metadata, _identity) = open_regular_no_follow(&path, "kimi_state")?;
     if metadata.len() > super::MAX_STATE_BYTES {
         return Err(AdapterError::UnsupportedFormat {
             stage: "kimi_state_type_or_size".to_string(),
@@ -873,8 +883,7 @@ fn read_agent_state(
     let after = file
         .metadata()
         .map_err(|_| AdapterError::SnapshotUnavailable)?;
-    if file_identity(&after) != identity
-        || after.len() != metadata.len()
+    if after.len() != metadata.len()
         || bytes.len() as u64 != metadata.len()
     {
         return Err(AdapterError::SnapshotUnavailable);

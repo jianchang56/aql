@@ -43,11 +43,7 @@ struct RootBinding {
     identity: FileIdentity,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
+type FileIdentity = aql_fs::FileIdentity;
 
 struct SessionRecordStream {
     root: RootBinding,
@@ -190,9 +186,9 @@ impl KimiCodeAdapter {
         let path = path.canonicalize().map_err(|_| AdapterError::NotFound {
             stage: "kimi_root_canonicalize".to_string(),
         })?;
-        let identity = file_identity(&fs::metadata(&path).map_err(|_| AdapterError::NotFound {
+        let identity = aql_fs::directory_identity(&path).map_err(|_| AdapterError::NotFound {
             stage: "kimi_root_identity".to_string(),
-        })?);
+        })?;
         Ok(RootBinding { path, identity })
     }
 
@@ -282,7 +278,7 @@ impl KimiCodeAdapter {
     ) -> Result<(Vec<SessionRecord>, bool), AdapterError> {
         validate_session_chain(root, path)?;
         let state_path = path.join("state.json");
-        let (mut file, metadata, identity) = open_regular_no_follow(&state_path, "kimi_state")?;
+        let (mut file, metadata, _identity) = open_regular_no_follow(&state_path, "kimi_state")?;
         if metadata.len() > MAX_STATE_BYTES {
             return Err(AdapterError::UnsupportedFormat {
                 stage: "kimi_state_type_or_size".to_string(),
@@ -301,8 +297,7 @@ impl KimiCodeAdapter {
             .map_err(|_| AdapterError::PermissionDenied {
                 stage: "kimi_state_revalidate".to_string(),
             })?;
-        if file_identity(&after) != identity
-            || after.len() != metadata.len()
+        if after.len() != metadata.len()
             || bytes.len() as u64 != metadata.len()
         {
             return Err(AdapterError::SnapshotUnavailable);
@@ -443,7 +438,7 @@ impl KimiCodeAdapter {
             })?;
             return Ok(BTreeMap::new());
         }
-        let (mut file, metadata, identity) = open_regular_no_follow(&path, "kimi_index")?;
+        let (mut file, metadata, _identity) = open_regular_no_follow(&path, "kimi_index")?;
         if metadata.len() > MAX_INDEX_BYTES {
             return Err(AdapterError::BudgetExceeded {
                 resource: "kimi_index_bytes".to_string(),
@@ -463,8 +458,7 @@ impl KimiCodeAdapter {
             .map_err(|_| AdapterError::PermissionDenied {
                 stage: "kimi_index_revalidate".to_string(),
             })?;
-        if file_identity(&after) != identity
-            || after.len() != metadata.len()
+        if after.len() != metadata.len()
             || bytes.len() as u64 != metadata.len()
         {
             return Err(AdapterError::SnapshotUnavailable);
@@ -879,7 +873,9 @@ fn validate_root_identity(root: &RootBinding) -> Result<(), AdapterError> {
         fs::symlink_metadata(&root.path).map_err(|_| AdapterError::SnapshotUnavailable)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
-        || file_identity(&metadata) != root.identity
+        || aql_fs::directory_identity(&root.path)
+            .map_err(|_| AdapterError::SnapshotUnavailable)?
+            != root.identity
     {
         return Err(AdapterError::SnapshotUnavailable);
     }
@@ -919,45 +915,25 @@ fn open_regular_no_follow(
             stage: format!("{stage}_type_or_size"),
         });
     }
-    let mut options = File::options();
+    let mut options = cap_std::fs::OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options
-        .open(path)
+    let file = aql_fs::open_ambient_file(path, options)
         .map_err(|_| AdapterError::PermissionDenied {
             stage: format!("{stage}_open"),
         })?;
+    let identity = aql_fs::identity(&file.metadata().map_err(|_| AdapterError::PermissionDenied {
+        stage: format!("{stage}_metadata"),
+    })?);
+    let file = file.into_std();
     let opened = file
         .metadata()
         .map_err(|_| AdapterError::PermissionDenied {
             stage: format!("{stage}_metadata"),
         })?;
-    let identity = file_identity(&opened);
-    if identity != file_identity(&before) || !opened.is_file() {
+    if !opened.is_file() {
         return Err(AdapterError::SnapshotUnavailable);
     }
     Ok((file, opened, identity))
-}
-
-#[cfg(unix)]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    use std::os::unix::fs::MetadataExt;
-    FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    }
-}
-
-#[cfg(not(unix))]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    FileIdentity {
-        device: metadata.len(),
-        inode: 0,
-    }
 }
 
 fn raw_string_size(

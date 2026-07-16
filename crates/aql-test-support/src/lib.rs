@@ -75,6 +75,7 @@ fn make_private_tree(_root: &Path) -> TestResult {
     Ok(())
 }
 
+#[cfg(unix)]
 fn walk(root: &Path) -> TestResult<Vec<std::path::PathBuf>> {
     let mut result = vec![root.to_path_buf()];
     let mut index = 0;
@@ -89,6 +90,30 @@ fn walk(root: &Path) -> TestResult<Vec<std::path::PathBuf>> {
         }
     }
     Ok(result)
+}
+
+#[cfg(unix)]
+fn symlink_file(source: &Path, target: &Path) -> TestResult {
+    std::os::unix::fs::symlink(source, target)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn symlink_file(source: &Path, target: &Path) -> TestResult {
+    std::os::windows::fs::symlink_file(source, target)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_dir(source: &Path, target: &Path) -> TestResult {
+    std::os::unix::fs::symlink(source, target)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn symlink_dir(source: &Path, target: &Path) -> TestResult {
+    std::os::windows::fs::symlink_dir(source, target)?;
+    Ok(())
 }
 
 fn copy_tree(source: &Path, target: &Path) -> TestResult {

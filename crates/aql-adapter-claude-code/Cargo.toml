@@ -6,9 +6,10 @@ version.workspace = true
 
 [dependencies]
 aql-adapter-api = { path = "../aql-adapter-api" }
+aql-fs = { path = "../aql-fs" }
 aql-model = { path = "../aql-model" }
+cap-std.workspace = true
 chrono.workspace = true
-libc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 

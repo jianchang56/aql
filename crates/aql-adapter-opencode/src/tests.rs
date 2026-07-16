@@ -69,6 +69,7 @@ fn authorizer_denies_forbidden_tables_and_sql_features() {
             .prepare("CREATE TEMP TABLE forbidden(value TEXT)")
             .is_err()
     );
+    drop(connection);
     fs::remove_dir_all(root).expect("fixtures are removed");
 }
 

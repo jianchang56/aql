@@ -178,6 +178,7 @@ fn sensitive_session_columns_require_grants_before_open_and_are_size_bounded() {
         .expect("bounded content stream opens")
         .records;
     assert!(records.next().expect("content row is attempted").is_err());
+    drop(records);
     request.projection = vec![ColumnName::new("cwd")];
     request.access = AccessGrant {
         path: true,
@@ -188,6 +189,7 @@ fn sensitive_session_columns_require_grants_before_open_and_are_size_bounded() {
         .expect("bounded path stream opens")
         .records;
     assert!(records.next().expect("path row is attempted").is_err());
+    drop(records);
     fs::remove_dir_all(roots).expect("fixtures remove");
 }
 
@@ -448,6 +450,7 @@ fn malformed_unknown_duplicate_and_oversized_parts_have_closed_outcomes() {
             .expect("malformed row is attempted")
             .is_err()
     );
+    drop(malformed);
 
     let unknown_manifest = manifest(&adapter, &roots.join("unknown-part"));
     let unknown = scan(
@@ -530,6 +533,7 @@ fn malformed_unknown_duplicate_and_oversized_parts_have_closed_outcomes() {
             .expect("oversized text is attempted")
             .is_err()
     );
+    drop(sensitive);
     request.table = TableName::ToolCalls;
     request.projection = vec![ColumnName::new("arguments")];
     request.access = AccessGrant {

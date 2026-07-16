@@ -44,28 +44,13 @@ pub(super) fn optional_file_identity(
                 stage: stage.to_string(),
             })
         }
-        Ok(metadata) => Ok(Some(file_identity(&metadata))),
+        Ok(_) => aql_fs::file_identity(path)
+            .map(Some)
+            .map_err(|_| AdapterError::SnapshotUnavailable),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(AdapterError::PermissionDenied {
             stage: stage.to_string(),
         }),
-    }
-}
-
-#[cfg(unix)]
-pub(super) fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    use std::os::unix::fs::MetadataExt;
-    FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    }
-}
-
-#[cfg(not(unix))]
-pub(super) fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    FileIdentity {
-        device: 0,
-        inode: metadata.len(),
     }
 }
 

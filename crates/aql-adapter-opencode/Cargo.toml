@@ -6,6 +6,7 @@ version.workspace = true
 
 [dependencies]
 aql-adapter-api = { path = "../aql-adapter-api" }
+aql-fs = { path = "../aql-fs" }
 aql-model = { path = "../aql-model" }
 chrono.workspace = true
 rusqlite = { workspace = true, features = ["bundled", "hooks"] }

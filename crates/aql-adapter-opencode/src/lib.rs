@@ -30,7 +30,7 @@ mod authorizer;
 mod storage;
 
 use authorizer::AuthorizerPolicy;
-use storage::{file_identity, optional_file_identity, safe_directory, safe_file, table_columns};
+use storage::{optional_file_identity, safe_directory, safe_file, table_columns};
 
 const MAX_JSON_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 type MessageCursor = (String, i64, String);
@@ -124,11 +124,7 @@ const PART_COLUMNS: [&str; 6] = [
     "data",
 ];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
+type FileIdentity = aql_fs::FileIdentity;
 
 #[derive(Clone)]
 struct RootBinding {
@@ -379,7 +375,10 @@ impl OpenCodeAdapter {
     }
 
     fn validate_root(path: &Path) -> Result<RootBinding, AdapterError> {
+        #[cfg(unix)]
         let root_metadata = safe_directory(path, "opencode_root")?;
+        #[cfg(not(unix))]
+        safe_directory(path, "opencode_root")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -393,26 +392,34 @@ impl OpenCodeAdapter {
             stage: "opencode_root_canonicalize".to_string(),
         })?;
         let database = path.join("opencode.db");
-        let database_metadata = safe_file(&database, "opencode_database")?;
+        safe_file(&database, "opencode_database")?;
         let wal_identity = optional_file_identity(&path.join("opencode.db-wal"), "opencode_wal")?;
         let shm_identity = optional_file_identity(&path.join("opencode.db-shm"), "opencode_shm")?;
+        let root_identity = aql_fs::directory_identity(&path)
+            .map_err(|_| AdapterError::SnapshotUnavailable)?;
+        let database_identity =
+            aql_fs::file_identity(&database).map_err(|_| AdapterError::SnapshotUnavailable)?;
         Ok(RootBinding {
             path,
-            root_identity: file_identity(&root_metadata),
-            database_identity: file_identity(&database_metadata),
+            root_identity,
+            database_identity,
             wal_identity,
             shm_identity,
         })
     }
 
     fn validate_binding(binding: &RootBinding) -> Result<(), AdapterError> {
-        let root = safe_directory(&binding.path, "opencode_root_revalidate")?;
-        let database = safe_file(
+        safe_directory(&binding.path, "opencode_root_revalidate")?;
+        safe_file(
             &binding.path.join("opencode.db"),
             "opencode_database_revalidate",
         )?;
-        if file_identity(&root) != binding.root_identity
-            || file_identity(&database) != binding.database_identity
+        if aql_fs::directory_identity(&binding.path)
+            .map_err(|_| AdapterError::SnapshotUnavailable)?
+            != binding.root_identity
+            || aql_fs::file_identity(&binding.path.join("opencode.db"))
+                .map_err(|_| AdapterError::SnapshotUnavailable)?
+                != binding.database_identity
             || optional_file_identity(
                 &binding.path.join("opencode.db-wal"),
                 "opencode_wal_revalidate",

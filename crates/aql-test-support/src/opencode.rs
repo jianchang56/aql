@@ -337,10 +337,7 @@ fn create_oversized_fixtures(output: &Path) -> TestResult {
     Ok(())
 }
 
-#[cfg(unix)]
 fn create_symlink_fixture(output: &Path) -> TestResult {
-    use std::os::unix::fs::symlink;
-
     create_root(output, "symlink-db-target")?;
     insert_session(
         output,
@@ -350,16 +347,11 @@ fn create_symlink_fixture(output: &Path) -> TestResult {
         None,
     )?;
     fs::create_dir_all(output.join("symlink-db"))?;
-    symlink(
-        "../symlink-db-target/opencode.db",
-        output.join("symlink-db/opencode.db"),
+    super::symlink_file(
+        Path::new("../symlink-db-target/opencode.db"),
+        &output.join("symlink-db/opencode.db"),
     )?;
     manifest(output, "symlink-db", "rejected", 0, 0, 0, 1)
-}
-
-#[cfg(not(unix))]
-fn create_symlink_fixture(_output: &Path) -> TestResult {
-    Err("OpenCode symlink fixtures require Unix".into())
 }
 
 fn manifest(

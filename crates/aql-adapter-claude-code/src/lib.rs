@@ -42,11 +42,7 @@ pub(crate) struct RootBinding {
     projects_identity: FileIdentity,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
+pub(crate) type FileIdentity = aql_fs::FileIdentity;
 
 #[derive(Clone)]
 pub(crate) struct TranscriptDescriptor {
@@ -130,7 +126,7 @@ impl ClaudeCodeAdapter {
         let path = path.canonicalize().map_err(|_| AdapterError::NotFound {
             stage: "claude_root_canonicalize".to_string(),
         })?;
-        let root_metadata = fs::metadata(&path).map_err(|_| AdapterError::NotFound {
+        let root_identity = aql_fs::directory_identity(&path).map_err(|_| AdapterError::NotFound {
             stage: "claude_root_identity".to_string(),
         })?;
         let projects = path.join("projects");
@@ -143,11 +139,16 @@ impl ClaudeCodeAdapter {
                 stage: "claude_projects_type".to_string(),
             });
         }
+        let projects_identity = aql_fs::directory_identity(&projects).map_err(|_| {
+            AdapterError::UnsupportedFormat {
+                stage: "claude_projects_identity".to_string(),
+            }
+        })?;
         Ok(RootBinding {
             path,
-            identity: file_identity(&root_metadata),
+            identity: root_identity,
             projects,
-            projects_identity: file_identity(&projects_metadata),
+            projects_identity,
         })
     }
 
@@ -491,9 +492,8 @@ fn enumerate_transcripts(root: &RootBinding) -> Result<TranscriptInventory, Adap
         }
         let project_path = project.path();
         validate_directory(&project_path)?;
-        let project_identity = file_identity(
-            &fs::symlink_metadata(&project_path).map_err(|_| AdapterError::SnapshotUnavailable)?,
-        );
+        let project_identity = aql_fs::directory_identity(&project_path)
+            .map_err(|_| AdapterError::SnapshotUnavailable)?;
         let files = fs::read_dir(&project_path).map_err(|_| AdapterError::PermissionDenied {
             stage: "claude_project_read".to_string(),
         })?;
@@ -562,7 +562,8 @@ fn enumerate_transcripts(root: &RootBinding) -> Result<TranscriptInventory, Adap
                 project_identity,
                 project_key: project_key.clone(),
                 kind,
-                identity: file_identity(&metadata),
+                identity: aql_fs::file_identity(&entry.path())
+                    .map_err(|_| AdapterError::SnapshotUnavailable)?,
                 len: metadata.len(),
                 updated_at: metadata.modified().ok().map(DateTime::<Utc>::from),
             });
@@ -588,10 +589,14 @@ pub(crate) fn validate_root_identity(root: &RootBinding) -> Result<(), AdapterEr
         fs::symlink_metadata(&root.projects).map_err(|_| AdapterError::SnapshotUnavailable)?;
     if root_metadata.file_type().is_symlink()
         || !root_metadata.is_dir()
-        || file_identity(&root_metadata) != root.identity
+        || aql_fs::directory_identity(&root.path)
+            .map_err(|_| AdapterError::SnapshotUnavailable)?
+            != root.identity
         || projects_metadata.file_type().is_symlink()
         || !projects_metadata.is_dir()
-        || file_identity(&projects_metadata) != root.projects_identity
+        || aql_fs::directory_identity(&root.projects)
+            .map_err(|_| AdapterError::SnapshotUnavailable)?
+            != root.projects_identity
     {
         return Err(AdapterError::SnapshotUnavailable);
     }
@@ -609,9 +614,10 @@ pub(crate) fn validate_descriptor_chain(
         return Err(AdapterError::SnapshotUnavailable);
     }
     validate_directory(&descriptor.project)?;
-    let project_metadata =
-        fs::symlink_metadata(&descriptor.project).map_err(|_| AdapterError::SnapshotUnavailable)?;
-    if file_identity(&project_metadata) != descriptor.project_identity {
+    if aql_fs::directory_identity(&descriptor.project)
+        .map_err(|_| AdapterError::SnapshotUnavailable)?
+        != descriptor.project_identity
+    {
         return Err(AdapterError::SnapshotUnavailable);
     }
     Ok(())
@@ -635,20 +641,16 @@ pub(crate) fn open_transcript(
     })?;
     if before.file_type().is_symlink()
         || !before.is_file()
-        || file_identity(&before) != descriptor.identity
+        || aql_fs::file_identity(&descriptor.path)
+            .map_err(|_| AdapterError::SnapshotUnavailable)?
+            != descriptor.identity
         || before.len() < descriptor.len
     {
         return Err(AdapterError::SnapshotUnavailable);
     }
-    let mut options = File::options();
+    let mut options = cap_std::fs::OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options
-        .open(&descriptor.path)
+    let file = aql_fs::open_ambient_file(&descriptor.path, options)
         .map_err(|_| AdapterError::PermissionDenied {
             stage: "claude_transcript_open".to_string(),
         })?;
@@ -658,12 +660,12 @@ pub(crate) fn open_transcript(
             stage: "claude_transcript_metadata".to_string(),
         })?;
     if !opened.is_file()
-        || file_identity(&opened) != descriptor.identity
+        || aql_fs::identity(&opened) != descriptor.identity
         || opened.len() < descriptor.len
     {
         return Err(AdapterError::SnapshotUnavailable);
     }
-    Ok(file)
+    Ok(file.into_std())
 }
 
 pub(crate) fn revalidate_transcript(
@@ -674,27 +676,10 @@ pub(crate) fn revalidate_transcript(
     let metadata = file
         .metadata()
         .map_err(|_| AdapterError::SnapshotUnavailable)?;
-    if file_identity(&metadata) != descriptor.identity || metadata.len() < descriptor.len {
+    if metadata.len() < descriptor.len {
         return Err(AdapterError::SnapshotUnavailable);
     }
     validate_descriptor_chain(root, descriptor)
-}
-
-#[cfg(unix)]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    use std::os::unix::fs::MetadataExt;
-    FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    }
-}
-
-#[cfg(not(unix))]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    FileIdentity {
-        device: metadata.len(),
-        inode: 0,
-    }
 }
 
 fn safe_component(value: &str, maximum: usize) -> bool {

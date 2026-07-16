@@ -148,10 +148,9 @@ pub fn generate_claude(output: &Path) -> TestResult {
             Value::String("Synthetic symlink".into()),
         )],
     )?;
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(
+    super::symlink_file(
         &target,
-        main_path(output, "symlink-transcript", MAIN_SESSION),
+        &main_path(output, "symlink-transcript", MAIN_SESSION),
     )?;
 
     make_private_tree(output)?;
