@@ -7,7 +7,7 @@
 
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::{fs, os::unix::fs::MetadataExt, path::PathBuf};
+use std::{fs, path::PathBuf};
 
 fn main() {
     if let Err(error) = run() {
@@ -420,7 +420,7 @@ fn run_aql(
 }
 
 #[derive(PartialEq, Eq)]
-struct Snapshot(Vec<(String, u64, u64, u32, u64, i64)>);
+struct Snapshot(Vec<(String, u64, u64, bool, u64, u128)>);
 
 fn source_snapshot(adapter: &str, root: &Path) -> Result<Snapshot, Box<dyn std::error::Error>> {
     let root_metadata = fs::symlink_metadata(root)?;
@@ -455,13 +455,19 @@ fn source_snapshot(adapter: &str, root: &Path) -> Result<Snapshot, Box<dyn std::
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err("real smoke allowlist contains an unsafe file".into());
         }
+        let identity = aql_fs::file_identity(&path)?;
+        let modified = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         snapshot.push((
             path.strip_prefix(root)?.to_string_lossy().into_owned(),
-            metadata.dev(),
-            metadata.ino(),
-            metadata.mode(),
+            identity.device(),
+            identity.inode(),
+            metadata.permissions().readonly(),
             metadata.len(),
-            metadata.mtime_nsec(),
+            modified,
         ));
     }
     Ok(Snapshot(snapshot))
