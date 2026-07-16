@@ -63,7 +63,8 @@ pub fn file_identity(path: &Path) -> io::Result<FileIdentity> {
 
 /// Opens a normalized absolute directory without following any path-component symlink.
 pub fn open_absolute_dir(path: &Path) -> io::Result<Dir> {
-    let (root, components) = split_absolute(path)?;
+    let path = normalize_absolute_path(path);
+    let (root, components) = split_absolute(&path)?;
     let mut directory = Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
     for component in components {
         directory = directory.open_dir_nofollow(component)?;
@@ -74,7 +75,8 @@ pub fn open_absolute_dir(path: &Path) -> io::Result<Dir> {
 /// Opens an absolute directory, creating missing components without following
 /// symlinks and applying the requested private mode where supported.
 pub fn open_or_create_absolute_dir(path: &Path, mode: u32) -> io::Result<Dir> {
-    let (root, components) = split_absolute(path)?;
+    let path = normalize_absolute_path(path);
+    let (root, components) = split_absolute(&path)?;
     let mut directory = Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
     for component in components {
         match directory.open_dir_nofollow(component) {
@@ -151,11 +153,23 @@ pub fn open_parent(root: &Dir, path: &Path) -> io::Result<(Dir, OsString)> {
 
 /// Flushes directory metadata to stable storage where the platform supports it.
 pub fn sync_dir(directory: &Dir) -> io::Result<()> {
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        directory.try_clone()?.into_std_file().sync_all()
+        use std::os::fd::AsFd as _;
+
+        let descriptor = rustix::fs::openat(
+            directory.as_fd(),
+            ".",
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        rustix::fs::fsync(descriptor).map_err(io::Error::from)
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
         let _ = directory;
         Ok(())
@@ -299,6 +313,22 @@ fn split_absolute(path: &Path) -> io::Result<(PathBuf, Vec<&OsStr>)> {
     Ok((root, names))
 }
 
+#[cfg(target_os = "macos")]
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+        let alias = Path::new(alias);
+        if let Ok(relative) = path.strip_prefix(alias) {
+            return Path::new(target).join(relative);
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 fn normal_components(path: &Path) -> io::Result<Vec<&OsStr>> {
     let mut names = Vec::new();
     for component in path.components() {
@@ -331,6 +361,7 @@ mod tests {
         assert!(temporary.path().join("created/nested").is_dir());
         let root = Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority())
             .expect("temporary capability");
+        sync_dir(&root).expect("directory metadata sync succeeds");
         open_relative_dir(&root, Path::new("child")).expect("relative directory opens");
         assert!(open_relative_dir(&root, Path::new("../escape")).is_err());
     }
