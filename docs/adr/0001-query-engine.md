@@ -8,7 +8,7 @@ Accepted for the focused read-only product.
 
 AQL requires a SQL engine that preserves the engine-independent Adapter Contract, receives projection information before source access, leaves unsupported predicates for engine-side evaluation, does not apply unsafe limits, supports cancellation and resource controls, and stays below 512 MiB RSS on the 1M-row synthetic metadata benchmark.
 
-The candidates were GitQL 0.43.0 and DataFusion 54.0.0. Both spikes used the same four-column synthetic sessions schema and the queries defined in `docs/engine-spike-scorecard.md`.
+The candidates were GitQL 0.43.0 and DataFusion 54.0.0. The historical spikes used the same four-column synthetic sessions schema and the queries defined in `docs/engine-spike-scorecard.md`.
 
 ## Candidates
 
@@ -68,16 +68,16 @@ Q1, 1M rows, five release runs:
 | GitQL | 19,401 ms | 19,488 ms | 411,795,456 bytes |
 | DataFusion | 57 ms | 68 ms | 110,837,760 bytes |
 
-Full evidence:
-
-- `benchmarks/engine/gitql.json`
-- `benchmarks/engine/datafusion.json`
+The detailed benchmark JSON and standalone spike projects are no longer kept in the
+production repository; the table above preserves the historical measurements used for
+the decision.
 
 ## Decision
 
 Use DataFusion 54.0.0 as the only production query engine for the AQL MVP.
 
-The GitQL spike remains isolated under `spikes/gitql` as reproducible decision evidence. It must not be referenced by the production workspace or exposed through a runtime engine switch.
+The standalone spike projects were removed after the decision. GitQL must not be
+reintroduced into the production workspace or exposed through a runtime engine switch.
 
 ## Consequences
 
