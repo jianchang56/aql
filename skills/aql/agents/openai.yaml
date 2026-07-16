@@ -1,0 +1,4 @@
+interface:
+  display_name: "AQL 本地数据查询"
+  short_description: "安全查询本地 Claude Code、Codex、Kimi Code 与 OpenCode 数据"
+  default_prompt: "Use $aql to query local Agent data with explicit read-only SQL and minimum access grants."
