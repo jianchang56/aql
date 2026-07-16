@@ -1,3 +1,10 @@
+//! Repository verification entry point for AQL.
+//!
+//! `cargo xtask verify` composes workspace, documentation, release, fixture,
+//! security, and performance gates using synthetic data only.
+
+#![deny(missing_docs)]
+
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::{fs, os::unix::fs::MetadataExt, path::PathBuf};

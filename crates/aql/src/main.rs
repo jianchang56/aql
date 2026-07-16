@@ -1,3 +1,11 @@
+//! AQL command-line application.
+//!
+//! The binary exposes explicit database selection, a read-only SQL query path,
+//! an interactive shell, deterministic metadata commands, and transactional
+//! rendering. It does not persist SQL history, query results, or access grants.
+
+#![deny(missing_docs)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
