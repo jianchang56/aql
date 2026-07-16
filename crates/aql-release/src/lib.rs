@@ -456,6 +456,29 @@ pub fn publish(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 struct Identity(PathBuf, u64, u64);
 #[derive(Clone, Copy)]
 struct ManagedFileIdentity(u64, u64);
+
+fn stat_device(stat: &rustix::fs::Stat) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(stat.st_dev)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        u64::try_from(stat.st_dev).ok()
+    }
+}
+
+fn permission_mode(stat: &rustix::fs::Stat) -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        stat.st_mode & 0o777
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        u32::from(stat.st_mode & 0o777)
+    }
+}
+
 fn prefix(path: &Path, exists: bool) -> Result<Vec<Identity>> {
     if !path.is_absolute()
         || path == Path::new("/")
@@ -614,7 +637,7 @@ fn read_managed_file(
         .read_to_end(&mut bytes)?;
     let after = file.metadata()?;
     let identity = ManagedFileIdentity(
-        u64::try_from(before.st_dev).map_err(|_| Error::new("invalid installed file device"))?,
+        stat_device(&before).ok_or_else(|| Error::new("invalid installed file device"))?,
         before.st_ino,
     );
     if after.dev() != identity.0
@@ -714,7 +737,7 @@ pub fn install(
     let parent_identity = ids
         .last()
         .ok_or_else(|| Error::new("prefix parent identity is missing"))?;
-    if u64::try_from(parent_stat.st_dev).ok() != Some(parent_identity.1)
+    if stat_device(&parent_stat) != Some(parent_identity.1)
         || parent_stat.st_ino != parent_identity.2
     {
         return fail("prefix parent changed before publication");
@@ -746,9 +769,7 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
     let root_identity = ids
         .last()
         .ok_or_else(|| Error::new("prefix identity is missing"))?;
-    if u64::try_from(root_stat.st_dev).ok() != Some(root_identity.1)
-        || root_stat.st_ino != root_identity.2
-    {
+    if stat_device(&root_stat) != Some(root_identity.1) || root_stat.st_ino != root_identity.2 {
         return fail("install prefix changed before uninstall");
     }
     let manifest_descriptor = openat(
@@ -784,8 +805,8 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
     identities.insert(
         "UNINSTALL_MANIFEST".to_string(),
         ManagedFileIdentity(
-            u64::try_from(manifest_stat.st_dev)
-                .map_err(|_| Error::new("invalid uninstall manifest device"))?,
+            stat_device(&manifest_stat)
+                .ok_or_else(|| Error::new("invalid uninstall manifest device"))?,
             manifest_stat.st_ino,
         ),
     );
@@ -822,7 +843,7 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
             return fail("installed manifest entry is invalid");
         }
         let (content, stat, identity) = read_managed_file(&root, Path::new(relative), MAX_ARCHIVE)?;
-        if u32::from(stat.st_mode & 0o777) != mode
+        if permission_mode(&stat) != mode
             || content.len() != entry.size
             || hex::encode(Sha256::digest(&content)) != entry.sha256
         {
@@ -838,7 +859,7 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
             .get(relative)
             .ok_or_else(|| Error::new("installed file identity is missing"))?;
         if !FileType::from_raw_mode(stat.st_mode).is_file()
-            || u64::try_from(stat.st_dev).ok() != Some(expected.0)
+            || stat_device(&stat) != Some(expected.0)
             || stat.st_ino != expected.1
         {
             return fail("installed file was replaced");
@@ -851,7 +872,7 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
             .get(relative)
             .ok_or_else(|| Error::new("installed file identity is missing"))?;
         if !FileType::from_raw_mode(stat.st_mode).is_file()
-            || u64::try_from(stat.st_dev).ok() != Some(expected.0)
+            || stat_device(&stat) != Some(expected.0)
             || stat.st_ino != expected.1
         {
             return fail("installed file changed during uninstall");
