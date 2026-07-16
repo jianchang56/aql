@@ -7,18 +7,14 @@
 #![deny(missing_docs)]
 
 use flate2::{Compression, Decompress, FlushDecompress, GzBuilder, Status};
-use rustix::fd::OwnedFd;
-use rustix::fs::{
-    AtFlags, CWD, FileType, Mode, OFlags, RenameFlags, fstat, openat, renameat_with, statat,
-    unlinkat,
-};
+use aql_fs::{FileIdentity, identity};
+use cap_std::fs::{Dir, Metadata as CapMetadata, OpenOptions as CapOpenOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use tar::{Archive, Builder, EntryType, Header};
@@ -66,11 +62,6 @@ impl From<std::io::Error> for Error {
 }
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
-        Self(value.to_string())
-    }
-}
-impl From<rustix::io::Errno> for Error {
-    fn from(value: rustix::io::Errno) -> Self {
         Self(value.to_string())
     }
 }
@@ -194,10 +185,9 @@ fn local(path: &Path, limit: u64) -> Result<Vec<u8>> {
     if text == "-" || text.contains("://") {
         return fail("input must be a local file");
     }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .open(path)?;
+    let mut options = CapOpenOptions::new();
+    options.read(true);
+    let mut file = aql_fs::open_ambient_file(path, options)?.into_std();
     let meta = file.metadata()?;
     if !meta.is_file() || meta.len() > limit {
         return fail("input is not a bounded regular file");
@@ -472,8 +462,7 @@ pub fn publish(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let mut temp = tempfile::Builder::new()
         .prefix(".aql-release-")
         .tempfile_in(parent)?;
-    temp.as_file()
-        .set_permissions(fs::Permissions::from_mode(mode))?;
+    aql_fs::set_file_mode(temp.as_file(), mode)?;
     temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
     fs::hard_link(temp.path(), path)?;
@@ -482,47 +471,29 @@ pub fn publish(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 }
 
 #[derive(Clone)]
-struct Identity(PathBuf, u64, u64);
+struct Identity(PathBuf, FileIdentity);
 #[derive(Clone, Copy)]
-struct ManagedFileIdentity(u64, u64);
-
-fn stat_device(stat: &rustix::fs::Stat) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        Some(stat.st_dev)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        u64::try_from(stat.st_dev).ok()
-    }
-}
-
-fn permission_mode(stat: &rustix::fs::Stat) -> u32 {
-    #[cfg(target_os = "linux")]
-    {
-        stat.st_mode & 0o777
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        u32::from(stat.st_mode & 0o777)
-    }
-}
+struct ManagedFileIdentity(FileIdentity);
 
 fn prefix(path: &Path, exists: bool) -> Result<Vec<Identity>> {
     if !path.is_absolute()
-        || path == Path::new("/")
+        || path.parent().is_none()
         || path
             .components()
             .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
     {
         return fail("prefix must be normalized and absolute");
     }
-    let home =
-        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| Error::new("HOME is required"))?);
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::new("user home is required"))?;
     let data = std::env::var_os("XDG_DATA_HOME")
+        .or_else(|| std::env::var_os("LOCALAPPDATA"))
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"));
     let config = std::env::var_os("XDG_CONFIG_HOME")
+        .or_else(|| std::env::var_os("APPDATA"))
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"));
     let state = std::env::var_os("AQL_HOME")
@@ -545,36 +516,44 @@ fn prefix(path: &Path, exists: bool) -> Result<Vec<Identity>> {
             return fail("prefix overlaps protected data");
         }
     }
-    let mut current = PathBuf::from("/");
-    let parts = path.components().skip(1).collect::<Vec<_>>();
+    let mut ancestors = path.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
     let mut ids = Vec::new();
-    for (index, part) in parts.iter().enumerate() {
-        current.push(part.as_os_str());
-        match fs::symlink_metadata(&current) {
+    for (index, current) in ancestors.iter().enumerate() {
+        if current.parent().is_none() {
+            continue;
+        }
+        match fs::symlink_metadata(current) {
             Ok(m) => {
                 if m.file_type().is_symlink() || !m.is_dir() {
                     return fail("prefix chain is unsafe");
                 }
-                ids.push(Identity(current.clone(), m.dev(), m.ino()));
-                if !exists && index + 1 == parts.len() {
+                ids.push(Identity(
+                    (*current).to_path_buf(),
+                    aql_fs::directory_identity(current)?,
+                ));
+                if !exists && index + 1 == ancestors.len() {
                     return fail("prefix already exists");
                 }
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound
                     && !exists
-                    && index + 1 == parts.len() =>
+                    && index + 1 == ancestors.len() =>
             {
                 break;
             }
             Err(_) => return fail("prefix parent is missing"),
         }
     }
-    let m = fs::symlink_metadata(
-        path.parent()
-            .ok_or_else(|| Error::new("prefix has no parent"))?,
-    )?;
-    if m.uid() != rustix::process::getuid().as_raw() || m.mode() & 0o022 != 0 {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::new("prefix has no parent"))?;
+    let parent_dir = aql_fs::open_absolute_dir(parent)?;
+    let parent_metadata = parent_dir.dir_metadata()?;
+    if !aql_fs::owned_by_current_user(&parent_metadata)
+        || aql_fs::mode(&parent_metadata).is_some_and(|mode| mode & 0o022 != 0)
+    {
         return fail("prefix parent is not private and owned");
     }
     Ok(ids)
@@ -602,81 +581,59 @@ fn protected_roots(home: &Path, data: &Path, state: PathBuf, aql_config: PathBuf
     ]
 }
 fn revalidate(ids: &[Identity]) -> Result<()> {
-    for Identity(path, dev, ino) in ids {
+    for Identity(path, expected) in ids {
         let m = fs::symlink_metadata(path)?;
-        if m.file_type().is_symlink() || !m.is_dir() || m.dev() != *dev || m.ino() != *ino {
+        if m.file_type().is_symlink()
+            || !m.is_dir()
+            || aql_fs::directory_identity(path)? != *expected
+        {
             return fail("prefix identity changed");
         }
     }
     Ok(())
 }
 
-fn open_directory(path: &Path) -> Result<OwnedFd> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    let mut descriptor = openat(CWD, "/", flags, Mode::empty())?;
-    for component in path.components().skip(1) {
-        let Component::Normal(name) = component else {
-            return fail("directory path is not normalized");
-        };
-        descriptor = openat(&descriptor, Path::new(name), flags, Mode::empty())?;
-    }
-    Ok(descriptor)
+fn open_directory(path: &Path) -> Result<Dir> {
+    Ok(aql_fs::open_absolute_dir(path)?)
 }
 
-fn relative_parent(root: &OwnedFd, relative: &Path) -> Result<(OwnedFd, OsString)> {
-    let components = relative.components().collect::<Vec<_>>();
-    let Some(Component::Normal(name)) = components.last() else {
-        return fail("managed path is invalid");
-    };
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    let mut descriptor = rustix::io::dup(root)?;
-    for component in &components[..components.len() - 1] {
-        let Component::Normal(name) = component else {
-            return fail("managed path is not normalized and relative");
-        };
-        descriptor = openat(&descriptor, Path::new(*name), flags, Mode::empty())?;
-    }
-    Ok((descriptor, name.to_os_string()))
+fn relative_parent(root: &Dir, relative: &Path) -> Result<(Dir, OsString)> {
+    Ok(aql_fs::open_parent(root, relative)?)
 }
 
 fn read_managed_file(
-    root: &OwnedFd,
+    root: &Dir,
     relative: &Path,
     limit: u64,
-) -> Result<(Vec<u8>, rustix::fs::Stat, ManagedFileIdentity)> {
+) -> Result<(Vec<u8>, CapMetadata, ManagedFileIdentity)> {
     let (parent, name) = relative_parent(root, relative)?;
-    let descriptor = openat(
-        &parent,
-        &name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )?;
-    let before = fstat(&descriptor)?;
-    if !FileType::from_raw_mode(before.st_mode).is_file()
-        || before.st_uid != rustix::process::getuid().as_raw()
-        || before.st_size < 0
-        || u64::try_from(before.st_size).map_or(true, |size| size > limit)
+    let mut options = CapOpenOptions::new();
+    options.read(true);
+    let descriptor = aql_fs::open_file(&parent, Path::new(&name), options)?;
+    let before = descriptor.metadata()?;
+    if !before.is_file()
+        || !aql_fs::owned_by_current_user(&before)
+        || before.len() > limit
     {
         return fail("unsafe installed file");
     }
-    let mut file = File::from(descriptor);
+    let expected_identity = identity(&before);
+    let mut file = descriptor.into_std();
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
         .take(limit + 1)
         .read_to_end(&mut bytes)?;
     let after = file.metadata()?;
-    let identity = ManagedFileIdentity(
-        stat_device(&before).ok_or_else(|| Error::new("invalid installed file device"))?,
-        before.st_ino,
-    );
-    if after.dev() != identity.0
-        || after.ino() != before.st_ino
-        || after.len() != u64::try_from(before.st_size).unwrap_or(u64::MAX)
+    let mut reopen_options = CapOpenOptions::new();
+    reopen_options.read(true);
+    let reopened = aql_fs::open_file(&parent, Path::new(&name), reopen_options)?;
+    if identity(&reopened.metadata()?) != expected_identity
+        || after.len() != before.len()
         || bytes.len() as u64 != after.len()
     {
         return fail("installed file changed while reading");
     }
-    Ok((bytes, before, identity))
+    Ok((bytes, before, ManagedFileIdentity(expected_identity)))
 }
 fn files() -> Vec<String> {
     let mut out = PAYLOAD
@@ -710,7 +667,7 @@ pub fn install(
     let stage = tempfile::Builder::new()
         .prefix(".aql-install-")
         .tempdir_in(parent)?;
-    fs::set_permissions(stage.path(), fs::Permissions::from_mode(0o700))?;
+    aql_fs::set_mode(stage.path(), 0o700)?;
     for (relative, bytes) in &release.payload {
         let path = stage.path().join(relative);
         fs::create_dir_all(path.parent().ok_or_else(|| Error::new("invalid payload"))?)?;
@@ -722,20 +679,19 @@ pub fn install(
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(mode)
             .open(path)?;
+        aql_fs::set_file_mode(&f, mode)?;
         f.write_all(bytes)?;
-        f.set_permissions(fs::Permissions::from_mode(mode))?;
         f.sync_all()?;
     }
     let mut manifest_file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o644)
         .open(stage.path().join("manifest.json"))?;
+    aql_fs::set_file_mode(&manifest_file, 0o644)?;
     manifest_file.write_all(&release.manifest)?;
-    manifest_file.set_permissions(fs::Permissions::from_mode(0o644))?;
     manifest_file.sync_all()?;
+    drop(manifest_file);
     let uninstall = Uninstall {
         files: files(),
         schema_version: "aql-uninstall-v1".into(),
@@ -746,11 +702,11 @@ pub fn install(
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
         .open(path)?;
+    aql_fs::set_file_mode(&f, 0o600)?;
     f.write_all(&canonical(&uninstall)?)?;
-    f.set_permissions(fs::Permissions::from_mode(0o600))?;
     f.sync_all()?;
+    drop(f);
     let mut staged_directories = PAYLOAD
         .iter()
         .filter_map(|(relative, _)| Path::new(relative).parent())
@@ -759,18 +715,17 @@ pub fn install(
     staged_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     staged_directories.dedup();
     for directory in staged_directories {
-        File::open(stage.path().join(directory))?.sync_all()?;
+        aql_fs::sync_dir(&aql_fs::open_absolute_dir(&stage.path().join(directory))?)?;
     }
-    File::open(stage.path())?.sync_all()?;
-    fs::set_permissions(stage.path(), fs::Permissions::from_mode(0o755))?;
+    aql_fs::sync_dir(&aql_fs::open_absolute_dir(stage.path())?)?;
+    aql_fs::set_mode(stage.path(), 0o755)?;
     revalidate(&ids)?;
     let parent_descriptor = open_directory(parent)?;
-    let parent_stat = fstat(&parent_descriptor)?;
-    let parent_identity = ids
+    let current_parent_identity = aql_fs::identity(&parent_descriptor.dir_metadata()?);
+    let expected_parent = ids
         .last()
         .ok_or_else(|| Error::new("prefix parent identity is missing"))?;
-    if stat_device(&parent_stat) != Some(parent_identity.1)
-        || parent_stat.st_ino != parent_identity.2
+    if current_parent_identity != expected_parent.1
     {
         return fail("prefix parent changed before publication");
     }
@@ -781,16 +736,11 @@ pub fn install(
     let destination_name = destination
         .file_name()
         .ok_or_else(|| Error::new("prefix name is missing"))?;
-    renameat_with(
-        &parent_descriptor,
-        stage_name,
-        &parent_descriptor,
-        destination_name,
-        RenameFlags::NOREPLACE,
-    )
+    let _ = (stage_name, destination_name);
+    aql_fs::rename_ambient_noreplace(stage.path(), destination)
     .map_err(|e| Error::new(format!("atomic publish failed: {e}")))?;
     let _ = stage.keep();
-    File::open(parent)?.sync_all()?;
+    aql_fs::sync_dir(&parent_descriptor)?;
     revalidate(&ids)
 }
 
@@ -798,33 +748,34 @@ pub fn install(
 pub fn uninstall(destination: &Path) -> Result<bool> {
     let ids = prefix(destination, true)?;
     let root = open_directory(destination)?;
-    let root_stat = fstat(&root)?;
+    let root_stat = root.dir_metadata()?;
     let root_identity = ids
         .last()
         .ok_or_else(|| Error::new("prefix identity is missing"))?;
-    if stat_device(&root_stat) != Some(root_identity.1) || root_stat.st_ino != root_identity.2 {
+    if identity(&root_stat) != root_identity.1 {
         return fail("install prefix changed before uninstall");
     }
-    let manifest_descriptor = openat(
+    let mut manifest_options = CapOpenOptions::new();
+    manifest_options.read(true);
+    let manifest_descriptor = aql_fs::open_file(
         &root,
-        "UNINSTALL_MANIFEST",
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
+        Path::new("UNINSTALL_MANIFEST"),
+        manifest_options,
     )?;
-    let manifest_stat = fstat(&manifest_descriptor)?;
-    if !FileType::from_raw_mode(manifest_stat.st_mode).is_file()
-        || manifest_stat.st_uid != rustix::process::getuid().as_raw()
-        || manifest_stat.st_mode & 0o077 != 0
-        || manifest_stat.st_size > 1024 * 1024
+    let manifest_stat = manifest_descriptor.metadata()?;
+    if !manifest_stat.is_file()
+        || !aql_fs::owned_by_current_user(&manifest_stat)
+        || aql_fs::mode(&manifest_stat).is_some_and(|mode| mode & 0o077 != 0)
+        || manifest_stat.len() > 1024 * 1024
     {
         return fail("unsafe uninstall manifest");
     }
-    let mut manifest_file = File::from(manifest_descriptor);
+    let mut manifest_file = manifest_descriptor.into_std();
     let mut bytes = Vec::new();
     Read::by_ref(&mut manifest_file)
         .take(1024 * 1024 + 1)
         .read_to_end(&mut bytes)?;
-    if usize::try_from(manifest_stat.st_size).ok() != Some(bytes.len()) {
+    if manifest_stat.len() as usize != bytes.len() {
         return fail("uninstall manifest changed while reading");
     }
     let parsed: Uninstall = serde_json::from_slice(&bytes)?;
@@ -837,15 +788,11 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
     let mut identities = BTreeMap::new();
     identities.insert(
         "UNINSTALL_MANIFEST".to_string(),
-        ManagedFileIdentity(
-            stat_device(&manifest_stat)
-                .ok_or_else(|| Error::new("invalid uninstall manifest device"))?,
-            manifest_stat.st_ino,
-        ),
+        ManagedFileIdentity(identity(&manifest_stat)),
     );
     let (installed_manifest_bytes, installed_manifest_stat, installed_manifest_identity) =
         read_managed_file(&root, Path::new("manifest.json"), 1024 * 1024)?;
-    if installed_manifest_stat.st_mode & 0o777 != 0o644 {
+    if aql_fs::mode(&installed_manifest_stat).is_some_and(|mode| mode & 0o777 != 0o644) {
         return fail("installed manifest mode changed");
     }
     let installed_manifest: Manifest = serde_json::from_slice(&installed_manifest_bytes)?;
@@ -876,7 +823,7 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
             return fail("installed manifest entry is invalid");
         }
         let (content, stat, identity) = read_managed_file(&root, Path::new(relative), MAX_ARCHIVE)?;
-        if permission_mode(&stat) != mode
+        if aql_fs::mode(&stat).is_some_and(|actual| actual != mode)
             || content.len() != entry.size
             || hex::encode(Sha256::digest(&content)) != entry.sha256
         {
@@ -887,30 +834,26 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
     revalidate(&ids)?;
     for relative in &parsed.files {
         let (parent, name) = relative_parent(&root, Path::new(relative))?;
-        let stat = statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let stat = parent.symlink_metadata(&name)?;
         let expected = identities
             .get(relative)
             .ok_or_else(|| Error::new("installed file identity is missing"))?;
-        if !FileType::from_raw_mode(stat.st_mode).is_file()
-            || stat_device(&stat) != Some(expected.0)
-            || stat.st_ino != expected.1
+        if !stat.is_file() || identity(&stat) != expected.0
         {
             return fail("installed file was replaced");
         }
     }
     for relative in parsed.files.iter().rev() {
         let (parent, name) = relative_parent(&root, Path::new(relative))?;
-        let stat = statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let stat = parent.symlink_metadata(&name)?;
         let expected = identities
             .get(relative)
             .ok_or_else(|| Error::new("installed file identity is missing"))?;
-        if !FileType::from_raw_mode(stat.st_mode).is_file()
-            || stat_device(&stat) != Some(expected.0)
-            || stat.st_ino != expected.1
+        if !stat.is_file() || identity(&stat) != expected.0
         {
             return fail("installed file changed during uninstall");
         }
-        unlinkat(&parent, &name, AtFlags::empty())?;
+        parent.remove_file(&name)?;
     }
     let mut dirs = PAYLOAD
         .iter()
@@ -931,9 +874,10 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
     dirs.dedup();
     for dir in dirs {
         if let Ok((parent, name)) = relative_parent(&root, &dir) {
-            let _ = unlinkat(parent, name, AtFlags::REMOVEDIR);
+            let _ = parent.remove_dir(name);
         }
     }
+    drop(root);
     let parent = open_directory(
         destination
             .parent()
@@ -942,9 +886,9 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
     let destination_name = destination
         .file_name()
         .ok_or_else(|| Error::new("prefix name is missing"))?;
-    match unlinkat(parent, destination_name, AtFlags::REMOVEDIR) {
+    match parent.remove_dir(destination_name) {
         Ok(()) => Ok(false),
-        Err(error) if error == rustix::io::Errno::NOTEMPTY => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(true),
         Err(error) => Err(Error::new(error.to_string())),
     }
 }
@@ -952,6 +896,24 @@ pub fn uninstall(destination: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn symlink_file(source: &Path, target: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(source, target)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(source: &Path, target: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(source, target)
+    }
+
+    fn synthetic_path(value: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\synthetic").join(value)
+        } else {
+            PathBuf::from("/synthetic").join(value)
+        }
+    }
 
     fn archive(entries: &[(String, Vec<u8>, u32, EntryType)]) -> Vec<u8> {
         let mut tar = Vec::new();
@@ -1070,7 +1032,7 @@ mod tests {
             assert!(verify(&path, &digest, "1.2.3", "aarch64-macos").is_err());
         }
         let link = temporary.path().join("archive-link");
-        std::os::unix::fs::symlink(&path, &link).expect("archive symlink");
+        symlink_file(&path, &link).expect("archive symlink");
         assert!(verify(&link, &digest, "1.2.3", "aarch64-macos").is_err());
     }
 
@@ -1081,7 +1043,7 @@ mod tests {
             .path()
             .canonicalize()
             .expect("canonical temporary");
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("private parent");
+        aql_fs::set_mode(&parent, 0o700).expect("private parent");
         let bytes = archive(&valid_entries());
         let (archive_path, digest) = write_archive(&parent, "release.tar.gz", &bytes);
         let destination = parent.join("installed");
@@ -1109,7 +1071,7 @@ mod tests {
             .path()
             .canonicalize()
             .expect("canonical temporary");
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("private parent");
+        aql_fs::set_mode(&parent, 0o700).expect("private parent");
         let bytes = archive(&valid_entries());
         let (archive_path, digest) = write_archive(&parent, "release.tar.gz", &bytes);
         let destination = parent.join("installed");
@@ -1134,13 +1096,13 @@ mod tests {
 
     #[test]
     fn install_prefixes_cannot_overlap_any_agent_store() {
-        let home = Path::new("/synthetic/home");
-        let data = Path::new("/synthetic/data");
+        let home = synthetic_path("home");
+        let data = synthetic_path("data");
         let roots = protected_roots(
-            home,
-            data,
-            PathBuf::from("/synthetic/state/aql"),
-            PathBuf::from("/synthetic/config/aql"),
+            &home,
+            &data,
+            synthetic_path("state/aql"),
+            synthetic_path("config/aql"),
         );
         for protected in [
             home.join(".claude"),
@@ -1151,7 +1113,7 @@ mod tests {
             assert!(roots.contains(&protected));
         }
         assert!(validate_environment_root(Path::new("relative/home")).is_err());
-        assert!(validate_environment_root(Path::new("/synthetic/../home")).is_err());
-        assert!(validate_environment_root(Path::new("/synthetic/home")).is_ok());
+        assert!(validate_environment_root(&synthetic_path("../home")).is_err());
+        assert!(validate_environment_root(&home).is_ok());
     }
 }

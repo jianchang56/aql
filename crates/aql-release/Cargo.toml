@@ -6,10 +6,11 @@ version.workspace = true
 publish = false
 
 [dependencies]
+aql-fs = { path = "../aql-fs" }
+cap-std.workspace = true
 clap = { workspace = true, features = ["derive"] }
 flate2 = { workspace = true, features = ["zlib-rs"] }
 hex.workspace = true
-rustix = { workspace = true, features = ["fs", "process"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
