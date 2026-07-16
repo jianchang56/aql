@@ -32,13 +32,13 @@ AQL 不上传数据，不调用 Agent 程序，不读取认证配置，也不会
 当前版本需要 Rust `1.96.1`：
 
 ```bash
-cargo build --locked --release -p aql-cli
+cargo build --locked --release -p aql
 ```
 
 或者安装到 Cargo bin 目录：
 
 ```bash
-cargo install --locked --path crates/aql-cli
+cargo install --locked --path crates/aql
 ```
 
 下文假设 `aql` 已加入 `PATH`。GitHub release、Homebrew Formula、本地可验证 archive、升级和卸载见 [安装文档](docs/installation.md)。

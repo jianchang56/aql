@@ -9,7 +9,7 @@ members = [
     "crates/aql-adapter-claude-code",
     "crates/aql-engine-datafusion",
     "crates/aql-config",
-    "crates/aql-cli",
+    "crates/aql",
     "crates/aql-test-support",
     "crates/aql-release",
     "tools/xtask",

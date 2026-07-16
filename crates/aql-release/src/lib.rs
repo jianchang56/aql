@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use tar::{Archive, Builder, EntryType, Header};
 
 pub const PACKAGE: &str = "aql";
-const BUILD_PACKAGE: &str = "aql-cli";
+const BUILD_PACKAGE: &str = "aql";
 pub const PAYLOAD: [(&str, u32); 9] = [
     ("bin/aql", 0o755),
     ("share/bash-completion/completions/aql", 0o644),

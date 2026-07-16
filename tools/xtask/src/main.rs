@@ -54,7 +54,7 @@ fn verify(scope: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("workspace") => verify_workspace()?,
         Some("cli") => {
-            run_cargo(&["test", "--locked", "-p", "aql-cli"])?;
+            run_cargo(&["test", "--locked", "-p", "aql"])?;
         }
         Some("adapters") => {
             run_cargo(&[
@@ -336,7 +336,7 @@ fn real_smoke() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("AQL_RUN_REAL_SMOKE").as_deref() != Ok("1") {
         return Err("real smoke requires explicit AQL_RUN_REAL_SMOKE=1 authorization".into());
     }
-    run_cargo(&["build", "--locked", "-p", "aql-cli"])?;
+    run_cargo(&["build", "--locked", "-p", "aql"])?;
     let home = std::env::var_os("AQL_REAL_HOME")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)

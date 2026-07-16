@@ -5,7 +5,7 @@
 要求 Rust `1.96.1`：
 
 ```bash
-cargo build --locked --release -p aql-cli
+cargo build --locked --release -p aql
 ```
 
 二进制位于：
@@ -17,7 +17,7 @@ target/release/aql
 也可以安装到 Cargo bin：
 
 ```bash
-cargo install --locked --path crates/aql-cli
+cargo install --locked --path crates/aql
 ```
 
 AQL 不自动使用 sudo、不修改 shell 配置、不从网络下载依赖外的可执行文件。
@@ -36,7 +36,7 @@ cargo xtask verify
 `aql-release` 负责 build manifest、archive、验证、安装、卸载和 Formula 生成。发布内容只包含 allowlist 中的 AQL 文件。下面以 Apple Silicon macOS 和版本 `0.1.0` 为例；其他平台替换 `TARGET`。
 
 ```bash
-SOURCE_DATE_EPOCH=1 cargo build --locked --release -p aql-cli -p aql-release
+SOURCE_DATE_EPOCH=1 cargo build --locked --release -p aql -p aql-release
 TARGET=aarch64-macos
 
 target/release/aql-release build \
@@ -95,6 +95,27 @@ target/release/aql-release uninstall \
 卸载二进制不会自动删除配置数据库和 installation salt。用户如需删除，应先确认目录是 AQL-owned 且不与任何 Agent root 重叠。
 
 ## Homebrew Formula
+
+[`packaging/homebrew/aql.rb.in`](../packaging/homebrew/aql.rb.in) 是发布工具使用的模板，包含尚未替换的版本、URL 和 SHA256 占位符，不能直接交给 Homebrew。正式发布时，Release workflow 会验证四个平台的 archive，生成完整的 `aql.rb` 并将它上传到同一个 GitHub Release。
+
+安装指定版本时，下载该 Release 中生成的 Formula：
+
+```bash
+VERSION=0.1.0
+curl -fL \
+  "https://github.com/jianchang56/aql/releases/download/v$VERSION/aql.rb" \
+  -o aql.rb
+brew install --formula ./aql.rb
+aql --version
+```
+
+卸载：
+
+```bash
+brew uninstall aql
+```
+
+下面的命令用于发布者从四个平台的已验证 archive 手动生成 Formula，不是普通用户的安装命令：
 
 ```bash
 target/release/aql-release formula \

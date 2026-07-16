@@ -60,8 +60,8 @@ jobs:
             aarch64-*) test "$(uname -m)" = "arm64" -o "$(uname -m)" = "aarch64" ;;
             x86_64-*) test "$(uname -m)" = "x86_64" ;;
           esac
-          cargo test --locked -p aql-cli -p aql-release
-          cargo build --locked --release -p aql-cli
+          cargo test --locked -p aql -p aql-release
+          cargo build --locked --release -p aql
       - name: Build and verify deterministic archive
         run: |
           version=${GITHUB_REF_NAME#v}

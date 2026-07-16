@@ -97,6 +97,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "aql"
+version = "0.1.0"
+dependencies = [
+ "aql-adapter-api",
+ "aql-adapter-claude-code",
+ "aql-adapter-codex",
+ "aql-adapter-kimi-code",
+ "aql-adapter-opencode",
+ "aql-catalog",
+ "aql-config",
+ "aql-engine-datafusion",
+ "aql-model",
+ "aql-test-support",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "clap_mangen",
+ "datafusion",
+ "futures",
+ "humantime",
+ "rand 0.10.2",
+ "rustix",
+ "rustyline",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "unicode-width",
+]
+
+[[package]]
 name = "aql-adapter-api"
 version = "0.1.0"
 dependencies = [
@@ -168,36 +198,6 @@ dependencies = [
  "aql-model",
  "aql-test-support",
  "chrono",
-]
-
-[[package]]
-name = "aql-cli"
-version = "0.1.0"
-dependencies = [
- "aql-adapter-api",
- "aql-adapter-claude-code",
- "aql-adapter-codex",
- "aql-adapter-kimi-code",
- "aql-adapter-opencode",
- "aql-catalog",
- "aql-config",
- "aql-engine-datafusion",
- "aql-model",
- "aql-test-support",
- "chrono",
- "clap",
- "clap_complete",
- "clap_mangen",
- "datafusion",
- "futures",
- "humantime",
- "rand 0.10.2",
- "rustix",
- "rustyline",
- "serde_json",
- "tempfile",
- "tokio",
- "unicode-width",
 ]
 
 [[package]]

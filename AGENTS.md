@@ -23,7 +23,7 @@ Built-in database names are `claude`, `codex`, `kimi`, `opencode`, and explicit 
 | `crates/aql-adapter-*` | Read-only Claude Code/Codex/Kimi/OpenCode adapters |
 | `crates/aql-catalog` | Reconciliation and source identity |
 | `crates/aql-engine-datafusion` | SQL firewall, planning, authorization, execution |
-| `crates/aql-cli` | Clap CLI, interactive shell, rendering, orchestration |
+| `crates/aql` | AQL executable, Clap CLI, interactive shell, rendering, orchestration |
 | `crates/aql-config` | Private configured-database storage |
 | `crates/aql-test-support` | Deterministic synthetic Claude Code/Codex/Kimi/OpenCode fixture generators |
 | `crates/aql-release` | Deterministic archive, verification, install, uninstall and formula tooling |
