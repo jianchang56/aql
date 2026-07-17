@@ -1178,6 +1178,55 @@ fn common_string_and_time_functions_are_allowlisted() {
 }
 
 #[test]
+fn session_context_registers_only_aql_query_capabilities() {
+    let context = aql_session_context(&QueryOptions::default()).expect("context builds");
+    let state = context.state();
+
+    for function in [
+        "abs",
+        "avg",
+        "char_length",
+        "coalesce",
+        "concat",
+        "count",
+        "date_part",
+        "date_trunc",
+        "length",
+        "lower",
+        "max",
+        "min",
+        "nullif",
+        "redact",
+        "replace",
+        "round",
+        "substr",
+        "substring",
+        "sum",
+        "trim",
+        "upper",
+        "mask_path",
+    ] {
+        assert!(
+            state.scalar_functions().contains_key(function)
+                || state.aggregate_functions().contains_key(function),
+            "missing AQL function {function}"
+        );
+    }
+
+    for function in ["array_agg", "encode", "regexp_like", "row_number", "sha256"] {
+        assert!(!state.scalar_functions().contains_key(function));
+        assert!(!state.aggregate_functions().contains_key(function));
+        assert!(!state.window_functions().contains_key(function));
+    }
+    assert!(state.window_functions().is_empty());
+    assert!(state.table_functions().is_empty());
+    assert!(state.table_factories().is_empty());
+    for extension in ["arrow", "csv", "json", "ndjson", "parquet"] {
+        assert!(state.get_file_format_factory(extension).is_none());
+    }
+}
+
+#[test]
 fn engine_errors_do_not_render_internal_details() {
     let error = QueryError::Engine(DataFusionError::Plan(
         "synthetic secret literal must stay internal".to_string(),

@@ -37,9 +37,10 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::{SessionStateBuilder, SessionStateDefaults};
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, LogicalPlan, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, TableProviderFilterPushDown, TableType, TypeSignature, Volatility,
+    AggregateUDF, ColumnarValue, Expr, LogicalPlan, Operator, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, TableProviderFilterPushDown, TableType, TypeSignature, Volatility,
 };
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
@@ -1415,6 +1416,56 @@ impl PreparedQuery {
     }
 }
 
+fn aql_scalar_functions() -> Vec<Arc<ScalarUDF>> {
+    vec![
+        datafusion::functions::core::coalesce(),
+        datafusion::functions::core::nullif(),
+        datafusion::functions::datetime::date_part(),
+        datafusion::functions::datetime::date_trunc(),
+        datafusion::functions::math::abs(),
+        datafusion::functions::math::round(),
+        datafusion::functions::string::btrim(),
+        datafusion::functions::string::concat(),
+        datafusion::functions::string::lower(),
+        datafusion::functions::string::replace(),
+        datafusion::functions::string::upper(),
+        datafusion::functions::unicode::character_length(),
+        datafusion::functions::unicode::substr(),
+    ]
+}
+
+fn aql_aggregate_functions() -> Vec<Arc<AggregateUDF>> {
+    vec![
+        datafusion::functions_aggregate::average::avg_udaf(),
+        datafusion::functions_aggregate::count::count_udaf(),
+        datafusion::functions_aggregate::min_max::max_udaf(),
+        datafusion::functions_aggregate::min_max::min_udaf(),
+        datafusion::functions_aggregate::sum::sum_udaf(),
+    ]
+}
+
+fn aql_session_context(options: &QueryOptions) -> Result<SessionContext> {
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(GreedyMemoryPool::new(options.max_memory_bytes)))
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
+        .build()?;
+    let state = SessionStateBuilder::new()
+        .with_config(SessionConfig::new())
+        .with_runtime_env(Arc::new(runtime))
+        .with_expr_planners(SessionStateDefaults::default_expr_planners())
+        .with_scalar_functions(aql_scalar_functions())
+        .with_aggregate_functions(aql_aggregate_functions())
+        .build();
+    let context = SessionContext::new_with_state(state);
+    context.register_udf(ScalarUDF::new_from_impl(RedactUdf::new(
+        options.redaction_salt.clone(),
+    )));
+    context.register_udf(ScalarUDF::new_from_impl(MaskPathUdf::new()));
+    Ok(context)
+}
+
 /// Validates, authorizes, and plans one query without opening Agent sources.
 ///
 /// The returned [`PreparedQuery`] can be inspected through
@@ -1429,17 +1480,7 @@ pub async fn prepare_query(
             "query memory budget must be greater than zero",
         ));
     }
-    let runtime = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::new(GreedyMemoryPool::new(options.max_memory_bytes)))
-        .with_disk_manager_builder(
-            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
-        )
-        .build()?;
-    let context = SessionContext::new_with_config_rt(SessionConfig::new(), Arc::new(runtime));
-    context.register_udf(ScalarUDF::new_from_impl(RedactUdf::new(
-        options.redaction_salt.clone(),
-    )));
-    context.register_udf(ScalarUDF::new_from_impl(MaskPathUdf::new()));
+    let context = aql_session_context(&options)?;
     let mut providers = Vec::new();
     for query_schema in QUERY_SCHEMAS.iter().filter(|schema| schema.name != "usage") {
         let provider = Arc::new(DeferredTable::new(query_schema));
