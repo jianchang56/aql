@@ -67,3 +67,14 @@ incremental = false
 [profile.test]
 debug = 0
 incremental = false
+
+# Balance runtime performance, binary size, and release build time across all
+# supported targets. Eight codegen units retain useful compiler parallelism
+# without the high link cost of workspace-wide LTO. Keep the default unwind
+# strategy and generic CPU target so published binaries remain portable.
+[profile.release]
+opt-level = 3
+codegen-units = 8
+debug = 0
+strip = "symbols"
+incremental = false
