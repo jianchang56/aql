@@ -9,7 +9,7 @@ pub enum SqlParameter {
     Bool(bool),
     /// Signed 64-bit integer.
     Int64(i64),
-    /// Finite or non-finite 64-bit floating-point value accepted by sqlparser.
+    /// Finite 64-bit floating-point value. Non-finite values are rejected.
     Float64(f64),
     /// UTF-8 text escaped as a SQL string literal by sqlparser.
     Text(String),
@@ -73,7 +73,15 @@ pub fn bind_sql_parameters(
                 SqlParameter::Null => Value::Null,
                 SqlParameter::Bool(value) => Value::Boolean(*value),
                 SqlParameter::Int64(value) => Value::Number(value.to_string(), false),
-                SqlParameter::Float64(value) => Value::Number(value.to_string(), false),
+                SqlParameter::Float64(value) => {
+                    if !value.is_finite() {
+                        return ControlFlow::Break(Box::new(sql_rejected(
+                            "parameters",
+                            "float parameters must be finite",
+                        )));
+                    }
+                    Value::Number(value.to_string(), false)
+                }
                 SqlParameter::Text(value) => Value::SingleQuotedString(value.clone()),
             };
             self.used.insert(name);
@@ -364,6 +372,12 @@ fn rewrite_select(
             }
         }
     }
+    if rewritten.len() > MAX_EXPRESSIONS {
+        return Err(sql_rejected(
+            "allowlist",
+            "query has too many projection expressions",
+        ));
+    }
     select.projection = rewritten;
     Ok(outputs)
 }
@@ -601,6 +615,9 @@ impl Visitor for ReadOnlyVisitor {
         if self.query_depth > MAX_QUERY_DEPTH {
             return Self::reject("query nesting exceeds the fixed limit");
         }
+        if query.with.as_ref().is_some_and(|with| with.recursive) {
+            return Self::reject("recursive CTEs are not supported");
+        }
         if !query.locks.is_empty()
             || query.for_clause.is_some()
             || query.settings.is_some()
@@ -608,6 +625,22 @@ impl Visitor for ReadOnlyVisitor {
             || !query.pipe_operators.is_empty()
         {
             return Self::reject("query control and format clauses are not allowed");
+        }
+        let order_by_extension = query.order_by.as_ref().is_some_and(|order_by| {
+            order_by.interpolate.is_some()
+                || match &order_by.kind {
+                    OrderByKind::Expressions(exprs) => {
+                        exprs.iter().any(|expr| expr.with_fill.is_some())
+                    }
+                    OrderByKind::All(_) => false,
+                }
+        });
+        let limit_by_extension = matches!(
+            &query.limit_clause,
+            Some(LimitClause::LimitOffset { limit_by, .. }) if !limit_by.is_empty()
+        );
+        if order_by_extension || limit_by_extension {
+            return Self::reject("dialect-specific ORDER BY and LIMIT clauses are not allowed");
         }
         ControlFlow::Continue(())
     }
@@ -622,7 +655,8 @@ impl Visitor for ReadOnlyVisitor {
             .from
             .iter()
             .map(|item| item.joins.len())
-            .sum::<usize>();
+            .sum::<usize>()
+            + select.from.len().saturating_sub(1);
         if self.joins > MAX_JOINS {
             return Self::reject("query has too many joins");
         }
@@ -632,6 +666,7 @@ impl Visitor for ReadOnlyVisitor {
         if select.into.is_some()
             || !select.optimizer_hints.is_empty()
             || select.select_modifiers.is_some()
+            || select.top.is_some()
             || select.exclude.is_some()
             || !select.lateral_views.is_empty()
             || select.prewhere.is_some()
@@ -640,6 +675,8 @@ impl Visitor for ReadOnlyVisitor {
             || !select.distribute_by.is_empty()
             || !select.sort_by.is_empty()
             || select.value_table_mode.is_some()
+            || !select.named_window.is_empty()
+            || select.qualify.is_some()
         {
             return Self::reject(
                 "dialect-specific or write-capable SELECT clauses are not allowed",

@@ -1167,6 +1167,95 @@ fn read_only_firewall_rejects_disallowed_functions_and_complexity() {
 }
 
 #[test]
+fn read_only_firewall_rejects_nested_recursive_ctes() {
+    for sql in [
+        "WITH RECURSIVE r AS (SELECT session_id FROM sessions) SELECT session_id FROM r",
+        "SELECT * FROM (WITH RECURSIVE sessions AS (SELECT session_id FROM sessions WHERE 1=0 UNION ALL SELECT session_id FROM sessions) SELECT session_id FROM sessions) t",
+    ] {
+        assert!(
+            matches!(
+                validate_read_only_sql(sql),
+                Err(QueryError::SqlRejected {
+                    stage: "allowlist",
+                    ..
+                })
+            ),
+            "query should be rejected: {sql}"
+        );
+    }
+}
+
+#[test]
+fn read_only_firewall_rejects_comma_join_fanout() {
+    let from = |count: usize| {
+        (1..=count)
+            .map(|index| format!("sessions s{index}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let within_limit = format!("SELECT s1.session_id FROM {}", from(MAX_JOINS + 1));
+    validate_read_only_sql(&within_limit).expect("comma joins within the limit are accepted");
+    let beyond_limit = format!("SELECT s1.session_id FROM {}", from(MAX_JOINS + 2));
+    assert!(matches!(
+        validate_read_only_sql(&beyond_limit),
+        Err(QueryError::SqlRejected {
+            stage: "allowlist",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn read_only_firewall_rejects_wildcard_projection_fanout() {
+    let sql = "WITH fanout AS (SELECT * FROM sessions s1, sessions s2) \
+               SELECT * FROM fanout f1, fanout f2, fanout f3, fanout f4, fanout f5, \
+               fanout f6, fanout f7, fanout f8, fanout f9";
+    assert!(matches!(
+        validate_read_only_sql(sql),
+        Err(QueryError::SqlRejected {
+            stage: "allowlist",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn read_only_firewall_rejects_unvetted_dialect_clauses() {
+    for sql in [
+        "SELECT TOP 5 session_id FROM sessions",
+        "SELECT session_id FROM sessions ORDER BY tokens_used WITH FILL FROM 0 TO 100 STEP 1",
+        "SELECT session_id FROM sessions ORDER BY tokens_used INTERPOLATE (tokens_used AS 0)",
+        "SELECT session_id FROM sessions LIMIT 5 BY agent_id",
+        "SELECT session_id FROM sessions QUALIFY session_id IS NOT NULL",
+        "SELECT count(*) OVER w FROM sessions WINDOW w AS (ORDER BY session_id)",
+    ] {
+        assert!(
+            matches!(
+                validate_read_only_sql(sql),
+                Err(QueryError::SqlRejected { .. })
+            ),
+            "query should be rejected: {sql}"
+        );
+    }
+}
+
+#[test]
+fn non_finite_float_parameters_are_rejected() {
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            bind_sql_parameters(
+                "SELECT session_id FROM sessions WHERE tokens_used > :ratio",
+                &BTreeMap::from([("ratio".to_string(), SqlParameter::Float64(value))]),
+            ),
+            Err(QueryError::SqlRejected {
+                stage: "parameters",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
 fn common_string_and_time_functions_are_allowlisted() {
     for sql in [
         "SELECT replace(title, 'old', 'new') FROM sessions",

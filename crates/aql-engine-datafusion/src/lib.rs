@@ -48,9 +48,9 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::{StreamExt, TryStreamExt, stream};
 use sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName, Query,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, Value,
-    Visit, Visitor,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, LimitClause,
+    ObjectName, OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
+    Statement, TableFactor, Value, Visit, Visitor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
