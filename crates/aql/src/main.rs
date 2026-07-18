@@ -530,8 +530,6 @@ async fn execute_query(
     .await
     .map_err(|_| deadline_exceeded("query timed out"))??;
     diagnostic_timing(diagnostics, "authorize", authorize_started);
-    let mut transactional_output = TransactionalOutput::create(output_file.as_deref())?;
-    ensure_before_deadline(deadline)?;
     let inputs = resolve_database_inputs(&database)?;
     ensure_before_deadline(deadline)?;
     let probe_started = Instant::now();
@@ -541,6 +539,12 @@ async fn execute_query(
     if sources.is_empty() {
         return Err(source_unavailable("probe returned no compatible source").into());
     }
+    // Arm one ctrl-c listener before the private output temporary exists so a
+    // SIGINT always takes the cancellation path instead of bypassing cleanup.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut transactional_output = TransactionalOutput::create(output_file.as_deref())?;
+    ensure_before_deadline(deadline)?;
     if explain {
         if output != Output::Table {
             return Err(invalid_argument("EXPLAIN supports only the default table output").into());
@@ -600,7 +604,7 @@ async fn execute_query(
     tokio::pin!(deadline_sleep);
     let streaming = tokio::select! {
         result = prepared.execute_stream(sources) => result?,
-        signal = tokio::signal::ctrl_c() => {
+        signal = &mut ctrl_c => {
             signal?;
             cancellation.cancel();
             return Err(query_cancelled().into());
@@ -622,7 +626,7 @@ async fn execute_query(
     loop {
         let next = tokio::select! {
             next = stream.next() => next,
-            signal = tokio::signal::ctrl_c() => {
+            signal = &mut ctrl_c => {
                 signal?;
                 cancellation.cancel();
                 return Err(query_cancelled().into());
@@ -1174,22 +1178,37 @@ fn load_or_create_installation_salt(
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let salt: [u8; 32] = rand::random();
+            let temporary_name = format!(".installation-{:016x}.tmp", rand::random::<u64>());
             let mut create_options = CapOpenOptions::new();
             create_options.write(true).create_new(true);
             aql_fs::set_open_mode(&mut create_options, 0o600);
-            match aql_fs::open_file(
+            let descriptor = aql_fs::open_file(
+                &directory,
+                std::path::Path::new(&temporary_name),
+                create_options,
+            )?;
+            let mut temporary = InstallationSaltTemp {
+                directory: &directory,
+                name: temporary_name,
+                committed: false,
+            };
+            let mut file = descriptor.into_std();
+            file.write_all(&salt)?;
+            file.sync_all()?;
+            match aql_fs::rename_noreplace(
+                &directory,
+                std::path::Path::new(&temporary.name),
                 &directory,
                 std::path::Path::new("installation.key"),
-                create_options,
             ) {
-                Ok(descriptor) => {
-                    let mut file = descriptor.into_std();
-                    file.write_all(&salt)?;
-                    file.sync_all()?;
+                Ok(()) => {
+                    temporary.committed = true;
                     aql_fs::sync_dir(&directory)?;
                     Ok(salt.to_vec())
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    // Lost the creation race: read the atomically published key.
+                    drop(temporary);
                     let mut options = CapOpenOptions::new();
                     options.read(true);
                     let descriptor = aql_fs::open_file(
@@ -1207,6 +1226,22 @@ fn load_or_create_installation_salt(
     }
 }
 
+/// Removes an unpublished installation-salt temporary file on every early
+/// exit, mirroring the temporary-file guards in `aql-config`.
+struct InstallationSaltTemp<'a> {
+    directory: &'a cap_std::fs::Dir,
+    name: String,
+    committed: bool,
+}
+
+impl Drop for InstallationSaltTemp<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.directory.remove_file(&self.name);
+        }
+    }
+}
+
 fn read_private_installation_salt(
     mut file: fs::File,
     stat: &cap_std::fs::Metadata,
@@ -1218,7 +1253,7 @@ fn read_private_installation_salt(
         return Err(state_integrity("installation salt has unsafe permissions or type").into());
     }
     let mut salt = Vec::with_capacity(32);
-    file.read_to_end(&mut salt)?;
+    Read::by_ref(&mut file).take(64).read_to_end(&mut salt)?;
     if salt.len() != 32 {
         return Err(state_integrity("installation salt has an invalid length").into());
     }
@@ -1226,7 +1261,7 @@ fn read_private_installation_salt(
 }
 
 fn aql_state_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(if let Some(path) = std::env::var_os("AQL_HOME") {
+    let root = if let Some(path) = std::env::var_os("AQL_HOME") {
         PathBuf::from(path)
     } else if cfg!(windows) {
         if let Some(path) = std::env::var_os("LOCALAPPDATA") {
@@ -1248,7 +1283,11 @@ fn aql_state_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     } else {
         PathBuf::from(std::env::var_os("HOME").ok_or_else(|| state_unavailable("HOME is not set"))?)
             .join(".local/share/aql")
-    })
+    };
+    if !root.is_absolute() {
+        return Err(invalid_argument("AQL state root must be absolute").into());
+    }
+    Ok(root)
 }
 
 #[cfg(test)]

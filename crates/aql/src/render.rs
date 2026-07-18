@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 use std::io::{Seek, SeekFrom};
 use unicode_width::UnicodeWidthStr;
 
@@ -103,7 +104,12 @@ impl StreamingRenderer {
                         if index > 0 {
                             write_budgeted(writer, b",", &self.budget)?;
                         }
-                        let header = csv_quote(field.name(), false)?;
+                        let mut name = field.name().clone();
+                        if starts_csv_formula(&name) {
+                            name.insert(0, '\'');
+                            *formula_escaped = true;
+                        }
+                        let header = csv_quote(&name, false)?;
                         write_budgeted(writer, header.as_bytes(), &self.budget)?;
                     }
                     write_budgeted(writer, b"\r\n", &self.budget)?;
@@ -203,7 +209,7 @@ impl TableSpool {
                 .schema()
                 .fields()
                 .iter()
-                .map(|field| max_line_width(field.name()))
+                .map(|field| max_line_width(&sanitize_table_text(field.name())))
                 .collect();
         }
         let options =
@@ -218,7 +224,9 @@ impl TableSpool {
         for row_index in 0..batch.num_rows() {
             let cells = formatters
                 .iter()
-                .map(|formatter| formatter.value(row_index).to_string())
+                .map(|formatter| {
+                    sanitize_table_text(&formatter.value(row_index).to_string()).into_owned()
+                })
                 .collect::<Vec<_>>();
             let height = cells
                 .iter()
@@ -274,18 +282,18 @@ impl TableSpool {
         let header_lines = schema
             .fields()
             .iter()
-            .map(|field| field.name().split('\n').count())
+            .map(|field| sanitize_table_text(field.name()).split('\n').count())
             .max()
             .unwrap_or(1) as u64;
-        let header_extra = schema
-            .fields()
-            .iter()
-            .flat_map(|field| field.name().split('\n'))
-            .try_fold(0_u64, |total, line| {
-                total
-                    .checked_add((line.len() - UnicodeWidthStr::width(line)) as u64)
-                    .ok_or("table output size overflow")
-            })?;
+        let header_extra = schema.fields().iter().try_fold(0_u64, |total, field| {
+            sanitize_table_text(field.name())
+                .split('\n')
+                .try_fold(total, |total, line| {
+                    total
+                        .checked_add((line.len() - UnicodeWidthStr::width(line)) as u64)
+                        .ok_or("table output size overflow")
+                })
+        })?;
         let line_width = self.widths.iter().try_fold(1_u64, |total, width| {
             total
                 .checked_add(*width as u64 + 3)
@@ -317,7 +325,7 @@ impl TableSpool {
         let headers = schema
             .fields()
             .iter()
-            .map(|field| field.name().to_string())
+            .map(|field| sanitize_table_text(field.name()).into_owned())
             .collect::<Vec<_>>();
         write_table_row(writer, &headers, &self.widths, budget)?;
         write_separator(writer, &self.widths, budget)?;
@@ -347,6 +355,22 @@ fn max_line_width(value: &str) -> usize {
         .map(UnicodeWidthStr::width)
         .max()
         .unwrap_or(0)
+}
+
+fn sanitize_table_text(value: &str) -> Cow<'_, str> {
+    let is_dangerous = |character: char| character.is_control() && character != '\n';
+    if !value.chars().any(is_dangerous) {
+        return Cow::Borrowed(value);
+    }
+    let mut sanitized = String::with_capacity(value.len());
+    for character in value.chars() {
+        if is_dangerous(character) {
+            sanitized.push('\u{FFFD}');
+        } else {
+            sanitized.push(character);
+        }
+    }
+    Cow::Owned(sanitized)
 }
 
 fn write_separator(
@@ -473,24 +497,19 @@ fn csv_arrow_cell(
     formula_escaped: &mut bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use datafusion::arrow::array::Array;
-    use datafusion::arrow::datatypes::DataType;
 
     if batch.column(column_index).is_null(row_index) {
         return Ok("\\N".to_string());
     }
-    let field = batch.schema().field(column_index).clone();
     let value = arrow_json_value(batch, column_index, row_index)?;
     match value {
         serde_json::Value::Null => Ok("\\N".to_string()),
         serde_json::Value::Bool(value) => Ok(value.to_string()),
         serde_json::Value::Number(value) => Ok(value.to_string()),
         serde_json::Value::String(mut value) => {
-            let formula_sensitive = matches!(field.data_type(), DataType::Utf8)
-                && !matches!(
-                    field.name().as_str(),
-                    "capabilities" | "content_json" | "arguments"
-                );
-            if formula_sensitive && starts_csv_formula(&value) {
+            // Formula safety never depends on the output column name: aliases
+            // are user-controllable, so every string cell is escaped the same way.
+            if starts_csv_formula(&value) {
                 value.insert(0, '\'');
                 *formula_escaped = true;
             }
@@ -504,10 +523,17 @@ fn csv_arrow_cell(
 }
 
 fn starts_csv_formula(value: &str) -> bool {
+    let first = value.as_bytes().first();
+    if first.is_some_and(|byte| matches!(byte, b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r')) {
+        return true;
+    }
+    // Some spreadsheet imports trim leading whitespace before detecting
+    // formulas, so whitespace-prefixed formula characters are dangerous too.
     value
+        .trim_start_matches([' ', '\t', '\r', '\n'])
         .as_bytes()
         .first()
-        .is_some_and(|byte| matches!(byte, b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r'))
+        .is_some_and(|byte| matches!(byte, b'=' | b'+' | b'-' | b'@'))
 }
 
 fn csv_quote(value: &str, force: bool) -> Result<String, Box<dyn std::error::Error>> {

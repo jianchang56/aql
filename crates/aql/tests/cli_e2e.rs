@@ -1,6 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 #[cfg(unix)]
 use std::thread;
@@ -15,6 +16,17 @@ fn symlink_file(source: &Path, target: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         std::os::windows::fs::symlink_file(source, target)
+    }
+}
+
+fn symlink_dir(source: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, target)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(source, target)
     }
 }
 
@@ -127,6 +139,32 @@ fn assert_success(output: &Output) {
         stdout(output),
         stderr(output)
     );
+}
+
+fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let mut entries: Vec<_> = fs::read_dir(&directory)
+            .expect("list snapshot directory")
+            .map(|entry| entry.expect("read snapshot entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("snapshot path is below root")
+                    .to_string_lossy()
+                    .into_owned();
+                files.push((relative, fs::read(&path).expect("read snapshot file")));
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 #[test]
@@ -518,6 +556,188 @@ fn timeout_symlink_and_parent_replacement_publish_nothing() {
             .is_none(),
         "abandoned private output must be removed"
     );
+}
+
+#[test]
+fn symlinked_builtin_candidate_root_fails_on_the_query_path() {
+    let environment = TestEnvironment::new();
+    let target = environment.standalone_codex("linked-candidate");
+    symlink_dir(&target, &environment.home.join(".codex"))
+        .expect("create built-in candidate symlink");
+
+    let discover = environment.run(["database", "discover"]);
+    assert_success(&discover);
+    assert!(stdout(&discover).contains("database=codex status=incompatible"));
+
+    let query = environment.run([
+        "query",
+        "-d",
+        "codex",
+        "SELECT session_id FROM sessions LIMIT 1",
+    ]);
+    assert_eq!(query.status.code(), Some(4));
+    assert!(query.stdout.is_empty());
+    assert!(stderr(&query).contains("error_category=source_unavailable"));
+}
+
+#[test]
+fn discover_and_show_mask_real_paths_and_leave_no_residue() {
+    let environment = TestEnvironment::new();
+    environment.install_codex("minimal", 0);
+    // A planted entry outside the four fixed candidates must never be
+    // reported: discovery is fixed-candidate and non-recursive.
+    fs::write(environment.home.join("stray.txt"), b"synthetic stray")
+        .expect("plant stray HOME entry");
+    let home_before = tree_snapshot(&environment.home);
+    let real_paths = [
+        environment.home.to_string_lossy().into_owned(),
+        environment.temporary.path().to_string_lossy().into_owned(),
+    ];
+
+    let discover = environment.run(["database", "discover"]);
+    assert_success(&discover);
+    let discovered = stdout(&discover);
+    assert_eq!(
+        discovered,
+        "database=claude status=missing\n\
+         database=codex status=compatible\n\
+         database=kimi status=missing\n\
+         database=opencode status=missing\n"
+    );
+    assert!(
+        !discovered.contains("stray"),
+        "discovery reported a non-candidate entry: {discovered}"
+    );
+    let discover_stderr = stderr(&discover);
+    let show = environment.run(["database", "show", "codex"]);
+    assert_success(&show);
+    let shown = stdout(&show);
+    assert_eq!(
+        shown,
+        "database=codex\nagent=codex\nstatus=compatible\npath=masked\n"
+    );
+    let show_stderr = stderr(&show);
+    for output in [&discovered, &discover_stderr, &shown, &show_stderr] {
+        for real_path in &real_paths {
+            assert!(
+                !output.contains(real_path),
+                "discovery output leaked a real path {real_path}: {output}"
+            );
+        }
+    }
+
+    // Discovery and show are read-only probes: no state or config root is
+    // created and nothing below HOME changes.
+    assert_eq!(
+        tree_snapshot(&environment.home),
+        home_before,
+        "discovery left residue below HOME"
+    );
+    assert!(
+        !environment.state.exists(),
+        "discovery must not create the AQL state root"
+    );
+    assert!(
+        !environment.config.exists(),
+        "discovery must not create the AQL config root"
+    );
+}
+
+#[test]
+fn configured_database_show_masks_member_roots_without_path_access() {
+    let environment = TestEnvironment::new();
+    let codex = environment.standalone_codex("masked-member");
+    let add = environment.run(vec![
+        OsString::from("database"),
+        OsString::from("add"),
+        OsString::from("masked"),
+        OsString::from("--member"),
+        OsString::from(format!("codex={}", codex.display())),
+        OsString::from("--acknowledge-persistent-path"),
+    ]);
+    assert_success(&add);
+
+    let show = environment.run(["database", "show", "masked"]);
+    assert_success(&show);
+    let shown = stdout(&show);
+    assert_eq!(
+        shown,
+        "database=masked\nmembers=1\nmember.1.adapter=codex\nmember.1.root=masked\n"
+    );
+    let stored_root = codex
+        .canonicalize()
+        .expect("canonicalize member root")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        !shown.contains(&stored_root),
+        "configured show leaked a member root: {shown}"
+    );
+    assert!(stderr(&show).is_empty());
+}
+
+#[test]
+fn query_persists_nothing_beyond_the_preexisting_installation_key() {
+    let environment = TestEnvironment::new();
+    environment.install_codex("minimal", 0);
+    // Pre-create a valid key so this test can assert that queries leave an
+    // existing installation identity unchanged.
+    fs::create_dir(&environment.state).expect("create isolated state root");
+    let salt = [7_u8; 32];
+    let key = environment.state.join("installation.key");
+    fs::write(&key, salt).expect("pre-create installation key");
+    let home_before = tree_snapshot(&environment.home);
+
+    let select = environment.run([
+        "query",
+        "-d",
+        "codex",
+        "--output",
+        "json",
+        "SELECT session_id FROM sessions ORDER BY session_id",
+    ]);
+    assert_success(&select);
+    assert!(stdout(&select).contains("session-minimal"));
+    let control = environment.run(["query", "-d", "codex", "SHOW TABLES;"]);
+    assert_success(&control);
+
+    // The state root holds only the untouched installation key: no SQL text,
+    // shell history, query results, grants, or payload copies are persisted.
+    let entries: Vec<String> = fs::read_dir(&environment.state)
+        .expect("list state root")
+        .map(|entry| {
+            entry
+                .expect("read state entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(entries, ["installation.key"]);
+    assert_eq!(fs::read(&key).expect("read installation key"), salt);
+    assert!(
+        !environment.config.exists(),
+        "queries must not create the AQL config root"
+    );
+    assert_eq!(
+        tree_snapshot(&environment.home),
+        home_before,
+        "query left residue below HOME"
+    );
+}
+
+#[test]
+fn relative_aql_home_is_rejected_instead_of_cwd_anchored() {
+    let environment = TestEnvironment::new();
+    let output = environment
+        .command()
+        .env("AQL_HOME", "relative-state")
+        .args(["database", "list"])
+        .output()
+        .expect("run database list with relative AQL_HOME");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("error_category=invalid_request"));
+    assert!(stderr(&output).contains("AQL state root must be absolute"));
 }
 
 #[cfg(unix)]

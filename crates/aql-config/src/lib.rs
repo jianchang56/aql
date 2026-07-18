@@ -581,7 +581,10 @@ fn validate_database_shape(database: &Database) -> Result<(), ConfigError> {
 /// Validates the public configured-database naming grammar.
 ///
 /// Names are 1–64 ASCII characters, start with a lowercase letter, and contain
-/// only lowercase letters, digits, `_`, or `-`.
+/// only lowercase letters, digits, `_`, or `-`. The name `all` is reserved for
+/// explicit federation and is never a configured database; the built-in
+/// database names `claude`, `codex`, `kimi`, and `opencode` remain valid and
+/// shadowable.
 ///
 /// # Examples
 ///
@@ -590,6 +593,7 @@ fn validate_database_shape(database: &Database) -> Result<(), ConfigError> {
 ///
 /// assert!(validate_database_name("local-agents").is_ok());
 /// assert!(validate_database_name("Local Agents").is_err());
+/// assert!(validate_database_name("all").is_err());
 /// ```
 pub fn validate_database_name(name: &str) -> Result<(), ConfigError> {
     let bytes = name.as_bytes();
@@ -599,6 +603,7 @@ pub fn validate_database_name(name: &str) -> Result<(), ConfigError> {
         || !bytes.iter().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
         })
+        || name == "all"
     {
         return Err(ConfigError::InvalidDatabaseName);
     }
@@ -787,12 +792,16 @@ mod tests {
 
     #[test]
     fn database_name_and_shape_are_exact() {
-        for valid in ["a", "daily", "a-1_b"] {
+        for valid in ["a", "daily", "a-1_b", "claude", "codex", "kimi", "opencode"] {
             assert!(validate_database_name(valid).is_ok());
         }
-        for invalid in ["", "A", "1a", "a/b", "a b", "é"] {
+        for invalid in ["", "A", "1a", "a/b", "a b", "é", "all"] {
             assert!(validate_database_name(invalid).is_err());
         }
+        assert!(matches!(
+            validate_database_name("all"),
+            Err(ConfigError::InvalidDatabaseName)
+        ));
         let too_many = Database {
             name: "daily".to_string(),
             members: (0..=MAX_MEMBERS_PER_DATABASE)
@@ -877,6 +886,45 @@ mod tests {
         let lock = store.acquire_write_lock().expect("writer locks");
         store.remove("daily", lock).expect("database removes");
         assert!(store.list().expect("databases list").is_empty());
+        drop(store);
+        fs::remove_dir_all(root).expect("test root is removed");
+    }
+
+    #[test]
+    fn reserved_federation_name_fails_closed_at_add_and_load() {
+        let root = root();
+        let source_root = source(&root, "source");
+        let config_root = root.join("config");
+        let store = ConfigStore::create(&config_root, &[]).expect("config store creates");
+        let reserved = Database {
+            name: "all".to_string(),
+            members: vec![DatabaseMember {
+                adapter_id: "codex".to_string(),
+                root: source_root,
+            }],
+        };
+        let lock = store.acquire_write_lock().expect("writer locks");
+        assert!(matches!(
+            store.add(reserved.clone(), &[], lock),
+            Err(ConfigError::InvalidDatabaseName)
+        ));
+        assert!(matches!(store.list(), Err(ConfigError::Missing)));
+
+        // A pre-existing config that names a database `all` fails closed.
+        let config = ConfigFile {
+            schema_version: CONFIG_SCHEMA_VERSION.to_string(),
+            databases: vec![reserved],
+        };
+        fs::write(
+            config_root.join(CONFIG_FILE),
+            toml::to_string(&config).expect("reserved-name config serializes"),
+        )
+        .expect("reserved-name config writes");
+        set_mode(&config_root.join(CONFIG_FILE), 0o600).expect("reserved-name config is private");
+        assert!(matches!(
+            store.list(),
+            Err(ConfigError::InvalidDatabaseName)
+        ));
         drop(store);
         fs::remove_dir_all(root).expect("test root is removed");
     }

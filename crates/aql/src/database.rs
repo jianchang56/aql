@@ -41,21 +41,38 @@ struct DatabaseCandidate {
 }
 
 fn database_candidates() -> Result<Vec<DatabaseCandidate>, Box<dyn std::error::Error>> {
-    let home = PathBuf::from(
-        std::env::var_os("HOME").ok_or_else(|| state_unavailable("HOME is not set"))?,
-    );
+    let home = std::env::var_os("HOME")
+        .or_else(|| {
+            cfg!(windows)
+                .then(|| std::env::var_os("USERPROFILE"))
+                .flatten()
+        })
+        .map(PathBuf::from)
+        .ok_or_else(|| state_unavailable("HOME is not set"))?;
     if !home.is_absolute() {
         return Err(state_unavailable("HOME must be absolute for database discovery").into());
     }
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
+        .or_else(|| {
+            cfg!(windows)
+                .then(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+                .flatten()
+        })
         .unwrap_or_else(|| home.join(".local/share"));
     if !data_home.is_absolute() {
         return Err(
             state_unavailable("XDG_DATA_HOME must be absolute for database discovery").into(),
         );
     }
-    Ok(vec![
+    Ok(database_candidates_for(&home, &data_home))
+}
+
+fn database_candidates_for(
+    home: &std::path::Path,
+    data_home: &std::path::Path,
+) -> Vec<DatabaseCandidate> {
+    vec![
         DatabaseCandidate {
             name: "claude",
             adapter_id: "claude-code",
@@ -76,7 +93,7 @@ fn database_candidates() -> Result<Vec<DatabaseCandidate>, Box<dyn std::error::E
             adapter_id: "opencode",
             root: data_home.join("opencode"),
         },
-    ])
+    ]
 }
 
 pub(super) fn read_adapter(
@@ -133,12 +150,22 @@ pub(super) fn bind_sources(
 pub(super) fn parse_source_specs(
     source_specs: Vec<String>,
 ) -> Result<Vec<ParsedSource>, Box<dyn std::error::Error>> {
-    parse_source_specs_with_policy(source_specs, false)
+    // `database add` canonicalizes each explicitly supplied member once;
+    // stored members are revalidated nofollow on every query bind.
+    parse_source_specs_inner(source_specs, false, false)
 }
 
 fn parse_source_specs_with_policy(
     source_specs: Vec<String>,
     skip_unavailable: bool,
+) -> Result<Vec<ParsedSource>, Box<dyn std::error::Error>> {
+    parse_source_specs_inner(source_specs, skip_unavailable, true)
+}
+
+fn parse_source_specs_inner(
+    source_specs: Vec<String>,
+    skip_unavailable: bool,
+    revalidate_no_symlink: bool,
 ) -> Result<Vec<ParsedSource>, Box<dyn std::error::Error>> {
     if source_specs.is_empty() {
         return Err(invalid_argument("database must contain at least one member").into());
@@ -176,8 +203,12 @@ fn parse_source_specs_with_policy(
                 Err(_) => continue,
             }
         }
-        let canonical = fs::canonicalize(&root)
-            .map_err(|_| source_unavailable("database member path is unavailable"))?;
+        let canonical = if revalidate_no_symlink && !skip_unavailable {
+            canonicalize_member_root_no_symlink(&root)?
+        } else {
+            fs::canonicalize(&root)
+                .map_err(|_| source_unavailable("database member path is unavailable"))?
+        };
         result.push(ParsedSource {
             adapter_id,
             root,
@@ -199,9 +230,26 @@ fn parse_source_specs_with_policy(
     Ok(result)
 }
 
+/// Revalidates a normalized database member root without following any path
+/// component symlink. Configured roots were canonicalized when they were
+/// stored, while built-in roots are fixed normalized paths, so query binding
+/// can retain the validated path without a second ambient canonicalization.
+fn canonicalize_member_root_no_symlink(
+    root: &std::path::Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    aql_fs::open_absolute_dir(root)
+        .map_err(|_| source_unavailable("database member path is unavailable"))?;
+    Ok(root.to_path_buf())
+}
+
 pub(super) fn configured_database_inputs(
     name: &str,
 ) -> Result<Option<SourceInputs>, Box<dyn std::error::Error>> {
+    // `all` is reserved for explicit federation and is never a configured
+    // database, so its lookup is empty by definition.
+    if name == "all" {
+        return Ok(None);
+    }
     aql_config::validate_database_name(name)?;
     let state_root = canonical_or_prospective(&aql_state_root()?)?;
     let config_root = aql_config_root()?;
@@ -246,9 +294,9 @@ fn candidate_is_compatible(
         .is_ok_and(|probe| !probe.manifests.is_empty()))
 }
 
-pub(super) fn resolve_database_inputs(
-    name: &str,
-) -> Result<SourceInputs, Box<dyn std::error::Error>> {
+/// Validates the public database-selection grammar shared by the CLI and the
+/// interactive shell: lowercase ASCII letters, digits, `_` or `-`.
+pub(super) fn validate_database_selection_name(name: &str) -> Result<(), CliError> {
     let normalized = name.to_ascii_lowercase();
     if name != normalized
         || !name
@@ -257,9 +305,15 @@ pub(super) fn resolve_database_inputs(
     {
         return Err(invalid_argument(
             "database name must use lowercase ASCII letters, digits, '_' or '-'",
-        )
-        .into());
+        ));
     }
+    Ok(())
+}
+
+pub(super) fn resolve_database_inputs(
+    name: &str,
+) -> Result<SourceInputs, Box<dyn std::error::Error>> {
+    validate_database_selection_name(name)?;
     if let Some(inputs) = configured_database_inputs(name)? {
         return Ok(inputs);
     }
@@ -596,6 +650,26 @@ pub(super) fn database_is_available(name: &str) -> Result<bool, Box<dyn std::err
 mod tests {
     use super::*;
 
+    fn symlink_dir(source: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(source, target)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(source, target)
+        }
+    }
+
+    #[test]
+    fn reserved_federation_name_never_resolves_to_a_configured_database() {
+        assert!(
+            configured_database_inputs("all")
+                .expect("reserved federation name resolves without configured-database I/O")
+                .is_none()
+        );
+    }
+
     #[test]
     fn optional_federation_members_skip_missing_roots() {
         let missing =
@@ -607,5 +681,76 @@ mod tests {
                 .expect("optional members parse")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn query_members_reject_symlink_roots_before_probe() {
+        let root = std::env::temp_dir().join(format!(
+            "aql-symlinked-member-{:016x}",
+            rand::random::<u64>()
+        ));
+        fs::create_dir(&root).expect("create synthetic member parent");
+        let target = root.join("target");
+        fs::create_dir(&target).expect("create symlink target");
+        let link = root.join("linked-root");
+        symlink_dir(&target, &link).expect("create member root symlink");
+        // Canonicalization resolves the link, so rejection must happen earlier.
+        assert!(fs::canonicalize(&link).is_ok());
+        let spec = || format!("codex={}", link.to_string_lossy());
+
+        let Err(error) = parse_source_specs_with_policy(vec![spec()], false) else {
+            panic!("symlinked member root must be rejected on the query path");
+        };
+        assert_eq!(error.to_string(), "database member path is unavailable");
+
+        // `database add` still canonicalizes an explicitly supplied member once.
+        assert!(parse_source_specs(vec![spec()]).is_ok());
+
+        // Federation skips the incompatible member instead of following it.
+        assert!(
+            parse_source_specs_with_policy(vec![spec()], true)
+                .expect("optional members parse")
+                .is_empty()
+        );
+
+        // A real directory passes the nofollow revalidation.
+        let real = format!("codex={}", target.to_string_lossy());
+        assert!(parse_source_specs_with_policy(vec![real], false).is_ok());
+        fs::remove_dir_all(&root).expect("clean synthetic member parent");
+    }
+
+    #[test]
+    fn discovery_candidates_are_fixed_direct_children_of_known_roots() {
+        let home = std::env::temp_dir().join("aql-synthetic-home");
+        let data_home = std::env::temp_dir().join("aql-synthetic-data-home");
+        let candidates = database_candidates_for(&home, &data_home);
+        // Discovery probes exactly this fixed candidate set and never
+        // enumerates anything else below HOME or the data home.
+        let observed: Vec<(&str, &str)> = candidates
+            .iter()
+            .map(|candidate| (candidate.name, candidate.adapter_id))
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                ("claude", "claude-code"),
+                ("codex", "codex"),
+                ("kimi", "kimi-code"),
+                ("opencode", "opencode")
+            ]
+        );
+        for candidate in &candidates {
+            // Every candidate is exactly one fixed component below a known
+            // root, keeping discovery bounded and non-recursive.
+            let parent = candidate
+                .root
+                .parent()
+                .expect("candidate root has a parent");
+            assert!(
+                parent == home || parent == data_home,
+                "candidate root {} is not a direct child of a known root",
+                candidate.root.display()
+            );
+        }
     }
 }

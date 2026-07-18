@@ -411,6 +411,45 @@ fn shell_welcome_guides_selection_without_choosing_a_default() {
 }
 
 #[test]
+fn shell_history_is_memory_only_and_status_reports_not_persistent() {
+    // `run_shell` requires a terminal, so the shell cannot be driven from a
+    // test harness; guard the rustyline wiring directly instead. A history
+    // persistence call appearing here is a boundary regression.
+    let shell = include_str!("shell.rs");
+    assert!(shell.contains("rustyline::history::DefaultHistory"));
+    assert!(shell.contains("history=persistent:false"));
+    for forbidden in ["save_history", "load_history", "append_history"] {
+        assert!(
+            !shell.contains(forbidden),
+            "shell history persistence call found: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn shell_use_validates_original_name_case_like_the_cli() {
+    // Keyword matching is case-insensitive; database names are not.
+    assert_eq!(shell_words("use codex"), vec!["USE", "CODEX"]);
+    assert_eq!(shell_words_original("use codex"), vec!["use", "codex"]);
+    assert_eq!(
+        shell_words_original("-- note\nUSE Local-Agents_2"),
+        vec!["USE", "Local-Agents_2"]
+    );
+    for valid in ["codex", "local-agents", "a1_b-2", "all"] {
+        assert!(validate_database_selection_name(valid).is_ok());
+    }
+    for invalid in ["Codex", "CODEX", "codex.db", "codex db", "codéx"] {
+        assert!(validate_database_selection_name(invalid).is_err());
+    }
+    let error = validate_database_selection_name("Codex")
+        .expect_err("mixed-case database selection is rejected");
+    assert_eq!(
+        error.to_string(),
+        "database name must use lowercase ASCII letters, digits, '_' or '-'"
+    );
+}
+
+#[test]
 fn shell_schema_commands_use_the_engine_canonical_schema() {
     assert!(QUERY_SCHEMAS.iter().any(|schema| schema.name == "sessions"));
     let sessions = QUERY_SCHEMAS
@@ -738,6 +777,109 @@ fn csv_output_rejects_controls_and_inconsistent_schemas() {
 }
 
 #[test]
+fn csv_output_escapes_formula_text_under_json_column_names() {
+    // Canonical JSON column names are not a security signal: output field
+    // names are user-controllable aliases, so formula escaping must apply to
+    // JSON-parsed string payloads too.
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("arguments", DataType::Utf8, false),
+            Field::new("content_json", DataType::Utf8, false),
+            Field::new("capabilities", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["\"=1+1\""])),
+            Arc::new(StringArray::from(vec!["\"@cmd\""])),
+            Arc::new(StringArray::from(vec!["\"+sum\""])),
+        ],
+    )
+    .expect("synthetic batch must be valid");
+
+    let csv = batches_to_csv(&[batch]).expect("CSV conversion must succeed");
+    assert_eq!(
+        csv.rendered,
+        "arguments,content_json,capabilities\r\n'=1+1,'@cmd,'+sum\r\n"
+    );
+    assert!(csv.formula_escaped);
+}
+
+#[test]
+fn csv_output_escapes_formula_shaped_headers() {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("=cmd|' /c calc'!A1", DataType::Utf8, false),
+            Field::new("plain", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["one"])),
+            Arc::new(StringArray::from(vec!["two"])),
+        ],
+    )
+    .expect("synthetic batch must be valid");
+
+    let csv = batches_to_csv(&[batch]).expect("CSV conversion must succeed");
+    assert_eq!(csv.rendered, "'=cmd|' /c calc'!A1,plain\r\none,two\r\n");
+    assert!(csv.formula_escaped);
+}
+
+#[test]
+fn csv_output_escapes_whitespace_prefixed_formula_text() {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec![
+            " =1+1", "\t=cmd", "  @name", "\n-2+3", " safe",
+        ]))],
+    )
+    .expect("synthetic batch must be valid");
+
+    let csv = batches_to_csv(&[batch]).expect("CSV conversion must succeed");
+    assert_eq!(
+        csv.rendered,
+        "title\r\n' =1+1\r\n'\t=cmd\r\n'  @name\r\n\"'\n-2+3\"\r\n safe\r\n"
+    );
+    assert!(csv.formula_escaped);
+}
+
+#[test]
+fn table_output_neutralizes_terminal_control_characters() {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "ev\u{1b}il",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec![
+            "red\u{1b}[31m",
+            "tab\there",
+            "c1\u{85}x",
+            "ok",
+            "two\nlines",
+        ]))],
+    )
+    .expect("synthetic batch must be valid");
+
+    let table = batches_to_table_limited(&[batch], u64::MAX).expect("table renders");
+    assert_eq!(
+        table,
+        "+----------+\n\
+         | ev\u{FFFD}il    |\n\
+         +----------+\n\
+         | red\u{FFFD}[31m |\n\
+         | tab\u{FFFD}here |\n\
+         | c1\u{FFFD}x     |\n\
+         | ok       |\n\
+         | two      |\n\
+         | lines    |\n\
+         +----------+\n"
+    );
+    assert!(!table.contains('\u{1b}'));
+}
+
+#[test]
 fn generated_release_docs_are_deterministic_and_exclude_internal_arguments() {
     public_command().debug_assert();
     let generated = public_command();
@@ -969,6 +1111,48 @@ fn installation_salt_uses_private_no_follow_state() {
     symlink_dir(&real_parent, &linked_parent).expect("create intermediate symlink");
     assert!(load_or_create_installation_salt(&linked_parent.join("state")).is_err());
     assert!(!real_parent.join("state").exists());
+    fs::remove_dir_all(root).expect("clean synthetic state");
+}
+
+#[test]
+fn installation_salt_publishes_atomically_and_reads_are_bounded() {
+    let root = std::env::temp_dir().join(format!(
+        "aql-installation-atomic-{:016x}",
+        rand::random::<u64>()
+    ));
+    fs::create_dir(&root).expect("create synthetic parent");
+    let root = root.canonicalize().expect("canonicalize synthetic parent");
+    let state_root = root.join("state");
+
+    let salt = load_or_create_installation_salt(&state_root).expect("salt is created");
+    assert_eq!(salt.len(), 32);
+    // Atomic publication leaves no temporary files behind.
+    let entries = fs::read_dir(&state_root)
+        .expect("list state root")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("state entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].file_name().to_string_lossy(), "installation.key");
+
+    // An invalid-length key fails closed and is never rewritten or removed.
+    let salt_path = state_root.join("installation.key");
+    fs::write(&salt_path, [1_u8; 16]).expect("write short salt");
+    aql_fs::set_mode(&salt_path, 0o600).expect("short salt is private");
+    let error = load_or_create_installation_salt(&state_root)
+        .expect_err("short installation key must fail");
+    assert_eq!(error_category(error.as_ref()), "state_integrity");
+    assert_eq!(
+        fs::read(&salt_path).expect("short salt remains"),
+        [1_u8; 16]
+    );
+
+    // An oversized key is rejected after a bounded read.
+    fs::write(&salt_path, vec![2_u8; 4096]).expect("write oversized salt");
+    aql_fs::set_mode(&salt_path, 0o600).expect("oversized salt is private");
+    let error = load_or_create_installation_salt(&state_root)
+        .expect_err("oversized installation key must fail");
+    assert_eq!(error_category(error.as_ref()), "state_integrity");
+
     fs::remove_dir_all(root).expect("clean synthetic state");
 }
 

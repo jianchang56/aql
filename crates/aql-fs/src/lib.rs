@@ -259,7 +259,11 @@ pub fn owned_by_current_user(metadata: &Metadata) -> bool {
     }
 }
 
-/// Atomically renames a directory entry while refusing to replace an existing target.
+/// Publishes a directory entry while refusing to replace an existing target.
+///
+/// Unix uses an atomic no-replace rename. Other platforms publish files with
+/// an atomic hard-link claim followed by temporary-name cleanup, and use the
+/// platform rename for directories after an explicit no-clobber check.
 pub fn rename_noreplace(from_dir: &Dir, from: &Path, to_dir: &Dir, to: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -275,7 +279,32 @@ pub fn rename_noreplace(from_dir: &Dir, from: &Path, to_dir: &Dir, to: &Path) ->
     }
     #[cfg(not(unix))]
     {
-        from_dir.rename(from, to_dir, to)
+        let source = from_dir.symlink_metadata(from)?;
+        if source.is_file() {
+            from_dir.hard_link(from, to_dir, to)?;
+            if let Err(error) = from_dir.remove_file(from) {
+                if to_dir
+                    .symlink_metadata(to)
+                    .is_ok_and(|target| identity(&target) == identity(&source))
+                {
+                    let _ = to_dir.remove_file(to);
+                }
+                return Err(error);
+            }
+            return Ok(());
+        }
+        if source.is_dir() {
+            match to_dir.symlink_metadata(to) {
+                Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            return from_dir.rename(from, to_dir, to);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source must be a regular file or directory",
+        ))
     }
 }
 
@@ -364,5 +393,51 @@ mod tests {
         sync_dir(&root).expect("directory metadata sync succeeds");
         open_relative_dir(&root, Path::new("child")).expect("relative directory opens");
         assert!(open_relative_dir(&root, Path::new("../escape")).is_err());
+    }
+
+    #[test]
+    fn no_replace_publication_preserves_existing_targets() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority())
+            .expect("temporary capability");
+        std::fs::write(temporary.path().join("source-file"), b"new").expect("source file");
+        std::fs::write(temporary.path().join("target-file"), b"old").expect("target file");
+        let error = rename_noreplace(
+            &root,
+            Path::new("source-file"),
+            &root,
+            Path::new("target-file"),
+        )
+        .expect_err("existing file target is preserved");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(temporary.path().join("target-file")).unwrap(),
+            b"old"
+        );
+
+        std::fs::create_dir(temporary.path().join("source-dir")).expect("source directory");
+        std::fs::create_dir(temporary.path().join("target-dir")).expect("target directory");
+        let error = rename_noreplace(
+            &root,
+            Path::new("source-dir"),
+            &root,
+            Path::new("target-dir"),
+        )
+        .expect_err("existing directory target is preserved");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+        std::fs::write(temporary.path().join("publish-file"), b"published").expect("publish file");
+        rename_noreplace(
+            &root,
+            Path::new("publish-file"),
+            &root,
+            Path::new("published-file"),
+        )
+        .expect("file publishes without replacement");
+        assert!(!temporary.path().join("publish-file").exists());
+        assert_eq!(
+            std::fs::read(temporary.path().join("published-file")).unwrap(),
+            b"published"
+        );
     }
 }

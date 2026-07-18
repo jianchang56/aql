@@ -29,7 +29,7 @@ AQL 不持久化 SQL、shell history、查询结果、授权、诊断、凭据�
 
 内置 discovery 只检查四个固定候选位置，不递归扫描 HOME、不启动 Agent 进程、不输出真实路径。配置数据库要求绝对路径和明确的 `--acknowledge-persistent-path`。
 
-所有 database member 在 Adapter probe 前统一解析，拒绝未知 Adapter、相对路径、symlink、重复和重叠 root。
+所有 database member 在 Adapter probe 前统一解析，拒绝未知 Adapter、相对路径、symlink、重复和重叠 root。discovery 与配置校验的结果在查询绑定时可能已过期，因此查询路径会以 nofollow 方式重新验证 member root 的全部路径组件，然后才 canonicalize。
 
 ## SQL firewall
 
@@ -97,13 +97,13 @@ stdout 查询按批流式渲染到匿名事务缓冲，只有执行到 EOF、元
 - no-replace rename；
 - 失败清理临时文件。
 
-CSV 始终转义以 `= + - @ tab CR` 开头的普通文本，避免电子表格公式执行。
+CSV 始终转义公式形状文本，避免电子表格公式执行：字符串单元格和列头以 `= + - @ tab CR` 开头，或以前导空白（空格、tab、CR、LF）后接 `= + - @` 时，一律加 `'` 前缀。
 
 ## 配置数据库
 
 配置 root 使用 private directory、ownership marker、known-file allowlist、writer lock、fsync 和原子替换。配置只包含数据库名、Adapter ID 和绝对 member path。
 
-旧 schema、未知字段、未知文件、宽权限、root overlap、symlink 和 state replacement 全部 fail closed。
+旧 schema、未知字段、未知文件、宽权限、root overlap、symlink 和 state replacement 全部 fail closed。配置 store 损坏或无法打开时，错误在内置数据库回退之前传播：包括内置名称在内的所有数据库解析都 fail closed。
 
 ## 诊断与错误
 

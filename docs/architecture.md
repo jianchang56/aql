@@ -84,15 +84,15 @@ Shell 的 SHOW/USE/GRANT 控制语句由 CLI 处理；SHOW TABLES、DESCRIBE/DES
 
 ## 输出
 
-查询批次流式渲染到匿名、无路径的 private 临时文件，只有数据流完整到达 EOF、元数据完成且渲染成功后才顺序发布 stdout。表格渲染使用第二个匿名行缓冲完成全局列宽计算，不保留全部 Arrow 批次。`--output-file` 直接流式写入同目录 private 临时文件，完成后 fsync 并通过 no-replace rename 发布。目标已存在、目录被替换或任一步失败时，不发布结果。
+查询批次流式渲染到匿名、无路径的 private 临时文件，只有数据流完整到达 EOF、元数据完成且渲染成功后才顺序发布 stdout。表格渲染使用第二个匿名行缓冲完成全局列宽计算，不保留全部 Arrow 批次。`--output-file` 直接流式写入同目录 private 临时文件，完成后 fsync、校验目录 identity 未变化，并通过 no-replace rename 发布；这些 nofollow 打开、mode、identity 校验与原子 rename/sync 原语由 `aql-fs` 提供。目标已存在、目录被替换或任一步失败时，不发布结果。
 
 CSV 只有安全模式，公式形状文本始终转义。
 
 ## Config 和 installation state
 
-`aql-config` 只保存配置数据库名称、Adapter ID 和绝对 member path。配置 schema 为 `aql-databases-v1`。
+`aql-config` 只保存配置数据库名称、Adapter ID 和绝对 member path。配置 schema 为 `aql-databases-v1`。配置写入经 `aql-fs` 原语完成：private 临时文件 fsync、原子 rename 和目录 sync。
 
-installation salt 用于 installation-scoped identity 与 redaction。普通查询不创建结果缓存或 Agent source sidecar。
+installation salt 用于 installation-scoped identity 与 redaction，其创建同样使用 `aql-fs` 的 no-replace 发布。普通查询不创建结果缓存或 Agent source sidecar。
 
 ## 核心执行顺序
 
@@ -110,7 +110,7 @@ parse and validate SQL
 
 ## 测试与发布
 
-`aql-test-support` 生成确定性的四种 Agent 合成 fixture。`aql-release` 负责确定性 archive、验证、安装、卸载和 Formula。`cargo xtask verify` 串联 workspace、文档、release 和 performance gates。
+`aql-test-support` 生成确定性的四种 Agent 合成 fixture。`aql-release` 负责确定性 archive、验证、安装、卸载和 Formula。`cargo xtask verify` 串联 workspace、文档、release gates，并重跑性能相关的行为测试（懒流式读取、预算与取消语义）；这些 gate 只做行为断言，不含计时或吞吐指标。
 
 相关契约：
 

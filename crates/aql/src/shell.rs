@@ -84,6 +84,15 @@ pub(super) fn drain_shell_statements(buffer: &mut String) -> Result<Vec<String>,
 }
 
 pub(super) fn shell_words(statement: &str) -> Vec<String> {
+    shell_words_original(statement)
+        .into_iter()
+        .map(|word| word.to_ascii_uppercase())
+        .collect()
+}
+
+/// Splits a shell statement without normalizing letter case, for inputs whose
+/// grammar is case-sensitive (database names).
+pub(super) fn shell_words_original(statement: &str) -> Vec<String> {
     let mut command = statement.trim_start();
     loop {
         if let Some(rest) = command.strip_prefix("--") {
@@ -104,7 +113,7 @@ pub(super) fn shell_words(statement: &str) -> Vec<String> {
     }
     command
         .split_ascii_whitespace()
-        .map(|word| word.to_ascii_uppercase())
+        .map(str::to_owned)
         .collect()
 }
 
@@ -363,7 +372,7 @@ pub(super) async fn run_shell(
     }
     let mut selected_database = None;
     if let Some(database) = initial_database {
-        let database = database.to_ascii_lowercase();
+        validate_database_selection_name(&database)?;
         if !database_is_available(&database)? {
             return Err(
                 database_not_found("unknown or unavailable database; run SHOW DATABASES").into(),
@@ -425,9 +434,14 @@ pub(super) async fn run_shell(
                         println!("{database}");
                     }
                 }
-                [use_word, database] if use_word == "USE" => {
-                    let database = database.to_ascii_lowercase();
-                    if !database_is_available(&database)? {
+                [use_word, _] if use_word == "USE" => {
+                    let database = shell_words_original(&statement)
+                        .get(1)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Err(error) = validate_database_selection_name(&database) {
+                        eprintln!("ERROR: {error}");
+                    } else if !database_is_available(&database)? {
                         eprintln!(
                             "ERROR: Unknown or unavailable database '{database}'. Run SHOW DATABASES;"
                         );

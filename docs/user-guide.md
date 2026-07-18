@@ -45,6 +45,8 @@ aql doctor -d codex
 
 `database discover` 只检查四个固定候选位置，不递归扫描 HOME、不调用 Agent 程序、不输出路径。
 
+数据库选择名称（`-d`、`shell -d` 和 `USE`）使用同一语法：只允许小写 ASCII 字母、数字、`_` 和 `-`。混合或大写形式会被拒绝，Shell 不做大小写折叠。
+
 ### 命名数据库
 
 ```bash
@@ -59,6 +61,17 @@ aql database remove work
 ```
 
 配置格式为 `aql-databases-v1`，只保存名称、Adapter ID 和绝对路径。它不保存 SQL、结果、授权、凭据或 installation salt。名称冲突时，配置数据库优先于同名内置数据库。
+
+配置名称必须以小写 ASCII 字母开头、长度不超过 64 字符，只能包含小写字母、数字、`_` 和 `-`。`all` 是保留的显式 federation 名称，`database add` 一律拒绝；内置名称 `claude`、`codex`、`kimi`、`opencode` 仍可有意识地用于 shadow。
+
+### 状态与配置目录
+
+| 环境变量 | 覆盖对象 | 默认 |
+|---|---|---|
+| `AQL_HOME` | AQL state root（installation salt 所在） | macOS `~/Library/Application Support/aql`；其他 Unix `${XDG_DATA_HOME:-$HOME/.local/share}/aql` |
+| `AQL_CONFIG_HOME` | 配置数据库 root | `${XDG_CONFIG_HOME:-$HOME/.config}/aql` |
+
+两个变量的值都必须是绝对路径；相对值会被拒绝并报错。
 
 ## 查询
 
@@ -104,6 +117,17 @@ aql examples token-usage
 ```
 
 首次查看建议先 `schema --list`，再查看单表。不带表名的 `schema` 输出全部字段。
+
+## 版本、补全和 man page
+
+```bash
+aql version
+aql version --output json
+aql completions bash   # 或 zsh、fish
+aql man
+```
+
+`version` 输出确定性的 package、target 和 canonical schema version 元数据，默认 `text`，可选 `--output json`。`completions` 生成确定性的 shell 补全脚本，`man` 生成确定性的 aql(1) man page；两者都写到 stdout，由用户自行重定向安装。
 
 ## 敏感字段
 

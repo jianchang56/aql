@@ -234,8 +234,13 @@ pub struct FieldValue<T> {
 
 1. Catalog 先按 `source_id + native_id` 建立身份。
 2. 不同物理 source kind 只有在 Adapter 明确声明共享 native ID namespace 时才合并。
-3. Authority 表决定主值；非主值写入 conflicts，不静默丢弃。
-4. 两个同 authority 值冲突时选择更新 watermark/observed_at 更可信者，并产生 warning。
+3. Authority 决定主值；冲突产生 warning 且双方 provenance 都保留，不静默丢弃。
+4. 字段值冲突（两侧均非 NULL 且不同）按字段 authority 仲裁，并产生 FieldConflict warning：
+   - authority 只由该字段 provenance 的 source_kind 决定（`state_database` > `session_index` > `rollout` > 其他），不比较 watermark 或 `observed_at`；
+   - 仅当 incoming authority 严格更高时覆盖；authority 相同（包括双方都没有该字段 provenance）时保留先扫描到的值，结果因此依赖来源扫描顺序；
+   - 既有值为 NULL 时被任何非 NULL incoming 值填充，不产生 warning；incoming NULL 永不覆盖既有值；
+   - `identity_confidence` 不参与字段合并，保留先扫描记录的取值；
+   - `extensions` 按键并入，相同 key 由后扫描记录静默覆盖，不产生 warning。
 5. 不同物理 source identity 永不自动合并。
 6. identity 不确定时保留两个实体，优先重复而不是误合并。
 
