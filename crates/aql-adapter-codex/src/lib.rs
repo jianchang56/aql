@@ -4,8 +4,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::io::{BufReader, Read};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -28,16 +28,35 @@ use sha2::{Digest, Sha256};
 
 mod rollout;
 
-use rollout::{ParsedArtifactChange, ParsedPayload, ReadFields, parse_next};
+use rollout::{ParsedArtifactChange, ParsedPayload, ReadFields, parse_next, read_limited_line};
 
 pub use aql_adapter_api as adapter_api;
 pub use aql_model as model;
+
+const MAX_INDEX_RECORD_BYTES: usize = 1024 * 1024;
+
+type FileIdentity = aql_fs::FileIdentity;
+
+/// Probe-time binding to one canonicalized Codex root and its state database.
+///
+/// Scan-time opens revalidate every bound identity and fail closed on
+/// replacement or shrink instead of reading a changed source.
+#[derive(Clone)]
+struct RootBinding {
+    path: PathBuf,
+    identity: FileIdentity,
+    database: PathBuf,
+    database_identity: FileIdentity,
+    database_len: u64,
+    wal_identity: Option<FileIdentity>,
+    shm_identity: Option<FileIdentity>,
+}
 
 /// Read-only adapter for Codex session metadata, rollout streams, and artifacts.
 pub struct CodexAdapter {
     installation_salt: Vec<u8>,
     observer: Option<Arc<dyn FileAccessObserver>>,
-    roots: Mutex<BTreeMap<SourceId, PathBuf>>,
+    roots: Mutex<BTreeMap<SourceId, RootBinding>>,
 }
 
 struct RolloutFileState {
@@ -49,8 +68,9 @@ struct RolloutFileState {
 }
 
 struct RolloutRecordStream {
-    root: PathBuf,
+    root: RootBinding,
     observer: Option<Arc<dyn FileAccessObserver>>,
+    connection: Option<Connection>,
     request: ScanRequest,
     diagnostics: ScanDiagnostics,
     after_id: Option<String>,
@@ -58,6 +78,18 @@ struct RolloutRecordStream {
     emitted: u64,
     finished: bool,
     installation_salt: Vec<u8>,
+}
+
+struct SessionRecordStream {
+    root: RootBinding,
+    observer: Option<Arc<dyn FileAccessObserver>>,
+    connection: Option<Connection>,
+    index_titles: Option<BTreeMap<String, String>>,
+    request: ScanRequest,
+    diagnostics: ScanDiagnostics,
+    after_id: Option<String>,
+    emitted: u64,
+    finished: bool,
 }
 
 impl RolloutRecordStream {
@@ -75,17 +107,14 @@ impl RolloutRecordStream {
 
     fn open_next_file(&mut self) -> Result<bool, AdapterError> {
         loop {
-            self.opened(SourceKind::StateDatabase);
-            let database =
-                CodexAdapter::database_path(&self.root).ok_or_else(|| AdapterError::NotFound {
-                    stage: "state_database".to_string(),
-                })?;
-            let connection =
-                Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
-                    |_| AdapterError::UnsupportedFormat {
-                        stage: "open_state_database".to_string(),
-                    },
-                )?;
+            if self.connection.is_none() {
+                self.connection = Some(open_state_database(&self.root, &self.observer)?);
+            }
+            let Some(connection) = self.connection.as_ref() else {
+                return Err(AdapterError::Internal {
+                    stage: "rollout_connection".to_string(),
+                });
+            };
             let row = match &self.after_id {
                 Some(after_id) => connection.query_row(
                     "SELECT id, rollout_path FROM threads WHERE id > ?1 ORDER BY id LIMIT 1",
@@ -108,27 +137,11 @@ impl RolloutRecordStream {
                 }
             };
             self.after_id = Some(native_id.clone());
-            let path = self.root.join(relative_path);
-            let file_size = match fs::metadata(&path) {
-                Ok(metadata) => metadata.len(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    self.diagnostics.push(AdapterWarning {
-                        kind: AdapterWarningKind::IncompleteCapability,
-                        source_kind: "rollout".to_string(),
-                        stage: "missing_rollout".to_string(),
-                    })?;
-                    continue;
-                }
-                Err(_) => {
-                    return Err(AdapterError::PermissionDenied {
-                        stage: "stat_rollout".to_string(),
-                    });
-                }
-            };
+            let locator = validate_rollout_locator(&relative_path)?;
             self.opened(SourceKind::Rollout);
-            let file = match File::open(path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let (file, file_size) = match open_rollout_file(&self.root, &locator) {
+                Ok(opened) => opened,
+                Err(AdapterError::NotFound { .. }) => {
                     self.diagnostics.push(AdapterWarning {
                         kind: AdapterWarningKind::IncompleteCapability,
                         source_kind: "rollout".to_string(),
@@ -136,11 +149,7 @@ impl RolloutRecordStream {
                     })?;
                     continue;
                 }
-                Err(_) => {
-                    return Err(AdapterError::PermissionDenied {
-                        stage: "open_rollout".to_string(),
-                    });
-                }
+                Err(error) => return Err(error),
             };
             let native = NativeId::new(native_id);
             self.current = Some(RolloutFileState {
@@ -160,6 +169,107 @@ impl RolloutRecordStream {
         self.emitted += 1;
         Ok(record)
     }
+
+    /// Releases the shared connection and any open rollout file so a terminal
+    /// stream never pins source files beyond its own lifetime.
+    fn release(&mut self) {
+        self.current = None;
+        self.connection = None;
+    }
+}
+
+impl Iterator for SessionRecordStream {
+    type Item = Result<CanonicalRecord, AdapterError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished
+            || self
+                .request
+                .limit
+                .is_some_and(|limit| self.emitted >= limit)
+        {
+            self.finished = true;
+            self.connection = None;
+            return None;
+        }
+        if let Err(error) = check_scan_state(
+            &self.request.cancellation,
+            &self.request.budget,
+            self.emitted,
+            self.request.budget.bytes_read_used(),
+        ) {
+            self.finished = true;
+            self.connection = None;
+            return Some(Err(error));
+        }
+        if self.connection.is_none() {
+            self.connection = Some(match open_state_database(&self.root, &self.observer) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+            });
+        }
+        let Some(connection) = self.connection.as_ref() else {
+            return Some(Err(AdapterError::Internal {
+                stage: "session_connection".to_string(),
+            }));
+        };
+        let mut page_request = self.request.clone();
+        page_request.limit = Some(1);
+        let loaded = scan_sessions(&page_request, connection, self.after_id.as_deref());
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.finished = true;
+                self.connection = None;
+                return Some(Err(error));
+            }
+        };
+        let Some(record) = loaded.into_iter().next() else {
+            self.finished = true;
+            self.connection = None;
+            return None;
+        };
+        let CanonicalRecord::Session(session) = &record else {
+            self.finished = true;
+            self.connection = None;
+            return Some(Err(AdapterError::Internal {
+                stage: "session_record".to_string(),
+            }));
+        };
+        self.after_id = Some(session.native_id.as_str().to_string());
+        if projected(&self.request.projection, "title") {
+            if self.index_titles.is_none() {
+                self.index_titles = Some(
+                    match load_session_index_titles(&self.root, &self.request, &self.observer) {
+                        Ok(titles) => titles,
+                        Err(error) => {
+                            self.finished = true;
+                            self.connection = None;
+                            return Some(Err(error));
+                        }
+                    },
+                );
+            }
+            if let (Some(index_titles), Some(database_title)) =
+                (&self.index_titles, session.title.as_ref())
+                && index_titles
+                    .get(session.native_id.as_str())
+                    .is_some_and(|index_title| index_title != database_title)
+                && let Err(error) = self
+                    .diagnostics
+                    .push(warning(AdapterWarningKind::FieldConflict))
+            {
+                self.finished = true;
+                self.connection = None;
+                return Some(Err(error));
+            }
+        }
+        self.emitted += 1;
+        Some(Ok(record))
+    }
 }
 
 impl Iterator for RolloutRecordStream {
@@ -173,6 +283,7 @@ impl Iterator for RolloutRecordStream {
                 .is_some_and(|limit| self.emitted >= limit)
         {
             self.finished = true;
+            self.release();
             return None;
         }
         loop {
@@ -183,6 +294,7 @@ impl Iterator for RolloutRecordStream {
                 self.request.budget.bytes_read_used(),
             ) {
                 self.finished = true;
+                self.release();
                 return Some(Err(error));
             }
             if self.current.is_none() {
@@ -190,10 +302,12 @@ impl Iterator for RolloutRecordStream {
                     Ok(true) => {}
                     Ok(false) => {
                         self.finished = true;
+                        self.release();
                         return None;
                     }
                     Err(error) => {
                         self.finished = true;
+                        self.release();
                         return Some(Err(error));
                     }
                 }
@@ -215,21 +329,22 @@ impl Iterator for RolloutRecordStream {
             };
             let parsed = match parse_next(&mut current.reader, &fields) {
                 Ok(parsed) => parsed,
-                Err(_) => {
+                Err(error) => {
                     self.finished = true;
-                    return Some(Err(AdapterError::CorruptSource {
-                        stage: "parse_rollout".to_string(),
-                    }));
+                    self.release();
+                    return Some(Err(error));
                 }
             };
             if let Err(error) = self.request.budget.charge_bytes_read(parsed.bytes_read) {
                 self.finished = true;
+                self.release();
                 return Some(Err(error));
             }
             self.bytes_read(SourceKind::Rollout, parsed.bytes_read);
             for kind in parsed.warnings {
                 if let Err(error) = self.diagnostics.push(warning(kind)) {
                     self.finished = true;
+                    self.release();
                     return Some(Err(error));
                 }
             }
@@ -348,13 +463,7 @@ impl CodexAdapter {
         }
     }
 
-    fn bytes_read(&self, kind: SourceKind, count: u64) {
-        if let Some(observer) = &self.observer {
-            observer.bytes_read(kind, count);
-        }
-    }
-
-    fn root(&self, manifest: &SourceManifest) -> Result<PathBuf, AdapterError> {
+    fn root(&self, manifest: &SourceManifest) -> Result<RootBinding, AdapterError> {
         self.roots
             .lock()
             .map_err(|_| AdapterError::Internal {
@@ -367,28 +476,89 @@ impl CodexAdapter {
             })
     }
 
-    fn database_path(root: &Path) -> Option<PathBuf> {
-        let sqlite_root = root.join("sqlite");
-        let entries = fs::read_dir(sqlite_root).ok()?;
-        entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("state_") && name.ends_with(".sqlite"))
-            })
-    }
-
-    fn open_database(&self, root: &Path) -> Result<Connection, AdapterError> {
-        let path = Self::database_path(root).ok_or_else(|| AdapterError::NotFound {
-            stage: "state_database".to_string(),
+    /// Validates one candidate root and binds the identities that scans later
+    /// revalidate, failing closed on symlink roots, world/group-writable roots,
+    /// hostile sidecars, and hot WAL files that would require recovery writes.
+    fn validate_root(path: &Path) -> Result<RootBinding, AdapterError> {
+        let metadata = fs::symlink_metadata(path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => AdapterError::NotFound {
+                stage: "codex_root".to_string(),
+            },
+            _ => AdapterError::PermissionDenied {
+                stage: "codex_root".to_string(),
+            },
         })?;
-        self.opened(SourceKind::StateDatabase);
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_| {
-            AdapterError::UnsupportedFormat {
-                stage: "open_state_database".to_string(),
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(AdapterError::UnsupportedFormat {
+                stage: "codex_root_type".to_string(),
+            });
+        }
+        let opened =
+            aql_fs::open_absolute_dir(path).map_err(|_| AdapterError::PermissionDenied {
+                stage: "codex_root_open".to_string(),
+            })?;
+        let opened_metadata =
+            opened
+                .dir_metadata()
+                .map_err(|_| AdapterError::PermissionDenied {
+                    stage: "codex_root_metadata".to_string(),
+                })?;
+        #[cfg(unix)]
+        {
+            use cap_std::fs::PermissionsExt;
+            if opened_metadata.permissions().mode() & 0o022 != 0 {
+                return Err(AdapterError::PermissionDenied {
+                    stage: "codex_root_permissions".to_string(),
+                });
             }
+        }
+        let path = path.canonicalize().map_err(|_| AdapterError::NotFound {
+            stage: "codex_root_canonicalize".to_string(),
+        })?;
+        let directory =
+            aql_fs::open_absolute_dir(&path).map_err(|_| AdapterError::SnapshotUnavailable)?;
+        let identity = aql_fs::identity(
+            &directory
+                .dir_metadata()
+                .map_err(|_| AdapterError::SnapshotUnavailable)?,
+        );
+        if identity != aql_fs::identity(&opened_metadata) {
+            return Err(AdapterError::SnapshotUnavailable);
+        }
+        let database = database_path(&path)?;
+        let database_metadata =
+            fs::symlink_metadata(&database).map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => AdapterError::NotFound {
+                    stage: "codex_state_database".to_string(),
+                },
+                _ => AdapterError::PermissionDenied {
+                    stage: "codex_state_database".to_string(),
+                },
+            })?;
+        if database_metadata.file_type().is_symlink() || !database_metadata.is_file() {
+            return Err(AdapterError::UnsupportedFormat {
+                stage: "codex_state_database_type".to_string(),
+            });
+        }
+        let wal_identity =
+            optional_file_identity(&sidecar_path(&database, "-wal"), "codex_state_database_wal")?;
+        let shm_identity =
+            optional_file_identity(&sidecar_path(&database, "-shm"), "codex_state_database_shm")?;
+        if wal_identity.is_some() && shm_identity.is_none() {
+            // A WAL without its shared-memory index would force SQLite to run
+            // recovery and create sidecars next to the source; fail closed.
+            return Err(AdapterError::SnapshotUnavailable);
+        }
+        let database_identity =
+            aql_fs::file_identity(&database).map_err(|_| AdapterError::SnapshotUnavailable)?;
+        Ok(RootBinding {
+            path,
+            identity,
+            database,
+            database_identity,
+            database_len: database_metadata.len(),
+            wal_identity,
+            shm_identity,
         })
     }
 
@@ -462,15 +632,14 @@ impl CodexAdapter {
             column("content_json", AccessClass::Content),
         ]
     }
+}
 
-    fn scan_session_edge(
-        &self,
-        request: &ScanRequest,
-        after_child_id: Option<&str>,
-    ) -> Result<Option<(CanonicalRecord, bool)>, AdapterError> {
-        let root = self.root(&request.source)?;
-        let connection = self.open_database(&root)?;
-        let row = match after_child_id {
+fn scan_session_edge(
+    request: &ScanRequest,
+    connection: &Connection,
+    after_child_id: Option<&str>,
+) -> Result<Option<(CanonicalRecord, bool)>, AdapterError> {
+    let row = match after_child_id {
             Some(after) => connection.query_row(
                 "SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges WHERE child_thread_id > ?1 ORDER BY child_thread_id LIMIT 1",
                 [after],
@@ -482,245 +651,241 @@ impl CodexAdapter {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
             ),
         };
-        let (parent, child, status) = match row {
-            Ok(row) => row,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-            Err(_) => {
-                return Err(AdapterError::CorruptSource {
-                    stage: "read_session_edge".to_string(),
-                });
-            }
-        };
-        check_scan_state(&request.cancellation, &request.budget, 1, 0)?;
+    let (parent, child, status) = match row {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(_) => {
+            return Err(AdapterError::CorruptSource {
+                stage: "read_session_edge".to_string(),
+            });
+        }
+    };
+    check_scan_state(&request.cancellation, &request.budget, 1, 0)?;
+    request.budget.charge_records(1)?;
+    let parent_native = NativeId::new(parent.clone());
+    let child_native = NativeId::new(child.clone());
+    let edge_native = NativeId::new(format!("{parent}->{child}"));
+    let record = SessionEdgeRecord {
+        edge_id: EntityId::from_parts("codex", &request.source.source_id, &edge_native),
+        source_id: request.source.source_id.clone(),
+        parent_session_id: EntityId::from_parts("codex", &request.source.source_id, &parent_native),
+        child_session_id: EntityId::from_parts("codex", &request.source.source_id, &child_native),
+        edge_kind: status,
+        created_at: None,
+        native_edge_id: Some(edge_native),
+        provenance: provenance_map_for_source(
+            &request.source.source_id,
+            Some(&request.source.format_fingerprint),
+            "state_database",
+            &[
+                "edge_id",
+                "source_id",
+                "parent_session_id",
+                "child_session_id",
+                "edge_kind",
+                "native_edge_id",
+            ],
+        ),
+        extensions: BTreeMap::new(),
+    };
+    let child_exists: i64 = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1)",
+            [&child],
+            |row| row.get(0),
+        )
+        .map_err(|_| AdapterError::CorruptSource {
+            stage: "check_session_edge_child".to_string(),
+        })?;
+    Ok(Some((
+        CanonicalRecord::SessionEdge(record),
+        child_exists == 0,
+    )))
+}
+
+fn scan_sessions(
+    request: &ScanRequest,
+    connection: &Connection,
+    after_id: Option<&str>,
+) -> Result<Vec<CanonicalRecord>, AdapterError> {
+    let available_columns = thread_columns(connection)?;
+    let mut selected_columns = vec!["id"];
+    for (logical, physical) in [
+        ("created_at", "created_at_ms"),
+        ("updated_at", "updated_at_ms"),
+        ("provider", "model_provider"),
+        ("cwd", "cwd"),
+        ("title", "title"),
+        ("tokens_used", "tokens_used"),
+        ("archived", "archived"),
+        ("model", "model"),
+        ("preview", "preview"),
+    ] {
+        if projected(&request.projection, logical) && available_columns.contains(physical) {
+            selected_columns.push(physical);
+        }
+    }
+    if request.predicates.iter().any(is_updated_at_range)
+        && available_columns.contains("updated_at_ms")
+    {
+        selected_columns.push("updated_at_ms");
+    }
+    selected_columns.sort_unstable();
+    selected_columns.dedup();
+    let query = format!(
+        "SELECT {} FROM threads{} ORDER BY id",
+        selected_columns.join(", "),
+        if after_id.is_some() {
+            " WHERE id > ?1"
+        } else {
+            ""
+        }
+    );
+    let mut statement =
+        connection
+            .prepare(&query)
+            .map_err(|_| AdapterError::UnsupportedFormat {
+                stage: "prepare_threads".to_string(),
+            })?;
+    let mut rows = match after_id {
+        Some(after_id) => statement.query([after_id]),
+        None => statement.query([]),
+    }
+    .map_err(|_| AdapterError::CorruptSource {
+        stage: "query_threads".to_string(),
+    })?;
+    let mut records = Vec::new();
+    while let Some(row) = rows.next().map_err(|_| AdapterError::CorruptSource {
+        stage: "read_threads".to_string(),
+    })? {
+        check_scan_state(
+            &request.cancellation,
+            &request.budget,
+            records.len() as u64 + 1,
+            0,
+        )?;
+        let native = NativeId::new(row.get::<_, String>("id").map_err(db_read_error)?);
+        let updated_at_ms = row.get::<_, i64>("updated_at_ms").ok();
+        if !matches_session_predicates(&native, updated_at_ms, &request.predicates) {
+            continue;
+        }
         request.budget.charge_records(1)?;
-        let parent_native = NativeId::new(parent.clone());
-        let child_native = NativeId::new(child.clone());
-        let edge_native = NativeId::new(format!("{parent}->{child}"));
-        let record = SessionEdgeRecord {
-            edge_id: EntityId::from_parts("codex", &request.source.source_id, &edge_native),
+        let entity = EntityId::from_parts("codex", &request.source.source_id, &native);
+        let selected = |name| projected(&request.projection, name);
+        let mut record = SessionRecord {
+            session_id: entity,
+            native_id: native,
             source_id: request.source.source_id.clone(),
-            parent_session_id: EntityId::from_parts(
-                "codex",
-                &request.source.source_id,
-                &parent_native,
-            ),
-            child_session_id: EntityId::from_parts(
-                "codex",
-                &request.source.source_id,
-                &child_native,
-            ),
-            edge_kind: status,
-            created_at: None,
-            native_edge_id: Some(edge_native),
-            provenance: provenance_map_for_source(
-                &request.source.source_id,
-                Some(&request.source.format_fingerprint),
-                "state_database",
-                &[
-                    "edge_id",
-                    "source_id",
-                    "parent_session_id",
-                    "child_session_id",
-                    "edge_kind",
-                    "native_edge_id",
-                ],
-            ),
+            agent_id: "codex".to_string(),
+            title: selected("title").then(|| row.get("title").ok()).flatten(),
+            preview: selected("preview")
+                .then(|| row.get("preview").ok())
+                .flatten(),
+            cwd: selected("cwd").then(|| row.get("cwd").ok()).flatten(),
+            project: None,
+            model: selected("model").then(|| row.get("model").ok()).flatten(),
+            provider: selected("provider")
+                .then(|| row.get("model_provider").ok())
+                .flatten(),
+            created_at: selected("created_at")
+                .then(|| timestamp_millis(row.get("created_at_ms").ok()))
+                .flatten(),
+            updated_at: selected("updated_at")
+                .then(|| timestamp_millis(row.get("updated_at_ms").ok()))
+                .flatten(),
+            status: None,
+            archived: selected("archived")
+                .then(|| row.get::<_, i64>("archived").ok().map(|value| value != 0))
+                .flatten(),
+            message_count: None,
+            tool_call_count: None,
+            tokens_used: selected("tokens_used")
+                .then(|| row.get("tokens_used").ok())
+                .flatten(),
+            identity_confidence: IdentityConfidence::Exact,
+            snapshot_state: SnapshotState::Weak,
+            provenance: BTreeMap::new(),
             extensions: BTreeMap::new(),
         };
-        let child_exists: i64 = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1)",
-                [&child],
-                |row| row.get(0),
-            )
-            .map_err(|_| AdapterError::CorruptSource {
-                stage: "check_session_edge_child".to_string(),
-            })?;
-        Ok(Some((
-            CanonicalRecord::SessionEdge(record),
-            child_exists == 0,
-        )))
-    }
-
-    fn scan_sessions(
-        &self,
-        request: &ScanRequest,
-        after_id: Option<&str>,
-    ) -> Result<Vec<CanonicalRecord>, AdapterError> {
-        let root = self.root(&request.source)?;
-        let connection = self.open_database(&root)?;
-        let available_columns = thread_columns(&connection)?;
-        let mut selected_columns = vec!["id"];
-        for (logical, physical) in [
-            ("created_at", "created_at_ms"),
-            ("updated_at", "updated_at_ms"),
-            ("provider", "model_provider"),
-            ("cwd", "cwd"),
-            ("title", "title"),
-            ("tokens_used", "tokens_used"),
-            ("archived", "archived"),
-            ("model", "model"),
-            ("preview", "preview"),
-        ] {
-            if projected(&request.projection, logical) && available_columns.contains(physical) {
-                selected_columns.push(physical);
-            }
-        }
-        if request.predicates.iter().any(is_updated_at_range)
-            && available_columns.contains("updated_at_ms")
-        {
-            selected_columns.push("updated_at_ms");
-        }
-        selected_columns.sort_unstable();
-        selected_columns.dedup();
-        let query = format!(
-            "SELECT {} FROM threads{} ORDER BY id",
-            selected_columns.join(", "),
-            if after_id.is_some() {
-                " WHERE id > ?1"
-            } else {
-                ""
-            }
+        let provenance_fields = session_provenance_fields(&record, &request.projection);
+        record.provenance = provenance_map_for_source(
+            &request.source.source_id,
+            Some(&request.source.format_fingerprint),
+            "state_database",
+            &provenance_fields,
         );
-        let mut statement =
-            connection
-                .prepare(&query)
-                .map_err(|_| AdapterError::UnsupportedFormat {
-                    stage: "prepare_threads".to_string(),
-                })?;
-        let mut rows = match after_id {
-            Some(after_id) => statement.query([after_id]),
-            None => statement.query([]),
+        let record = CanonicalRecord::Session(record);
+        check_record_value_size(&record, &request.budget)?;
+        records.push(record);
+        if request
+            .limit
+            .is_some_and(|limit| records.len() as u64 >= limit)
+        {
+            break;
         }
-        .map_err(|_| AdapterError::CorruptSource {
-            stage: "query_threads".to_string(),
-        })?;
-        let mut records = Vec::new();
-        while let Some(row) = rows.next().map_err(|_| AdapterError::CorruptSource {
-            stage: "read_threads".to_string(),
-        })? {
-            check_scan_state(
-                &request.cancellation,
-                &request.budget,
-                records.len() as u64 + 1,
-                0,
-            )?;
-            let native = NativeId::new(row.get::<_, String>("id").map_err(db_read_error)?);
-            let updated_at_ms = row.get::<_, i64>("updated_at_ms").ok();
-            if !matches_session_predicates(&native, updated_at_ms, &request.predicates) {
-                continue;
-            }
-            request.budget.charge_records(1)?;
-            let entity = EntityId::from_parts("codex", &request.source.source_id, &native);
-            let selected = |name| projected(&request.projection, name);
-            let mut record = SessionRecord {
-                session_id: entity,
-                native_id: native,
-                source_id: request.source.source_id.clone(),
-                agent_id: "codex".to_string(),
-                title: selected("title").then(|| row.get("title").ok()).flatten(),
-                preview: selected("preview")
-                    .then(|| row.get("preview").ok())
-                    .flatten(),
-                cwd: selected("cwd").then(|| row.get("cwd").ok()).flatten(),
-                project: None,
-                model: selected("model").then(|| row.get("model").ok()).flatten(),
-                provider: selected("provider")
-                    .then(|| row.get("model_provider").ok())
-                    .flatten(),
-                created_at: selected("created_at")
-                    .then(|| timestamp_millis(row.get("created_at_ms").ok()))
-                    .flatten(),
-                updated_at: selected("updated_at")
-                    .then(|| timestamp_millis(row.get("updated_at_ms").ok()))
-                    .flatten(),
-                status: None,
-                archived: selected("archived")
-                    .then(|| row.get::<_, i64>("archived").ok().map(|value| value != 0))
-                    .flatten(),
-                message_count: None,
-                tool_call_count: None,
-                tokens_used: selected("tokens_used")
-                    .then(|| row.get("tokens_used").ok())
-                    .flatten(),
-                identity_confidence: IdentityConfidence::Exact,
-                snapshot_state: SnapshotState::Weak,
-                provenance: BTreeMap::new(),
-                extensions: BTreeMap::new(),
-            };
-            let provenance_fields = session_provenance_fields(&record, &request.projection);
-            record.provenance = provenance_map_for_source(
-                &request.source.source_id,
-                Some(&request.source.format_fingerprint),
-                "state_database",
-                &provenance_fields,
-            );
-            let record = CanonicalRecord::Session(record);
-            check_record_value_size(&record, &request.budget)?;
-            records.push(record);
-            if request
-                .limit
-                .is_some_and(|limit| records.len() as u64 >= limit)
-            {
-                break;
-            }
-        }
-        Ok(records)
     }
+    Ok(records)
+}
 
-    fn session_index_conflicts(
-        &self,
-        request: &ScanRequest,
-        records: &[CanonicalRecord],
-    ) -> Result<Vec<AdapterWarning>, AdapterError> {
-        if !projected(&request.projection, "title") {
-            return Ok(Vec::new());
+/// Reads `session_index.jsonl` once per scan under the shared budget and
+/// returns the native-id to title evidence map used for conflict warnings.
+/// The index is title evidence only; missing files degrade to an empty map.
+fn load_session_index_titles(
+    root: &RootBinding,
+    request: &ScanRequest,
+    observer: &Option<Arc<dyn FileAccessObserver>>,
+) -> Result<BTreeMap<String, String>, AdapterError> {
+    let mut titles = BTreeMap::new();
+    validate_binding(root)?;
+    let directory = open_bound_root(root)?;
+    let path = Path::new("session_index.jsonl");
+    let metadata = match directory.symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(titles),
+        Err(_) => {
+            return Err(AdapterError::PermissionDenied {
+                stage: "session_index_metadata".to_string(),
+            });
         }
-        let path = self.root(&request.source)?.join("session_index.jsonl");
-        if !path.is_file() {
-            return Ok(Vec::new());
-        }
-        self.opened(SourceKind::SessionIndex);
-        let file = File::open(path).map_err(|_| AdapterError::NotFound {
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(AdapterError::UnsupportedFormat {
+            stage: "session_index_type".to_string(),
+        });
+    }
+    if let Some(observer) = observer {
+        observer.opened(SourceKind::SessionIndex);
+    }
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    let file =
+        aql_fs::open_file(&directory, path, options).map_err(|_| AdapterError::NotFound {
             stage: "open_session_index".to_string(),
         })?;
-        let database_titles: BTreeMap<_, _> = records
-            .iter()
-            .filter_map(|record| match record {
-                CanonicalRecord::Session(session) => session
-                    .title
-                    .as_ref()
-                    .map(|title| (session.native_id.as_str(), title.as_str())),
-                _ => None,
-            })
-            .collect();
-        let mut warnings = Vec::new();
-        for line in BufReader::new(file).lines() {
-            check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
-            let line = line.map_err(|_| AdapterError::CorruptSource {
-                stage: "read_session_index".to_string(),
-            })?;
-            request.budget.charge_bytes_read(line.len() as u64)?;
-            self.bytes_read(SourceKind::SessionIndex, line.len() as u64);
-            let value: JsonValue =
-                serde_json::from_str(&line).map_err(|_| AdapterError::CorruptSource {
-                    stage: "parse_session_index".to_string(),
-                })?;
-            let Some(id) = value.get("id").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            let Some(index_title) = value.get("thread_name").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            if database_titles
-                .get(id)
-                .is_some_and(|database_title| *database_title != index_title)
-            {
-                warnings.push(warning(AdapterWarningKind::FieldConflict));
-            }
+    let mut reader = BufReader::new(file.into_std());
+    while let Some((line, _complete, consumed)) = read_limited_line(
+        &mut reader,
+        MAX_INDEX_RECORD_BYTES,
+        "codex_index_record_bytes",
+    )? {
+        check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
+        request.budget.charge_bytes_read(consumed as u64)?;
+        if let Some(observer) = observer {
+            observer.bytes_read(SourceKind::SessionIndex, consumed as u64);
         }
-        Ok(warnings)
+        let value: JsonValue =
+            serde_json::from_slice(&line).map_err(|_| AdapterError::CorruptSource {
+                stage: "parse_session_index".to_string(),
+            })?;
+        let Some(id) = value.get("id").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some(index_title) = value.get("thread_name").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        titles.insert(id.to_string(), index_title.to_string());
     }
+    Ok(titles)
 }
 
 impl AgentAdapter for CodexAdapter {
@@ -729,20 +894,10 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn probe(&self, request: &ProbeRequest) -> Result<ProbeResult, AdapterError> {
-        let root = Path::new(&request.data_root);
-        if !root.is_dir() {
-            return Err(AdapterError::NotFound {
-                stage: "probe_root".to_string(),
-            });
-        }
-        let database = Self::database_path(root).ok_or_else(|| AdapterError::NotFound {
-            stage: "probe_state_database".to_string(),
-        })?;
+        let binding = Self::validate_root(Path::new(&request.data_root))?;
         self.opened(SourceKind::StateDatabase);
-        let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|_| AdapterError::UnsupportedFormat {
-                stage: "probe_state_database".to_string(),
-            })?;
+        let connection =
+            open_state_database_file(&binding.database, binding.wal_identity.is_some())?;
         let has_threads: i64 = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads')",
@@ -793,7 +948,7 @@ impl AgentAdapter for CodexAdapter {
         }
         let format_fingerprint = format!(
             "{base_fingerprint}:index-{}:rollout-{}:edges-{}",
-            if root.join("session_index.jsonl").is_file() {
+            if binding.path.join("session_index.jsonl").is_file() {
                 "jsonl-v0"
             } else {
                 "none"
@@ -853,17 +1008,16 @@ impl AgentAdapter for CodexAdapter {
         if user_version != 5 {
             warnings.push("unrecognized_user_version".to_string());
         }
-        let source_id = SourceId::for_data_root(
-            "codex",
-            &request.data_root,
-            self.installation_salt.as_slice(),
-        );
+        let root_text = binding.path.to_string_lossy();
+        let source_id =
+            SourceId::for_data_root("codex", &root_text, self.installation_salt.as_slice());
+        let snapshot = snapshot_token(&binding);
         self.roots
             .lock()
             .map_err(|_| AdapterError::Internal {
                 stage: "source_registry".to_string(),
             })?
-            .insert(source_id.clone(), root.to_path_buf());
+            .insert(source_id.clone(), binding);
         let data_root_token = format!("codex-root:{}", source_id.as_str());
         Ok(ProbeResult {
             manifests: vec![SourceManifest {
@@ -881,7 +1035,7 @@ impl AgentAdapter for CodexAdapter {
                 .into_iter()
                 .chain((has_session_edges != 0).then(|| "session_edges".to_string()))
                 .collect(),
-                snapshot: Some(SnapshotToken::new("weak-fixture-snapshot")),
+                snapshot: Some(snapshot),
                 warnings,
             }],
         })
@@ -983,7 +1137,7 @@ impl AgentAdapter for CodexAdapter {
             let diagnostics = ScanDiagnostics::default();
             let stream_diagnostics = diagnostics.clone();
             let observer = self.observer.clone();
-            let source_id = effective_request.source.source_id.clone();
+            let mut connection: Option<Connection> = None;
             let mut after_child_id: Option<String> = None;
             let mut emitted = 0_u64;
             let records = Box::new(std::iter::from_fn(move || {
@@ -993,16 +1147,22 @@ impl AgentAdapter for CodexAdapter {
                 {
                     return None;
                 }
-                let mut roots = BTreeMap::new();
-                roots.insert(source_id.clone(), root.clone());
-                let adapter = CodexAdapter {
-                    installation_salt: Vec::new(),
-                    observer: observer.clone(),
-                    roots: Mutex::new(roots),
+                if connection.is_none() {
+                    connection = Some(match open_state_database(&root, &observer) {
+                        Ok(connection) => connection,
+                        Err(error) => return Some(Err(error)),
+                    });
+                }
+                let Some(connection) = connection.as_ref() else {
+                    return Some(Err(AdapterError::Internal {
+                        stage: "session_edge_connection".to_string(),
+                    }));
                 };
-                let result = match adapter
-                    .scan_session_edge(&effective_request, after_child_id.as_deref())
-                {
+                let result = match scan_session_edge(
+                    &effective_request,
+                    connection,
+                    after_child_id.as_deref(),
+                ) {
                     Ok(result) => result,
                     Err(error) => return Some(Err(error)),
                 };
@@ -1063,6 +1223,7 @@ impl AgentAdapter for CodexAdapter {
             let records = Box::new(RolloutRecordStream {
                 root,
                 observer: self.observer.clone(),
+                connection: None,
                 request: effective_request,
                 diagnostics: diagnostics.clone(),
                 after_id: None,
@@ -1099,48 +1260,17 @@ impl AgentAdapter for CodexAdapter {
 
         let root = self.root(&effective_request.source)?;
         let diagnostics = ScanDiagnostics::default();
-        let stream_diagnostics = diagnostics.clone();
-        let observer = self.observer.clone();
-        let source_id = effective_request.source.source_id.clone();
-        let mut after_id: Option<String> = None;
-        let mut emitted = 0_u64;
-        let records = Box::new(std::iter::from_fn(move || {
-            if effective_request
-                .limit
-                .is_some_and(|limit| emitted >= limit)
-            {
-                return None;
-            }
-            let mut roots = BTreeMap::new();
-            roots.insert(source_id.clone(), root.clone());
-            let adapter = CodexAdapter {
-                installation_salt: Vec::new(),
-                observer: observer.clone(),
-                roots: Mutex::new(roots),
-            };
-            let mut page_request = effective_request.clone();
-            page_request.limit = Some(1);
-            let loaded = match adapter.scan_sessions(&page_request, after_id.as_deref()) {
-                Ok(loaded) => loaded,
-                Err(error) => return Some(Err(error)),
-            };
-            let record = loaded.into_iter().next()?;
-            if let CanonicalRecord::Session(session) = &record {
-                after_id = Some(session.native_id.as_str().to_string());
-            }
-            match adapter.session_index_conflicts(&page_request, std::slice::from_ref(&record)) {
-                Ok(warnings) => {
-                    for warning in warnings {
-                        if let Err(error) = stream_diagnostics.push(warning) {
-                            return Some(Err(error));
-                        }
-                    }
-                }
-                Err(error) => return Some(Err(error)),
-            }
-            emitted += 1;
-            Some(Ok(record))
-        }));
+        let records = Box::new(SessionRecordStream {
+            root,
+            observer: self.observer.clone(),
+            connection: None,
+            index_titles: None,
+            request: effective_request,
+            diagnostics: diagnostics.clone(),
+            after_id: None,
+            emitted: 0,
+            finished: false,
+        });
         Ok(ScanResult {
             records,
             pushdown: PushdownReport {
@@ -1183,6 +1313,287 @@ fn db_read_error(_error: rusqlite::Error) -> AdapterError {
     AdapterError::CorruptSource {
         stage: "read_thread_value".to_string(),
     }
+}
+
+/// Selects the newest `state_<version>.sqlite` candidate deterministically
+/// instead of relying on directory iteration order.
+fn database_path(root: &Path) -> Result<PathBuf, AdapterError> {
+    let sqlite_root = root.join("sqlite");
+    let entries = fs::read_dir(&sqlite_root).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => AdapterError::NotFound {
+            stage: "codex_state_database".to_string(),
+        },
+        _ => AdapterError::PermissionDenied {
+            stage: "codex_state_database".to_string(),
+        },
+    })?;
+    let mut newest: Option<(u64, PathBuf)> = None;
+    for entry in entries {
+        let entry = entry.map_err(|_| AdapterError::PermissionDenied {
+            stage: "codex_state_database_entry".to_string(),
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(version) = name
+            .strip_prefix("state_")
+            .and_then(|rest| rest.strip_suffix(".sqlite"))
+            .and_then(|version| version.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if newest
+            .as_ref()
+            .is_none_or(|(current, _)| version > *current)
+        {
+            newest = Some((version, entry.path()));
+        }
+    }
+    newest
+        .map(|(_, path)| path)
+        .ok_or_else(|| AdapterError::NotFound {
+            stage: "codex_state_database".to_string(),
+        })
+}
+
+fn sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut name = database
+        .file_name()
+        .map_or_else(std::ffi::OsString::new, std::ffi::OsStr::to_os_string);
+    name.push(suffix);
+    database.with_file_name(name)
+}
+
+fn optional_file_identity(path: &Path, stage: &str) -> Result<Option<FileIdentity>, AdapterError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(AdapterError::UnsupportedFormat {
+                stage: stage.to_string(),
+            })
+        }
+        Ok(_) => aql_fs::file_identity(path)
+            .map(Some)
+            .map_err(|_| AdapterError::SnapshotUnavailable),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(AdapterError::PermissionDenied {
+            stage: stage.to_string(),
+        }),
+    }
+}
+
+/// Revalidates every identity bound at probe time, failing closed on
+/// replacement, shrink, or sidecar drift instead of reading a changed source.
+fn validate_binding(binding: &RootBinding) -> Result<(), AdapterError> {
+    let root_metadata =
+        fs::symlink_metadata(&binding.path).map_err(|_| AdapterError::SnapshotUnavailable)?;
+    if root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || aql_fs::directory_identity(&binding.path)
+            .map_err(|_| AdapterError::SnapshotUnavailable)?
+            != binding.identity
+    {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    let database_metadata =
+        fs::symlink_metadata(&binding.database).map_err(|_| AdapterError::SnapshotUnavailable)?;
+    if database_metadata.file_type().is_symlink()
+        || !database_metadata.is_file()
+        || database_metadata.len() < binding.database_len
+        || aql_fs::file_identity(&binding.database)
+            .map_err(|_| AdapterError::SnapshotUnavailable)?
+            != binding.database_identity
+        || optional_file_identity(
+            &sidecar_path(&binding.database, "-wal"),
+            "codex_state_database_wal",
+        )? != binding.wal_identity
+        || optional_file_identity(
+            &sidecar_path(&binding.database, "-shm"),
+            "codex_state_database_shm",
+        )? != binding.shm_identity
+    {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    Ok(())
+}
+
+/// Opens the currently named root without following symlinks and proves that
+/// the opened capability is the directory bound during probing. The capability
+/// lives only through the following relative open, avoiding long-lived Windows
+/// directory locks while closing the path-replacement race.
+fn open_bound_root(binding: &RootBinding) -> Result<cap_std::fs::Dir, AdapterError> {
+    let directory =
+        aql_fs::open_absolute_dir(&binding.path).map_err(|_| AdapterError::SnapshotUnavailable)?;
+    let metadata = directory
+        .dir_metadata()
+        .map_err(|_| AdapterError::SnapshotUnavailable)?;
+    if aql_fs::identity(&metadata) != binding.identity {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    Ok(directory)
+}
+
+/// Opens the bound state database after identity revalidation. A database
+/// without a WAL sidecar is opened with immutable semantics so the read never
+/// creates `-wal`/`-shm` files or attempts WAL recovery next to the source; a
+/// bound active WAL (both sidecars present) keeps the plain read-only path.
+fn open_state_database(
+    root: &RootBinding,
+    observer: &Option<Arc<dyn FileAccessObserver>>,
+) -> Result<Connection, AdapterError> {
+    validate_binding(root)?;
+    if let Some(observer) = observer {
+        observer.opened(SourceKind::StateDatabase);
+    }
+    open_state_database_file(&root.database, root.wal_identity.is_some())
+}
+
+fn open_state_database_file(database: &Path, active_wal: bool) -> Result<Connection, AdapterError> {
+    if active_wal {
+        Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_| {
+            AdapterError::UnsupportedFormat {
+                stage: "open_state_database".to_string(),
+            }
+        })
+    } else {
+        Connection::open_with_flags(
+            immutable_uri(database)?,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|_| AdapterError::UnsupportedFormat {
+            stage: "open_state_database".to_string(),
+        })
+    }
+}
+
+/// Builds a `file:` URI that opens the database with immutable semantics,
+/// percent-encoding the characters SQLite treats as URI delimiters.
+fn immutable_uri(database: &Path) -> Result<String, AdapterError> {
+    let text = database
+        .to_str()
+        .ok_or_else(|| AdapterError::UnsupportedFormat {
+            stage: "state_database_uri".to_string(),
+        })?;
+    let text = normalize_windows_verbatim(text);
+    let mut uri = String::with_capacity(text.len() + 24);
+    uri.push_str("file:");
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        uri.push_str("///");
+    }
+    for character in text.chars() {
+        match character {
+            '\\' => uri.push('/'),
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3F"),
+            '#' => uri.push_str("%23"),
+            _ => uri.push(character),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Ok(uri)
+}
+
+#[cfg(windows)]
+fn normalize_windows_verbatim(text: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return std::borrow::Cow::Owned(format!(r"\\{rest}"));
+    }
+    std::borrow::Cow::Borrowed(text.strip_prefix(r"\\?\").unwrap_or(text))
+}
+
+#[cfg(not(windows))]
+fn normalize_windows_verbatim(text: &str) -> &str {
+    text
+}
+
+/// Derives the opaque snapshot token from the identities bound during probing.
+fn snapshot_token(binding: &RootBinding) -> SnapshotToken {
+    let mut digest = Sha256::new();
+    digest.update(b"codex-snapshot-v0\0");
+    for identity in [binding.identity, binding.database_identity] {
+        digest.update(identity.device().to_le_bytes());
+        digest.update(identity.inode().to_le_bytes());
+    }
+    digest.update(binding.database_len.to_le_bytes());
+    for sidecar in [binding.wal_identity, binding.shm_identity] {
+        match sidecar {
+            Some(identity) => {
+                digest.update([1_u8]);
+                digest.update(identity.device().to_le_bytes());
+                digest.update(identity.inode().to_le_bytes());
+            }
+            None => digest.update([0_u8]),
+        }
+    }
+    let hash = digest.finalize();
+    SnapshotToken::new(format!(
+        "codex-snapshot:{}",
+        hash[..12]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+/// Validates a store-supplied rollout locator before any filesystem access.
+/// Only normalized relative paths below the known rollout roots are accepted;
+/// absolute paths, parent components, and every other component shape fail
+/// closed.
+fn validate_rollout_locator(locator: &str) -> Result<PathBuf, AdapterError> {
+    let invalid = || AdapterError::CorruptSource {
+        stage: "rollout_locator".to_string(),
+    };
+    let path = Path::new(locator);
+    let mut components = path.components();
+    let Some(Component::Normal(root)) = components.next() else {
+        return Err(invalid());
+    };
+    if root != "sessions" && root != "archived_sessions" {
+        return Err(invalid());
+    }
+    let mut depth = 1_usize;
+    for component in components {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(invalid());
+        }
+        depth += 1;
+    }
+    if depth < 2 {
+        return Err(invalid());
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Opens one validated rollout locator below the bound root without following
+/// any symlink component, returning the file and a fixed byte boundary taken
+/// from the opened file itself.
+fn open_rollout_file(root: &RootBinding, locator: &Path) -> Result<(File, u64), AdapterError> {
+    validate_binding(root)?;
+    let directory = open_bound_root(root)?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    let file =
+        aql_fs::open_file(&directory, locator, options).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => AdapterError::NotFound {
+                stage: "open_rollout".to_string(),
+            },
+            _ => AdapterError::PermissionDenied {
+                stage: "open_rollout".to_string(),
+            },
+        })?;
+    let file = file.into_std();
+    let metadata = file
+        .metadata()
+        .map_err(|_| AdapterError::PermissionDenied {
+            stage: "stat_rollout".to_string(),
+        })?;
+    if !metadata.is_file() {
+        return Err(AdapterError::CorruptSource {
+            stage: "rollout_locator_type".to_string(),
+        });
+    }
+    Ok((file, metadata.len()))
 }
 
 fn check_record_value_size(

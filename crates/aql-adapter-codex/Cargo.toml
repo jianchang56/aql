@@ -6,7 +6,9 @@ version.workspace = true
 
 [dependencies]
 aql-adapter-api = { path = "../aql-adapter-api" }
+aql-fs = { path = "../aql-fs" }
 aql-model = { path = "../aql-model" }
+cap-std.workspace = true
 chrono.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 serde.workspace = true

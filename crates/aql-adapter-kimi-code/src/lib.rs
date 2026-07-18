@@ -52,6 +52,7 @@ struct SessionRecordStream {
     emitted: u64,
     finished: bool,
     index: Option<BTreeMap<String, PathBuf>>,
+    listing: Option<Vec<LocatedSession>>,
     diagnostics: ScanDiagnostics,
     ready: std::collections::VecDeque<SessionRecord>,
 }
@@ -205,17 +206,24 @@ impl KimiCodeAdapter {
             })
     }
 
-    fn next_session_dir(
+    /// Enumerates the bucket/session layout once per scan and returns every
+    /// accepted session sorted by `(bucket, session)` key, replacing the
+    /// previous per-session re-enumeration.
+    fn list_session_dirs(
         root: &RootBinding,
-        after: Option<&SessionKey>,
-    ) -> Result<Option<LocatedSession>, AdapterError> {
+        request: &ScanRequest,
+    ) -> Result<Vec<LocatedSession>, AdapterError> {
         validate_root_identity(root)?;
         let sessions = root.path.join("sessions");
         validate_directory(&sessions)?;
-        let mut best: Option<LocatedSession> = None;
+        let mut found: Vec<LocatedSession> = Vec::new();
+        let remaining_records = request
+            .budget
+            .max_records
+            .saturating_sub(request.budget.records_used());
         let buckets = match fs::read_dir(&sessions) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(_) => {
                 return Err(AdapterError::PermissionDenied {
                     stage: "kimi_sessions".to_string(),
@@ -223,9 +231,13 @@ impl KimiCodeAdapter {
             }
         };
         for bucket in buckets {
+            check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
             let bucket = bucket.map_err(|_| AdapterError::PermissionDenied {
                 stage: "kimi_bucket".to_string(),
             })?;
+            request
+                .budget
+                .charge_bytes_read(bucket.file_name().as_encoded_bytes().len() as u64)?;
             let kind = bucket
                 .file_type()
                 .map_err(|_| AdapterError::PermissionDenied {
@@ -243,9 +255,13 @@ impl KimiCodeAdapter {
                     stage: "kimi_bucket_read".to_string(),
                 })?;
             for session in sessions {
+                check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
                 let session = session.map_err(|_| AdapterError::PermissionDenied {
                     stage: "kimi_session_entry".to_string(),
                 })?;
+                request
+                    .budget
+                    .charge_bytes_read(session.file_name().as_encoded_bytes().len() as u64)?;
                 let kind = session
                     .file_type()
                     .map_err(|_| AdapterError::PermissionDenied {
@@ -259,16 +275,28 @@ impl KimiCodeAdapter {
                         bucket_name.clone(),
                         session.file_name().to_string_lossy().into_owned(),
                     );
-                    if after.is_none_or(|after| key > *after)
-                        && best.as_ref().is_none_or(|(_, current)| key < *current)
-                    {
-                        best = Some((session.path(), key));
+                    if found.len() as u64 >= remaining_records {
+                        return Err(AdapterError::BudgetExceeded {
+                            resource: "kimi_session_inventory".to_string(),
+                            actual: found.len() as u64 + 1,
+                        });
                     }
+                    found.push((session.path(), key));
                 }
             }
         }
+        found.sort_by(|left, right| left.1.cmp(&right.1));
         validate_root_identity(root)?;
-        Ok(best)
+        Ok(found)
+    }
+
+    /// Returns the first listed session with a key strictly after `after`.
+    fn next_session_dir(
+        listing: &[LocatedSession],
+        after: Option<&SessionKey>,
+    ) -> Option<LocatedSession> {
+        let index = listing.partition_point(|(_, key)| Some(key) <= after);
+        listing.get(index).cloned()
     }
 
     fn read_state(
@@ -494,20 +522,25 @@ impl KimiCodeAdapter {
                     continue;
                 }
             };
-            let session_dir = PathBuf::from(entry.session_dir);
-            if !safe_id(&entry.session_id)
-                || !session_dir.is_absolute()
-                || !session_dir.starts_with(&sessions_root)
-                || session_dir.file_name().and_then(|name| name.to_str())
-                    != Some(entry.session_id.as_str())
-            {
+            let session_dir = if safe_id(&entry.session_id) {
+                resolve_index_session_dir(&sessions_root, &entry.session_dir).filter(
+                    |session_dir| {
+                        session_dir.starts_with(&sessions_root)
+                            && session_dir.file_name().and_then(|name| name.to_str())
+                                == Some(entry.session_id.as_str())
+                    },
+                )
+            } else {
+                None
+            };
+            let Some(session_dir) = session_dir else {
                 diagnostics.push(AdapterWarning {
                     kind: AdapterWarningKind::StaleSnapshot,
                     source_kind: "kimi_index".to_string(),
                     stage: "invalid_index_locator".to_string(),
                 })?;
                 continue;
-            }
+            };
             result.insert(entry.session_id, session_dir);
         }
         validate_root_identity(root)?;
@@ -633,6 +666,7 @@ impl AgentAdapter for KimiCodeAdapter {
                     emitted: 0,
                     finished: false,
                     index: None,
+                    listing: None,
                     diagnostics: diagnostics.clone(),
                     ready: std::collections::VecDeque::new(),
                 },
@@ -694,9 +728,19 @@ impl Iterator for SessionRecordStream {
                 }
             }
         }
-        let next = match KimiCodeAdapter::next_session_dir(&self.root, self.after.as_ref()) {
-            Ok(Some(next)) => next,
-            Ok(None) => {
+        let listing = match self.listing.as_ref() {
+            Some(listing) => listing,
+            None => match KimiCodeAdapter::list_session_dirs(&self.root, &self.request) {
+                Ok(listing) => self.listing.insert(listing),
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+            },
+        };
+        let next = match KimiCodeAdapter::next_session_dir(listing, self.after.as_ref()) {
+            Some(next) => next,
+            None => {
                 if self.index.as_ref().is_some_and(|index| !index.is_empty())
                     && let Err(error) = self.diagnostics.push(AdapterWarning {
                         kind: AdapterWarningKind::StaleSnapshot,
@@ -709,10 +753,6 @@ impl Iterator for SessionRecordStream {
                 }
                 self.finished = true;
                 return None;
-            }
-            Err(error) => {
-                self.finished = true;
-                return Some(Err(error));
             }
         };
         self.after = Some(next.1);
@@ -862,6 +902,34 @@ fn safe_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Resolves an index locator to a session directory below `sessions_root`.
+///
+/// Absolute locators (the pinned on-disk form) pass through unchanged for the
+/// caller's allowlist checks. Relative locators resolve against the sessions
+/// root only when they consist of exactly two safe normal components
+/// (`<bucket>/<session>`), so `.`/`..`, prefix, and root components can never
+/// escape the allowlisted tree.
+fn resolve_index_session_dir(sessions_root: &Path, locator: &str) -> Option<PathBuf> {
+    let path = Path::new(locator);
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    let components = path.components().collect::<Vec<_>>();
+    let [
+        std::path::Component::Normal(bucket),
+        std::path::Component::Normal(session),
+    ] = components.as_slice()
+    else {
+        return None;
+    };
+    let bucket = bucket.to_str()?;
+    let session = session.to_str()?;
+    if !safe_id(bucket) || !safe_id(session) {
+        return None;
+    }
+    Some(sessions_root.join(bucket).join(session))
 }
 
 fn validate_root_identity(root: &RootBinding) -> Result<(), AdapterError> {

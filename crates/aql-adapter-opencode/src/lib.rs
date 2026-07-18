@@ -441,10 +441,25 @@ impl OpenCodeAdapter {
     ) -> Result<Connection, AdapterError> {
         Self::validate_binding(binding)?;
         self.opened();
-        let connection = Connection::open_with_flags(
-            binding.path.join("opencode.db"),
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
+        let database = binding.path.join("opencode.db");
+        let connection = if binding.wal_identity.is_none() {
+            // No WAL companion exists, so the database was cleanly checkpointed
+            // and closed. Open it with immutable semantics so SQLite never
+            // creates `-shm`/`-wal` sidecars and never attempts WAL recovery.
+            // The binding keeps `wal_identity == None`; the identity re-checks
+            // fail closed if a WAL ever appears afterwards.
+            Connection::open_with_flags(
+                immutable_uri(&database)?,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_URI,
+            )
+        } else {
+            Connection::open_with_flags(
+                database,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+        }
         .map_err(|_| AdapterError::UnsupportedFormat {
             stage: "opencode_database_open".to_string(),
         })?;
@@ -2126,6 +2141,42 @@ fn columns() -> Vec<ColumnCapability> {
 
 fn projected(projection: &[ColumnName], name: &str) -> bool {
     projection.iter().any(|column| column.as_str() == name)
+}
+
+/// Builds a `file:` URI with immutable semantics for a sidecar-free database.
+///
+/// The path is percent-encoded so that URI delimiters (`?`, `#`, `%`) and
+/// non-ASCII bytes in the data root cannot corrupt the query string.
+fn immutable_uri(path: &Path) -> Result<String, AdapterError> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let text = path
+        .to_str()
+        .ok_or_else(|| AdapterError::UnsupportedFormat {
+            stage: "opencode_database_open".to_string(),
+        })?;
+    let mut uri = String::with_capacity(text.len() + "file:?immutable=1".len());
+    uri.push_str("file:");
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'/'
+            | b'\\'
+            | b':'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~' => uri.push(char::from(byte)),
+            _ => {
+                uri.push('%');
+                uri.push(char::from(HEX[usize::from(byte >> 4)]));
+                uri.push(char::from(HEX[usize::from(byte & 0x0F)]));
+            }
+        }
+    }
+    uri.push_str("?immutable=1");
+    Ok(uri)
 }
 
 fn db_error(error: rusqlite::Error, request: &ScanRequest, stage: &str) -> AdapterError {

@@ -212,6 +212,7 @@ pub(super) fn summarize(
     let mut seen_usage = BTreeMap::new();
     let mut seen_entries = BTreeSet::new();
     while let Some((line, complete, bytes)) = read_limited_line(&mut reader)? {
+        check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
         request.budget.charge_bytes_read(bytes as u64)?;
         let envelope = match parse_envelope(&line, complete, diagnostics)? {
             Some(value) => value,
@@ -728,6 +729,7 @@ fn first_identity(
                 stage: "claude_transcript_identity".to_string(),
             });
         };
+        check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
         request.budget.charge_bytes_read(bytes as u64)?;
         let Some(envelope) = parse_envelope(&line, complete, diagnostics)? else {
             continue;

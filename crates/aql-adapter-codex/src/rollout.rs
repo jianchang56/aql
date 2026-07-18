@@ -1,11 +1,11 @@
-use std::io::Read;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{BufRead, BufReader, Read};
 
-use aql_adapter_api::AdapterWarningKind;
+use aql_adapter_api::{AdapterError, AdapterWarningKind};
 use chrono::{DateTime, Utc};
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value as JsonValue;
+
+pub(crate) const MAX_ROLLOUT_RECORD_BYTES: usize = 1024 * 1024;
 
 #[derive(Default)]
 pub(crate) struct ReadFields {
@@ -55,59 +55,124 @@ pub(crate) struct NextEvent {
     pub bytes_read: u64,
 }
 
-pub(crate) fn parse_next(
-    reader: &mut impl Read,
-    fields: &ReadFields,
-) -> Result<NextEvent, serde_json::Error> {
-    let bytes_read = Arc::new(AtomicU64::new(0));
-    let non_whitespace = Arc::new(AtomicU64::new(0));
-    let tracking_reader = TrackingReader {
-        inner: reader,
-        bytes_read: bytes_read.clone(),
-        non_whitespace: non_whitespace.clone(),
-    };
-    let mut deserializer = serde_json::Deserializer::from_reader(tracking_reader);
-    match (EventSeed { fields }).deserialize(&mut deserializer) {
-        Ok(event) => {
-            let warnings = if event.event_type.as_deref().is_some_and(|kind| {
-                !matches!(
-                    kind,
-                    "session_meta" | "turn_context" | "event_msg" | "response_item" | "compacted"
-                )
-            }) {
-                vec![AdapterWarningKind::UnknownEvent]
+/// Reads one newline-terminated record without materializing more than
+/// `maximum` payload bytes, mirroring the bounded readers used by the Claude
+/// Code and Kimi Code adapters. Returns the payload without the newline,
+/// whether the record was newline-terminated, and the consumed byte count.
+pub(crate) fn read_limited_line<R: Read>(
+    reader: &mut BufReader<R>,
+    maximum: usize,
+    resource: &str,
+) -> Result<Option<(Vec<u8>, bool, usize)>, AdapterError> {
+    let mut output = Vec::new();
+    let mut consumed = 0;
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .map_err(|_| AdapterError::PermissionDenied {
+                stage: "codex_record_read".to_string(),
+            })?;
+        if buffer.is_empty() {
+            return if output.is_empty() {
+                Ok(None)
             } else {
-                Vec::new()
+                Ok(Some((output, false, consumed)))
             };
-            Ok(NextEvent {
-                event: Some(event),
-                warnings,
-                bytes_read: bytes_read.load(Ordering::Acquire),
-            })
         }
-        Err(error) if error.is_eof() => Ok(NextEvent {
-            event: None,
-            warnings: if non_whitespace.load(Ordering::Acquire) > 0 {
-                vec![AdapterWarningKind::TruncatedRecord]
-            } else {
-                Vec::new()
-            },
-            bytes_read: bytes_read.load(Ordering::Acquire),
-        }),
-        Err(error) => Err(error),
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(buffer.len(), |index| index + 1);
+        let payload = if newline.is_some() { take - 1 } else { take };
+        if output.len() + payload > maximum {
+            return Err(AdapterError::BudgetExceeded {
+                resource: resource.to_string(),
+                actual: (output.len() + payload) as u64,
+            });
+        }
+        output.extend_from_slice(&buffer[..payload]);
+        reader.consume(take);
+        consumed += take;
+        if newline.is_some() {
+            return Ok(Some((output, true, consumed)));
+        }
+    }
+}
+
+pub(crate) fn parse_next<R: Read>(
+    reader: &mut BufReader<R>,
+    fields: &ReadFields,
+) -> Result<NextEvent, AdapterError> {
+    let mut bytes_read = 0_u64;
+    loop {
+        let Some((line, complete, consumed)) = read_limited_line(
+            reader,
+            MAX_ROLLOUT_RECORD_BYTES,
+            "codex_rollout_record_bytes",
+        )?
+        else {
+            return Ok(NextEvent {
+                event: None,
+                warnings: Vec::new(),
+                bytes_read,
+            });
+        };
+        bytes_read += consumed as u64;
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            if complete {
+                continue;
+            }
+            return Ok(NextEvent {
+                event: None,
+                warnings: Vec::new(),
+                bytes_read,
+            });
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(&line);
+        let parsed = (EventSeed { fields })
+            .deserialize(&mut deserializer)
+            .and_then(|event| deserializer.end().map(|()| event));
+        return match parsed {
+            Ok(event) => {
+                let warnings = if event.event_type.as_deref().is_some_and(|kind| {
+                    !matches!(
+                        kind,
+                        "session_meta"
+                            | "turn_context"
+                            | "event_msg"
+                            | "response_item"
+                            | "compacted"
+                    )
+                }) {
+                    vec![AdapterWarningKind::UnknownEvent]
+                } else {
+                    Vec::new()
+                };
+                Ok(NextEvent {
+                    event: Some(event),
+                    warnings,
+                    bytes_read,
+                })
+            }
+            Err(_) if !complete => Ok(NextEvent {
+                event: None,
+                warnings: vec![AdapterWarningKind::TruncatedRecord],
+                bytes_read,
+            }),
+            Err(_) => Err(AdapterError::CorruptSource {
+                stage: "parse_rollout".to_string(),
+            }),
+        };
     }
 }
 
 #[cfg(test)]
-pub(crate) fn parse_stream<F>(
-    reader: impl Read,
+pub(crate) fn parse_stream<R: Read, F>(
+    mut reader: BufReader<R>,
     fields: ReadFields,
     mut consume: F,
-) -> Result<ParseResult, serde_json::Error>
+) -> Result<ParseResult, AdapterError>
 where
     F: FnMut(ParsedEvent) -> bool,
 {
-    let mut reader = reader;
     let mut warnings = Vec::new();
     loop {
         let next = parse_next(&mut reader, &fields)?;
@@ -120,26 +185,6 @@ where
             }
             None => return Ok(ParseResult { warnings }),
         }
-    }
-}
-
-struct TrackingReader<R> {
-    inner: R,
-    bytes_read: Arc<AtomicU64>,
-    non_whitespace: Arc<AtomicU64>,
-}
-
-impl<R: Read> Read for TrackingReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        let count = self.inner.read(&mut buffer[..1])?;
-        self.bytes_read.fetch_add(count as u64, Ordering::Relaxed);
-        if count == 1 && !buffer[0].is_ascii_whitespace() {
-            self.non_whitespace.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(count)
     }
 }
 
@@ -430,7 +475,7 @@ impl<'de> Visitor<'de> for ContentItemVisitor {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Read};
+    use std::io::{BufReader, Cursor, Read};
 
     use super::*;
 
@@ -442,7 +487,7 @@ mod tests {
         bytes.extend_from_slice(appended);
         let mut events = 0;
         let parsed = parse_stream(
-            Cursor::new(bytes).take(initial.len() as u64),
+            BufReader::new(Cursor::new(bytes).take(initial.len() as u64)),
             ReadFields::default(),
             |_| {
                 events += 1;
@@ -457,7 +502,7 @@ mod tests {
     #[test]
     fn parse_next_advances_exactly_one_event() {
         let bytes = b"{\"type\":\"session_meta\",\"payload\":{}}\n{\"type\":\"turn_context\",\"payload\":{}}\n";
-        let mut reader = Cursor::new(bytes);
+        let mut reader = BufReader::new(Cursor::new(bytes));
         let fields = ReadFields::default();
 
         let first = parse_next(&mut reader, &fields).expect("first event must parse");
@@ -465,7 +510,6 @@ mod tests {
             first.event.and_then(|event| event.event_type).as_deref(),
             Some("session_meta")
         );
-        assert!(reader.position() < bytes.len() as u64);
 
         let second = parse_next(&mut reader, &fields).expect("second event must parse");
         assert_eq!(
@@ -482,12 +526,34 @@ mod tests {
     fn incomplete_boundary_tail_is_reported_without_losing_prior_events() {
         let bytes = b"{\"type\":\"session_meta\",\"payload\":{}}\n{\"type\":";
         let mut events = 0;
-        let parsed = parse_stream(Cursor::new(bytes), ReadFields::default(), |_| {
-            events += 1;
-            true
-        })
+        let parsed = parse_stream(
+            BufReader::new(Cursor::new(bytes)),
+            ReadFields::default(),
+            |_| {
+                events += 1;
+                true
+            },
+        )
         .expect("truncated tail is a warning");
         assert_eq!(events, 1);
         assert_eq!(parsed.warnings, vec![AdapterWarningKind::TruncatedRecord]);
+    }
+
+    #[test]
+    fn oversized_record_fails_before_materialization() {
+        let mut bytes = b"{\"type\":\"".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', MAX_ROLLOUT_RECORD_BYTES));
+        bytes.extend_from_slice(b"\"}\n");
+        let error = match parse_next(
+            &mut BufReader::new(Cursor::new(bytes)),
+            &ReadFields::default(),
+        ) {
+            Ok(_) => panic!("oversized record must fail the bounded read"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            AdapterError::BudgetExceeded { resource, .. } if resource == "codex_rollout_record_bytes"
+        ));
     }
 }

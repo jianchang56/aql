@@ -280,6 +280,79 @@ fn active_wal_session_is_visible_without_changing_database_or_wal() {
 }
 
 #[test]
+fn cleanly_closed_wal_session_is_visible_without_sidecars_or_changes() {
+    let roots = fixtures();
+    let source = roots.join("minimal");
+    let database = source.join("opencode.db");
+    {
+        let writer = Connection::open(&database).expect("writer opens");
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .expect("WAL enables");
+        writer
+            .execute(
+                "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?1, 'project-synthetic', 'wal-closed-session', '/synthetic/wal', 'Synthetic closed WAL title', '1.17.18', 1767225607000, 1767225607000)",
+                ["ses_synthetic_wal_closed"],
+            )
+            .expect("WAL row commits");
+    }
+    let wal = source.join("opencode.db-wal");
+    let shm = source.join("opencode.db-shm");
+    assert!(!wal.exists() && !shm.exists());
+    let database_before = fs::read(&database).expect("DB bytes read");
+    let adapter = OpenCodeAdapter::new(b"synthetic-salt".to_vec());
+    let manifest = manifest(&adapter, &source);
+    let rows = scan(
+        &adapter,
+        manifest.clone(),
+        TableName::Sessions,
+        &["native_id"],
+        AccessGrant::default(),
+        Vec::new(),
+        None,
+    )
+    .expect("cleanly-closed WAL scan opens")
+    .records
+    .collect::<Result<Vec<_>, _>>()
+    .expect("cleanly-closed WAL scan succeeds");
+    assert!(rows.iter().any(|record| matches!(
+        record,
+        CanonicalRecord::Session(session) if session.native_id.as_str() == "ses_synthetic_wal_closed"
+    )));
+    assert_eq!(
+        fs::read(&database).expect("DB bytes re-read"),
+        database_before
+    );
+    assert!(!wal.exists() && !shm.exists());
+
+    let writer = Connection::open(&database).expect("writer reopens");
+    writer
+        .execute_batch("PRAGMA wal_autocheckpoint=0;")
+        .expect("autocheckpoint disables");
+    writer
+        .execute(
+            "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?1, 'project-synthetic', 'wal-drift-session', '/synthetic/wal', 'Synthetic drift title', '1.17.18', 1767225608000, 1767225608000)",
+            ["ses_synthetic_wal_drift"],
+        )
+        .expect("WAL row commits");
+    assert!(wal.is_file());
+    assert!(matches!(
+        scan(
+            &adapter,
+            manifest,
+            TableName::Sessions,
+            &["native_id"],
+            AccessGrant::default(),
+            Vec::new(),
+            None,
+        ),
+        Err(aql_adapter_api::AdapterError::SnapshotUnavailable)
+    ));
+    drop(writer);
+    fs::remove_dir_all(roots).expect("fixtures remove");
+}
+
+#[test]
 fn messages_tools_and_derived_usage_inputs_follow_the_pinned_projection() {
     let roots = fixtures();
     let adapter = OpenCodeAdapter::new(b"synthetic-salt".to_vec());

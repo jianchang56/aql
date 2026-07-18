@@ -375,7 +375,9 @@ fn index_session(
     workdir: &str,
 ) -> TestResult {
     use std::io::Write;
-    let directory = fs::canonicalize(session_dir(output, fixture, bucket, session))?;
+    // Emit the locator relative to the sessions root so fixture bytes are
+    // host-independent; the adapter resolves it below the validated root.
+    let directory = format!("{bucket}/{session}");
     let value = json!({"sessionId": session, "sessionDir": directory, "workDir": workdir});
     let mut file = fs::OpenOptions::new()
         .append(true)

@@ -161,8 +161,10 @@ name = "aql-adapter-codex"
 version = "0.1.0"
 dependencies = [
  "aql-adapter-api",
+ "aql-fs",
  "aql-model",
  "aql-test-support",
+ "cap-std",
  "chrono",
  "rusqlite",
  "serde",

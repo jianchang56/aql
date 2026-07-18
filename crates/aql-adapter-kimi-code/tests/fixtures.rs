@@ -3,23 +3,33 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const EXPECTED_FIXTURES: [&str; 16] = [
-    "added-column",
-    "artifacts",
-    "checkpointed-wal",
-    "conflict",
-    "empty",
-    "edges",
-    "large-metadata",
+const EXPECTED_FIXTURES: [&str; 26] = [
+    "active-boundary",
+    "full",
+    "future-protocol",
+    "huge-sensitive",
+    "huge-wire",
+    "invalid-state",
+    "legacy-1.0",
+    "malformed-record",
     "minimal",
-    "missing-critical",
-    "missing-optional",
-    "separate-root-a",
-    "separate-root-b",
-    "multi-source",
-    "truncated-jsonl",
-    "unknown-event",
-    "unknown-version",
+    "mismatched-bucket",
+    "missing-index",
+    "missing-protocol",
+    "missing-state",
+    "missing-workdir",
+    "multi-session",
+    "root-replacement",
+    "root-replacement-replacement",
+    "stale-index",
+    "subagent",
+    "symlink-agent-dir",
+    "symlink-sessions-dir",
+    "symlink-state",
+    "symlink-wire",
+    "truncated-tail",
+    "unpaired-tools",
+    "unknown-record",
 ];
 
 fn temporary_directory(suffix: &str) -> PathBuf {
@@ -31,7 +41,7 @@ fn temporary_directory(suffix: &str) -> PathBuf {
 }
 
 fn generate(output: &Path) {
-    aql_test_support::generate_codex(output, 100).expect("fixture generator must succeed");
+    aql_test_support::generate_kimi(output).expect("fixture generator must succeed");
 }
 
 fn logical_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
@@ -43,15 +53,27 @@ fn logical_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
             let path = entry.path();
-            if path.is_dir() {
+            let relative = path
+                .strip_prefix(root)
+                .expect("fixture path must be below root")
+                .to_string_lossy()
+                .into_owned();
+            // Compare links by their stored target instead of following them:
+            // the relative targets are themselves deterministic fixture bytes,
+            // and Windows cannot resolve forward-slash link targets at all.
+            let metadata = fs::symlink_metadata(&path)
+                .unwrap_or_else(|error| panic!("fixture entry {path:?} must stat: {error}"));
+            if metadata.file_type().is_symlink() {
+                let target = fs::read_link(&path).unwrap_or_else(|error| {
+                    panic!("fixture link {path:?} must be readable: {error}")
+                });
+                files.push((relative, target.as_os_str().as_encoded_bytes().to_vec()));
+            } else if metadata.is_dir() {
                 visit(root, &path, files);
             } else {
-                let relative = path
-                    .strip_prefix(root)
-                    .expect("fixture path must be below root")
-                    .to_string_lossy()
-                    .into_owned();
-                let content = fs::read(path).expect("fixture file must be readable");
+                let content = fs::read(&path).unwrap_or_else(|error| {
+                    panic!("fixture file {path:?} must be readable: {error}")
+                });
                 files.push((relative, content));
             }
         }
@@ -84,30 +106,4 @@ fn generates_all_scenarios_deterministically() {
 
     fs::remove_dir_all(first).expect("first fixture tree must be removable");
     fs::remove_dir_all(second).expect("second fixture tree must be removable");
-}
-
-#[test]
-fn committed_fixture_sources_contain_only_synthetic_literals() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../aql-test-support");
-    let generator = [
-        root.join("src/codex.rs"),
-        root.join("assets/codex-schema.sql"),
-    ]
-    .into_iter()
-    .map(|path| fs::read_to_string(path).expect("fixture source must be readable"))
-    .collect::<String>();
-    let forbidden_patterns = [
-        ["/", "Users", "/"].concat(),
-        ["@", "example.com"].concat(),
-        ["BEGIN ", "PRIVATE KEY"].concat(),
-        ["s", "k", "-"].concat(),
-    ];
-    for forbidden in forbidden_patterns {
-        assert!(
-            !generator.contains(&forbidden),
-            "fixture generator contains forbidden literal {forbidden}"
-        );
-    }
-    assert!(generator.contains("Synthetic"));
-    assert!(generator.contains("/workspace/example"));
 }

@@ -173,7 +173,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
 
     fn probe(&self, request: &ProbeRequest) -> Result<ProbeResult, AdapterError> {
         let root = Self::validate_root(Path::new(&request.data_root))?;
-        let (descriptors, _) = enumerate_transcripts(&root)?;
+        let (descriptors, _) = enumerate_transcripts(&root, None)?;
         if !descriptors
             .iter()
             .any(|item| matches!(item.kind, TranscriptKind::Main { .. }))
@@ -236,7 +236,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
         )?;
         check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
         let root = self.root_for(&request.source)?;
-        let (descriptors, mains) = enumerate_transcripts(&root)?;
+        let (descriptors, mains) = enumerate_transcripts(&root, Some(&request))?;
         let diagnostics = ScanDiagnostics::default();
         let predicate_count = request.predicates.len();
         let ordering_count = request.order_hint.len();
@@ -453,7 +453,10 @@ impl Iterator for EdgeStream {
     }
 }
 
-fn enumerate_transcripts(root: &RootBinding) -> Result<TranscriptInventory, AdapterError> {
+fn enumerate_transcripts(
+    root: &RootBinding,
+    scan_state: Option<&ScanRequest>,
+) -> Result<TranscriptInventory, AdapterError> {
     validate_root_identity(root)?;
     let mut descriptors = Vec::new();
     let mut mains = BTreeSet::new();
@@ -462,6 +465,9 @@ fn enumerate_transcripts(root: &RootBinding) -> Result<TranscriptInventory, Adap
         stage: "claude_projects_read".to_string(),
     })?;
     for project in projects {
+        if let Some(request) = scan_state {
+            check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
+        }
         let project = project.map_err(|_| AdapterError::PermissionDenied {
             stage: "claude_project_entry".to_string(),
         })?;
@@ -498,6 +504,9 @@ fn enumerate_transcripts(root: &RootBinding) -> Result<TranscriptInventory, Adap
             stage: "claude_project_read".to_string(),
         })?;
         for entry in files {
+            if let Some(request) = scan_state {
+                check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
+            }
             let entry = entry.map_err(|_| AdapterError::PermissionDenied {
                 stage: "claude_transcript_entry".to_string(),
             })?;

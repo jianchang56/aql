@@ -109,6 +109,84 @@ fn active_wal_probe_preserves_database_and_wal_bytes() {
     fs::remove_dir_all(root).expect("fixtures are removed");
 }
 
+#[test]
+fn cleanly_closed_wal_probe_leaves_no_sidecars_and_unchanged_bytes() {
+    let root = fixtures();
+    let source = root.join("minimal");
+    let database = source.join("opencode.db");
+    {
+        let writer = Connection::open(&database).expect("synthetic writer opens");
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .expect("synthetic WAL mode enables");
+        writer
+            .execute(
+                "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?1, 'project-synthetic', 'wal-closed-session', '/synthetic/wal', 'Synthetic closed WAL title', '1.17.18', 1767225607000, 1767225607000)",
+                ["ses_synthetic_wal_closed"],
+            )
+            .expect("synthetic WAL row commits");
+    }
+    let wal = source.join("opencode.db-wal");
+    let shm = source.join("opencode.db-shm");
+    assert!(!wal.exists() && !shm.exists());
+    let database_before = fs::read(&database).expect("database bytes read");
+    assert_eq!(
+        &database_before[18..20],
+        &[2, 2],
+        "fixture database is in WAL mode"
+    );
+    let adapter = OpenCodeAdapter::new(b"synthetic-salt".to_vec());
+    adapter
+        .probe(&ProbeRequest {
+            data_root: source.to_string_lossy().into_owned(),
+        })
+        .expect("cleanly-closed WAL source probes");
+    assert_eq!(
+        fs::read(&database).expect("database bytes re-read"),
+        database_before
+    );
+    assert!(!wal.exists() && !shm.exists());
+    fs::remove_dir_all(root).expect("fixtures are removed");
+}
+
+#[test]
+fn cleanly_closed_wal_then_new_wal_fails_closed() {
+    let root = fixtures();
+    let source = root.join("minimal");
+    let database = source.join("opencode.db");
+    {
+        let writer = Connection::open(&database).expect("synthetic writer opens");
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .expect("synthetic WAL mode enables");
+    }
+    assert!(!source.join("opencode.db-wal").exists());
+    let binding = OpenCodeAdapter::validate_root(&source).expect("source validates");
+    let adapter = OpenCodeAdapter::new(b"synthetic-salt".to_vec());
+    adapter
+        .probe(&ProbeRequest {
+            data_root: source.to_string_lossy().into_owned(),
+        })
+        .expect("cleanly-closed WAL source probes");
+    let writer = Connection::open(&database).expect("synthetic writer reopens");
+    writer
+        .execute_batch("PRAGMA wal_autocheckpoint=0;")
+        .expect("autocheckpoint disables");
+    writer
+        .execute(
+            "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?1, 'project-synthetic', 'wal-drift-session', '/synthetic/wal', 'Synthetic drift title', '1.17.18', 1767225608000, 1767225608000)",
+            ["ses_synthetic_wal_drift"],
+        )
+        .expect("synthetic WAL row commits");
+    assert!(source.join("opencode.db-wal").is_file());
+    assert!(matches!(
+        OpenCodeAdapter::validate_binding(&binding),
+        Err(AdapterError::SnapshotUnavailable)
+    ));
+    drop(writer);
+    fs::remove_dir_all(root).expect("fixtures are removed");
+}
+
 #[cfg(unix)]
 #[test]
 fn wal_symlink_and_root_replacement_fail_closed() {

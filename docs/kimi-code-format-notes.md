@@ -57,6 +57,8 @@ workDir
 
 The index is append-only. Later valid entries replace earlier entries with the same `sessionId`. Invalid JSON, wrong field types, relative `sessionDir`, paths outside the selected `sessions` root, and entries whose directory basename differs from `sessionId` are ignored by Kimi. AQL reports sanitized warnings for invalid entries but never uses them as authority.
 
+AQL accepts exactly two `sessionDir` locator forms. The first is the pinned absolute on-disk form, which passes through unchanged to the containment checks. The second is a strict relative form `<bucket>/<session>` resolved against the selected `sessions` root: it must consist of exactly two safe normal components (non-empty, never `.` or `..`, ASCII alphanumerics plus `.`, `_`, `-` only). Any other relative shape, or any prefix, root or `..` component, is fail-closed rejected. Both forms must then resolve inside the `sessions` root with a directory basename equal to `sessionId`; a non-conforming entry is ignored with a sanitized warning and is never used as authority.
+
 `workDir` in the index is explicitly non-authoritative. `session_index.jsonl` is only a discovery hint: stale or missing entries cannot suppress a valid self-describing session. AQL scans only the two fixed directory levels `sessions/<bucket>/<session-id>` and never recursively searches arbitrary descendants.
 
 ## `state.json` contract and authority

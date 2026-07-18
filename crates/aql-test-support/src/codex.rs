@@ -197,6 +197,25 @@ pub fn generate_codex(output: &Path, large_metadata_count: usize) -> TestResult 
 
     create_standard_fixture(
         output,
+        "checkpointed-wal",
+        "session-checkpointed-wal",
+        "Synthetic checkpointed WAL session",
+        "rollout-checkpointed-wal.jsonl",
+    )?;
+    {
+        // A cleanly closed WAL database keeps WAL mode in its header while its
+        // sidecars are checkpointed away, exercising sidecar-free reads.
+        let wal_connection = connection(output, "checkpointed-wal")?;
+        wal_connection.pragma_update(None, "journal_mode", "WAL")?;
+        wal_connection.execute(
+            "UPDATE threads SET tokens_used = tokens_used + 1 WHERE id = 'session-checkpointed-wal'",
+            [],
+        )?;
+    }
+    write_manifest(output, "checkpointed-wal", 1, 2, 1, 0)?;
+
+    create_standard_fixture(
+        output,
         "unknown-version",
         "session-unknown-version",
         "Synthetic unknown version",

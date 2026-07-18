@@ -63,6 +63,32 @@ impl FileAccessObserver for Observer {
     }
 }
 
+#[cfg(unix)]
+struct RootReplacingObserver {
+    root: PathBuf,
+    moved: PathBuf,
+    replacement: PathBuf,
+    replaced: Mutex<bool>,
+}
+
+#[cfg(unix)]
+impl FileAccessObserver for RootReplacingObserver {
+    fn opened(&self, source_kind: SourceKind) {
+        if !matches!(source_kind, SourceKind::Rollout) {
+            return;
+        }
+        let mut replaced = self.replaced.lock().expect("replacement lock");
+        if *replaced {
+            return;
+        }
+        fs::rename(&self.root, &self.moved).expect("bound root moves aside");
+        fs::rename(&self.replacement, &self.root).expect("replacement root moves into place");
+        *replaced = true;
+    }
+
+    fn bytes_read(&self, _source_kind: SourceKind, _count: u64) {}
+}
+
 fn kind_name(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::StateDatabase => "state",
@@ -900,4 +926,413 @@ fn rollout_byte_budget_is_checked_before_unbounded_scan() {
     ));
     assert_eq!(observer.bytes(SourceKind::Rollout), 0);
     std::fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn checkpointed_wal_is_readable_without_creating_sidecars() {
+    let fixtures = fixture_root();
+    let root = fixtures.join("checkpointed-wal");
+    let database = root.join("sqlite/state_5.sqlite");
+    let wal = database.with_file_name("state_5.sqlite-wal");
+    let shm = database.with_file_name("state_5.sqlite-shm");
+    assert!(
+        !wal.exists() && !shm.exists(),
+        "fixture must be cleanly checkpointed"
+    );
+    let entries_before = directory_entries(database.parent().expect("database has a parent"));
+
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let records = adapter
+        .scan(request(
+            source.clone(),
+            TableName::Sessions,
+            &["session_id", "tokens_used"],
+        ))
+        .expect("checkpointed WAL metadata must be readable")
+        .records
+        .collect::<Result<Vec<_>, _>>()
+        .expect("checkpointed WAL records must be valid");
+    assert_eq!(records.len(), 1);
+
+    let messages = adapter
+        .scan(request(
+            source,
+            TableName::Messages,
+            &["message_id", "role"],
+        ))
+        .expect("checkpointed WAL rollout locators must resolve")
+        .records
+        .collect::<Result<Vec<_>, _>>()
+        .expect("checkpointed WAL messages must be valid");
+    assert_eq!(messages.len(), 2);
+
+    assert_eq!(
+        entries_before,
+        directory_entries(database.parent().expect("database has a parent")),
+        "AQL must not create a journal, WAL, SHM, or cache sidecar"
+    );
+    assert!(!wal.exists() && !shm.exists(), "no sidecar may appear");
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn hot_wal_without_shm_fails_closed_without_creating_sidecars() {
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    let database = root.join("sqlite/state_5.sqlite");
+    let writer = Connection::open(&database).expect("fixture writer must open");
+    writer
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("fixture must enter WAL mode");
+    writer
+        .pragma_update(None, "wal_autocheckpoint", 0)
+        .expect("fixture autocheckpoint must be disabled");
+    writer
+        .execute(
+            "UPDATE threads SET updated_at_ms = updated_at_ms + 1 WHERE id = 'session-minimal'",
+            [],
+        )
+        .expect("fixture WAL write must succeed");
+    let wal = database.with_file_name("state_5.sqlite-wal");
+    assert!(wal.is_file());
+
+    // A copied hot WAL has no shared-memory index; opening it would force
+    // SQLite to run recovery and create sidecars next to the source.
+    let copied = fixtures.join("hot-wal-copy");
+    fs::create_dir_all(copied.join("sqlite")).expect("copied sqlite directory");
+    fs::copy(&database, copied.join("sqlite/state_5.sqlite")).expect("copy database");
+    fs::copy(&wal, copied.join("sqlite/state_5.sqlite-wal")).expect("copy hot WAL");
+    let entries_before = directory_entries(&copied.join("sqlite"));
+
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let error = adapter
+        .probe(&ProbeRequest {
+            data_root: copied.to_string_lossy().into_owned(),
+        })
+        .expect_err("hot WAL must fail closed");
+    assert!(
+        matches!(error, AdapterError::SnapshotUnavailable),
+        "hot WAL must not report a misleading format error: {error}"
+    );
+    assert_eq!(
+        entries_before,
+        directory_entries(&copied.join("sqlite")),
+        "failing closed must not create, checkpoint, or delete sidecars"
+    );
+    assert!(
+        !copied.join("sqlite/state_5.sqlite-shm").exists(),
+        "no SHM sidecar may appear"
+    );
+
+    drop(writer);
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn hostile_rollout_locators_fail_closed() {
+    for locator in [
+        "../escape.jsonl",
+        "sessions/../escape.jsonl",
+        "sessions/../../outside/escape.jsonl",
+        "/absolute/rollout.jsonl",
+        r"C:\absolute\rollout.jsonl",
+        "other/rollout.jsonl",
+        "archived_sessions/../escape.jsonl",
+        "sessions",
+        "",
+    ] {
+        let fixtures = fixture_root();
+        let root = fixtures.join("minimal");
+        Connection::open(root.join("sqlite/state_5.sqlite"))
+            .expect("fixture database must open")
+            .execute("UPDATE threads SET rollout_path = ?1", [locator])
+            .expect("fixture locator must update");
+        let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+        let source = manifest(&adapter, &root);
+        let mut result = adapter
+            .scan(request(source, TableName::Messages, &["message_id"]))
+            .expect("creating a rollout stream must not read the source");
+        assert!(
+            matches!(
+                result.records.next(),
+                Some(Err(AdapterError::CorruptSource { .. }))
+            ),
+            "locator {locator:?} must fail closed"
+        );
+        drop(result);
+        fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rollout_open_rejects_root_replacement_after_database_open() {
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    let moved = fixtures.join("bound-root");
+    let replacement = fixtures.join("replacement-root");
+    let replacement_rollout = replacement.join("sessions/2026/01/01/rollout-minimal.jsonl");
+    fs::create_dir_all(replacement_rollout.parent().expect("rollout parent"))
+        .expect("replacement rollout parent");
+    fs::write(
+        &replacement_rollout,
+        b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"replacement\"}}\n",
+    )
+    .expect("replacement rollout");
+    let observer = Arc::new(RootReplacingObserver {
+        root: root.clone(),
+        moved,
+        replacement,
+        replaced: Mutex::new(false),
+    });
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec()).with_observer(observer);
+    let source = manifest(&adapter, &root);
+    let mut result = adapter
+        .scan(request(source, TableName::Messages, &["message_id"]))
+        .expect("creating a rollout stream remains lazy");
+    assert!(matches!(
+        result.records.next(),
+        Some(Err(AdapterError::SnapshotUnavailable))
+    ));
+    drop(result);
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_rollout_component_fails_closed() {
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    let outside = fixtures.join("outside.jsonl");
+    fs::write(&outside, b"{\"type\":\"session_meta\",\"payload\":{}}\n")
+        .expect("outside rollout must be writable");
+    std::os::unix::fs::symlink(
+        &outside,
+        root.join("sessions/2026/01/01/rollout-minimal.jsonl"),
+    )
+    .expect("rollout symlink must be creatable");
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let mut result = adapter
+        .scan(request(source, TableName::Messages, &["message_id"]))
+        .expect("creating a rollout stream must not read the source");
+    assert!(matches!(
+        result.records.next(),
+        Some(Err(AdapterError::PermissionDenied { .. }))
+    ));
+    drop(result);
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_rejects_symlink_and_group_writable_roots() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+
+    let link = fixtures.join("root-link");
+    std::os::unix::fs::symlink(&root, &link).expect("root symlink must be creatable");
+    let error = adapter
+        .probe(&ProbeRequest {
+            data_root: link.to_string_lossy().into_owned(),
+        })
+        .expect_err("symlink root must be rejected");
+    assert!(matches!(error, AdapterError::UnsupportedFormat { .. }));
+
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o775))
+        .expect("fixture permissions must be mutable");
+    let error = adapter
+        .probe(&ProbeRequest {
+            data_root: root.to_string_lossy().into_owned(),
+        })
+        .expect_err("group-writable root must be rejected");
+    assert!(matches!(error, AdapterError::PermissionDenied { .. }));
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
+        .expect("fixture permissions must be restorable");
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn database_replacement_or_shrink_invalidates_the_bound_snapshot() {
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    let database = root.join("sqlite/state_5.sqlite");
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let token = source
+        .snapshot
+        .clone()
+        .expect("probe must bind a snapshot token");
+    assert!(
+        token.as_str().starts_with("codex-snapshot:"),
+        "token must be identity-derived: {}",
+        token.as_str()
+    );
+
+    // Replacement keeps the same schema but changes the database identity.
+    fs::remove_file(&database).expect("original database must be removable");
+    fs::copy(
+        fixtures.join("separate-root-a/sqlite/state_5.sqlite"),
+        &database,
+    )
+    .expect("replacement database must copy");
+    let mut result = adapter
+        .scan(request(
+            source.clone(),
+            TableName::Sessions,
+            &["session_id"],
+        ))
+        .expect("creating a session stream must not read the source");
+    assert!(matches!(
+        result.records.next(),
+        Some(Err(AdapterError::SnapshotUnavailable))
+    ));
+    drop(result);
+
+    let rebound = manifest(&adapter, &root);
+    assert_ne!(
+        rebound.snapshot, source.snapshot,
+        "replacement must produce a fresh snapshot token"
+    );
+
+    // Shrinking the bound database also fails closed.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&database)
+        .expect("database must open for truncation")
+        .set_len(4)
+        .expect("database must truncate");
+    let mut result = adapter
+        .scan(request(rebound, TableName::Sessions, &["session_id"]))
+        .expect("creating a session stream must not read the source");
+    assert!(matches!(
+        result.records.next(),
+        Some(Err(AdapterError::SnapshotUnavailable))
+    ));
+    drop(result);
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn newest_state_database_is_selected_deterministically() {
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    let database = root.join("sqlite/state_5.sqlite");
+    fs::copy(&database, root.join("sqlite/state_4.sqlite")).expect("older sibling must copy");
+    fs::copy(&database, root.join("sqlite/state_6.sqlite")).expect("newer sibling must copy");
+    for (version, title) in [
+        ("state_4.sqlite", "Synthetic older database"),
+        ("state_6.sqlite", "Synthetic newer database"),
+    ] {
+        Connection::open(root.join("sqlite").join(version))
+            .expect("sibling database must open")
+            .execute("UPDATE threads SET title = ?1", [title])
+            .expect("sibling title must update");
+    }
+
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let mut scan = request(source, TableName::Sessions, &["session_id", "title"]);
+    scan.access.content = true;
+    let records = adapter
+        .scan(scan)
+        .expect("multi-version scan must succeed")
+        .records
+        .collect::<Result<Vec<_>, _>>()
+        .expect("multi-version records must be valid");
+    assert_eq!(records.len(), 1);
+    let CanonicalRecord::Session(session) = &records[0] else {
+        panic!("expected a session record");
+    };
+    assert_eq!(session.title.as_deref(), Some("Synthetic newer database"));
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn session_scan_reuses_one_connection_and_reads_the_index_once() {
+    let fixtures = fixture_root();
+    let observer = Arc::new(Observer::default());
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec()).with_observer(observer.clone());
+    let source = manifest(&adapter, &fixtures.join("large-metadata"));
+    let opens_after_probe = observer.count(SourceKind::StateDatabase);
+    let mut scan = request(source, TableName::Sessions, &["session_id", "title"]);
+    scan.access.content = true;
+    let records = adapter
+        .scan(scan)
+        .expect("paged session scan must succeed")
+        .records
+        .collect::<Result<Vec<_>, _>>()
+        .expect("paged session records must be valid");
+    assert_eq!(records.len(), 100);
+    assert_eq!(
+        observer.count(SourceKind::StateDatabase),
+        opens_after_probe + 1,
+        "one scan must open one connection"
+    );
+    assert_eq!(
+        observer.count(SourceKind::SessionIndex),
+        1,
+        "the session index must be read once per scan"
+    );
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn rollout_scan_reuses_one_connection_across_files() {
+    let fixtures = fixture_root();
+    let observer = Arc::new(Observer::default());
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec()).with_observer(observer.clone());
+    let source = manifest(&adapter, &fixtures.join("edges"));
+    let opens_after_probe = observer.count(SourceKind::StateDatabase);
+    let records = adapter
+        .scan(request(source, TableName::Messages, &["message_id"]))
+        .expect("multi-file rollout scan must succeed")
+        .records
+        .collect::<Result<Vec<_>, _>>()
+        .expect("multi-file rollout records must be valid");
+    assert_eq!(records.len(), 4);
+    assert_eq!(
+        observer.count(SourceKind::StateDatabase),
+        opens_after_probe + 1,
+        "one rollout scan must open one connection"
+    );
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn oversized_session_index_record_fails_the_bounded_read() {
+    use std::io::Write;
+
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    let mut oversized = br#"{"id":"session-minimal","thread_name":""#.to_vec();
+    oversized.extend(std::iter::repeat_n(b'a', 1024 * 1024 + 1));
+    oversized.extend_from_slice(b"\"}\n");
+    let mut index = fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("session_index.jsonl"))
+        .expect("session index must open");
+    index
+        .write_all(&oversized)
+        .expect("oversized index line must be written");
+    drop(index);
+
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let mut scan = request(source, TableName::Sessions, &["session_id", "title"]);
+    scan.access.content = true;
+    let mut result = adapter
+        .scan(scan)
+        .expect("creating a session stream must not read the source");
+    assert!(matches!(
+        result.records.next(),
+        Some(Err(AdapterError::BudgetExceeded { resource, .. }))
+            if resource == "codex_index_record_bytes"
+    ));
+    drop(result);
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
 }

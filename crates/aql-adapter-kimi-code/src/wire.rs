@@ -17,8 +17,8 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use super::{
-    FileIdentity, KimiCodeAdapter, RootBinding, SafeAgent, normalize_limit, open_regular_no_follow,
-    projected, validate_agents, validate_directory, validate_session_chain,
+    FileIdentity, KimiCodeAdapter, LocatedSession, RootBinding, SafeAgent, normalize_limit,
+    open_regular_no_follow, projected, validate_agents, validate_directory, validate_session_chain,
     validate_workdir_bucket,
 };
 
@@ -38,6 +38,7 @@ pub(super) fn scan(
             request,
             diagnostics: diagnostics.clone(),
             after_session: None,
+            listing: None,
             agents: VecDeque::new(),
             current: None,
             current_session: None,
@@ -74,6 +75,7 @@ pub(super) fn scan_edges(
             root,
             request,
             after_session: None,
+            listing: None,
             ready: VecDeque::new(),
             emitted: 0,
             finished: false,
@@ -96,6 +98,7 @@ struct EdgeStream {
     root: RootBinding,
     request: ScanRequest,
     after_session: Option<(String, String)>,
+    listing: Option<Vec<LocatedSession>>,
     ready: VecDeque<SessionEdgeRecord>,
     emitted: u64,
     finished: bool,
@@ -106,6 +109,7 @@ struct WireStream {
     request: ScanRequest,
     diagnostics: ScanDiagnostics,
     after_session: Option<(String, String)>,
+    listing: Option<Vec<LocatedSession>>,
     agents: VecDeque<(PathBuf, String, EntityId)>,
     current: Option<WireFile>,
     current_session: Option<EntityId>,
@@ -250,8 +254,15 @@ impl WireStream {
                 self.sequence = 0;
                 return Ok(true);
             }
+            let listing = match self.listing.as_ref() {
+                Some(listing) => listing,
+                None => self.listing.insert(KimiCodeAdapter::list_session_dirs(
+                    &self.root,
+                    &self.request,
+                )?),
+            };
             let Some((session_dir, key)) =
-                KimiCodeAdapter::next_session_dir(&self.root, self.after_session.as_ref())?
+                KimiCodeAdapter::next_session_dir(listing, self.after_session.as_ref())
             else {
                 return Ok(false);
             };
@@ -780,18 +791,24 @@ impl Iterator for EdgeStream {
             return Some(Ok(CanonicalRecord::SessionEdge(edge)));
         }
         loop {
-            let next =
-                match KimiCodeAdapter::next_session_dir(&self.root, self.after_session.as_ref()) {
-                    Ok(Some(next)) => next,
-                    Ok(None) => {
-                        self.finished = true;
-                        return None;
-                    }
+            let listing = match self.listing.as_ref() {
+                Some(listing) => listing,
+                None => match KimiCodeAdapter::list_session_dirs(&self.root, &self.request) {
+                    Ok(listing) => self.listing.insert(listing),
                     Err(error) => {
                         self.finished = true;
                         return Some(Err(error));
                     }
-                };
+                },
+            };
+            let next = match KimiCodeAdapter::next_session_dir(listing, self.after_session.as_ref())
+            {
+                Some(next) => next,
+                None => {
+                    self.finished = true;
+                    return None;
+                }
+            };
             self.after_session = Some(next.1);
             let native = match next.0.file_name().and_then(|name| name.to_str()) {
                 Some(native) => native.to_string(),

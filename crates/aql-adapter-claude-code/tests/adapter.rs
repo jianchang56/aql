@@ -365,6 +365,45 @@ fn project_replacement_duplicate_session_and_future_version_fail_closed() {
     ));
 }
 
+#[test]
+fn cancellation_is_observed_mid_file_during_session_summary() {
+    let fixtures = fixtures();
+    let root = fixtures.path().join("minimal");
+    let transcript = find_main(&root);
+    let session = transcript
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .expect("session name")
+        .to_string();
+    let mut contents = String::new();
+    for index in 0..40_000_u32 {
+        contents.push_str(&format!(
+            "{{\"type\":\"user\",\"uuid\":\"{index:08x}-0000-4000-8000-000000000000\",\"sessionId\":\"{session}\",\"version\":\"2.1.207\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"Synthetic cancellation line {index}\"}}}}\n"
+        ));
+    }
+    fs::write(&transcript, contents).expect("large transcript written");
+    let adapter = ClaudeCodeAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let scan = request(source, TableName::Sessions, &["message_count"]);
+    let token = scan.cancellation.clone();
+    let budget = scan.budget.clone();
+    let watcher = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while !token.is_cancelled() {
+            if budget.bytes_read_used() >= 1_000_000
+                || started.elapsed() > std::time::Duration::from_secs(30)
+            {
+                token.cancel();
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    });
+    let mut records = adapter.scan(scan).expect("session scan starts").records;
+    assert!(matches!(records.next(), Some(Err(AdapterError::Cancelled))));
+    watcher.join().expect("watcher joins");
+}
+
 fn find_main(root: &Path) -> PathBuf {
     fs::read_dir(root.join("projects/synthetic-project"))
         .expect("project exists")
