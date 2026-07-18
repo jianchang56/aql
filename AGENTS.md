@@ -23,6 +23,7 @@ Built-in database names are `claude`, `codex`, `kimi`, `opencode`, and explicit 
 | `crates/aql-adapter-*` | Read-only Claude Code/Codex/Kimi/OpenCode adapters |
 | `crates/aql-catalog` | Reconciliation and source identity |
 | `crates/aql-engine-datafusion` | SQL firewall, planning, authorization, execution |
+| `crates/aql-fs` | Capability-based filesystem primitives: nofollow opens, atomic no-replace publish, mode/ownership helpers |
 | `crates/aql` | AQL executable, Clap CLI, interactive shell, rendering, orchestration |
 | `crates/aql-config` | Private configured-database storage |
 | `crates/aql-test-support` | Deterministic synthetic Claude Code/Codex/Kimi/OpenCode fixture generators |
@@ -77,7 +78,7 @@ cargo xtask verify
 git diff --check
 ```
 
-`cargo xtask verify` chains workspace, documentation, release and performance gates. Use only synthetic roots unless an explicitly authorized `AQL_RUN_REAL_SMOKE=1 cargo xtask real-smoke` task says otherwise.
+`cargo xtask verify` chains workspace, documentation, release and performance-related behavioral gates (lazy streaming, budget, cancellation; no timing or throughput assertions). Use only synthetic roots unless an explicitly authorized `AQL_RUN_REAL_SMOKE=1 cargo xtask real-smoke` task says otherwise.
 
 Generated `target/`, logs, temporary archives, `__pycache__`, and test state are not source artifacts. Remove them after cleanup/documentation tasks or when the user asks for a clean workspace.
 
