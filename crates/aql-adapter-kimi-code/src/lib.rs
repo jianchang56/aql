@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_INDEX_LINE_BYTES: usize = 64 * 1024;
+const MAX_SESSION_INVENTORY: usize = 100_000;
 const FORMAT: &str = "kimi-code-0.23.3-wire-1.4";
 type SessionKey = (String, String);
 type LocatedSession = (PathBuf, SessionKey);
@@ -217,10 +218,6 @@ impl KimiCodeAdapter {
         let sessions = root.path.join("sessions");
         validate_directory(&sessions)?;
         let mut found: Vec<LocatedSession> = Vec::new();
-        let remaining_records = request
-            .budget
-            .max_records
-            .saturating_sub(request.budget.records_used());
         let buckets = match fs::read_dir(&sessions) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -275,13 +272,13 @@ impl KimiCodeAdapter {
                         bucket_name.clone(),
                         session.file_name().to_string_lossy().into_owned(),
                     );
-                    if found.len() as u64 >= remaining_records {
+                    found.push((session.path(), key));
+                    if found.len() > MAX_SESSION_INVENTORY {
                         return Err(AdapterError::BudgetExceeded {
                             resource: "kimi_session_inventory".to_string(),
-                            actual: found.len() as u64 + 1,
+                            actual: found.len() as u64,
                         });
                     }
-                    found.push((session.path(), key));
                 }
             }
         }

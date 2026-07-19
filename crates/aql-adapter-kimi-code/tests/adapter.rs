@@ -86,21 +86,22 @@ fn safe_session_scan_does_not_project_sensitive_state() {
 }
 
 #[test]
-fn session_inventory_obeys_the_shared_record_budget() {
+fn session_inventory_does_not_consume_the_canonical_record_budget() {
     let fixtures = fixtures();
     let root = fixtures.join("minimal");
-    fs::create_dir_all(root.join("sessions/wd_workspace_84b61923346a/session-inventory-overflow"))
+    fs::create_dir_all(root.join("sessions/wd_workspace_84b61923346a/session-z-overflow"))
         .expect("second synthetic session directory");
     let adapter = KimiCodeAdapter::new(b"fixture-salt".to_vec());
     let source = manifest(&adapter, &root);
     let mut scan = request(source, &["session_id"]);
     scan.budget.max_records = 1;
+    scan.limit = Some(1);
     let mut records = adapter.scan(scan).expect("bounded scan starts").records;
     assert!(matches!(
         records.next(),
-        Some(Err(AdapterError::BudgetExceeded { resource, .. }))
-            if resource == "kimi_session_inventory"
+        Some(Ok(CanonicalRecord::Session(_)))
     ));
+    assert!(records.next().is_none());
     fs::remove_dir_all(fixtures).expect("fixtures removed");
 }
 

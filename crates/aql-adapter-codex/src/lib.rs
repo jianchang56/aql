@@ -898,6 +898,7 @@ impl AgentAdapter for CodexAdapter {
         self.opened(SourceKind::StateDatabase);
         let connection =
             open_state_database_file(&binding.database, binding.wal_identity.is_some())?;
+        validate_binding(&binding)?;
         let has_threads: i64 = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads')",
@@ -1445,20 +1446,26 @@ fn open_state_database(
     if let Some(observer) = observer {
         observer.opened(SourceKind::StateDatabase);
     }
-    open_state_database_file(&root.database, root.wal_identity.is_some())
+    let connection = open_state_database_file(&root.database, root.wal_identity.is_some())?;
+    validate_binding(root)?;
+    Ok(connection)
 }
 
 fn open_state_database_file(database: &Path, active_wal: bool) -> Result<Connection, AdapterError> {
     if active_wal {
-        Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_| {
-            AdapterError::UnsupportedFormat {
-                stage: "open_state_database".to_string(),
-            }
+        Connection::open_with_flags(
+            database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|_| AdapterError::UnsupportedFormat {
+            stage: "open_state_database".to_string(),
         })
     } else {
         Connection::open_with_flags(
             immutable_uri(database)?,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .map_err(|_| AdapterError::UnsupportedFormat {
             stage: "open_state_database".to_string(),
