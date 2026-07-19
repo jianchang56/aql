@@ -559,6 +559,42 @@ fn timeout_symlink_and_parent_replacement_publish_nothing() {
 }
 
 #[test]
+fn output_target_is_rejected_before_source_probe() {
+    let environment = TestEnvironment::new();
+    fs::create_dir(environment.home.join(".codex")).expect("create incompatible Codex root");
+    let target = environment.temporary.path().join("already-exists.json");
+    fs::write(&target, b"unchanged").expect("create existing output target");
+
+    let result = environment.run([
+        "query".into(),
+        "-d".into(),
+        "codex".into(),
+        "--output-file".into(),
+        target.as_os_str().to_owned(),
+        "SELECT session_id FROM sessions LIMIT 1".into(),
+    ]);
+    assert_eq!(result.status.code(), Some(4));
+    assert!(result.stdout.is_empty());
+    assert!(stderr(&result).contains("error_category=already_exists"));
+    assert_eq!(
+        fs::read(&target).expect("read existing target"),
+        b"unchanged"
+    );
+
+    let explain = environment.run([
+        "query",
+        "-d",
+        "codex",
+        "--output",
+        "json",
+        "EXPLAIN SELECT session_id FROM sessions LIMIT 1",
+    ]);
+    assert_eq!(explain.status.code(), Some(2));
+    assert!(explain.stdout.is_empty());
+    assert!(stderr(&explain).contains("error_category=invalid_request"));
+}
+
+#[test]
 fn symlinked_builtin_candidate_root_fails_on_the_query_path() {
     let environment = TestEnvironment::new();
     let target = environment.standalone_codex("linked-candidate");
@@ -578,6 +614,25 @@ fn symlinked_builtin_candidate_root_fails_on_the_query_path() {
     assert_eq!(query.status.code(), Some(4));
     assert!(query.stdout.is_empty());
     assert!(stderr(&query).contains("error_category=source_unavailable"));
+
+    let intermediate = TestEnvironment::new();
+    intermediate.install_codex("minimal", 0);
+    let linked_home = intermediate.temporary.path().join("linked-home");
+    symlink_dir(&intermediate.home, &linked_home).expect("create intermediate HOME symlink");
+    let all = intermediate
+        .command()
+        .env("HOME", &linked_home)
+        .args([
+            "query",
+            "-d",
+            "all",
+            "SELECT session_id FROM sessions LIMIT 1",
+        ])
+        .output()
+        .expect("run all through symlinked HOME");
+    assert_eq!(all.status.code(), Some(4));
+    assert!(all.stdout.is_empty());
+    assert!(stderr(&all).contains("error_category=source_unavailable"));
 }
 
 #[test]

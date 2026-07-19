@@ -195,16 +195,12 @@ fn parse_source_specs_inner(
         if !root.is_absolute() {
             return Err(invalid_argument("database member path must be absolute").into());
         }
-        if skip_unavailable {
-            match fs::symlink_metadata(&root) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-                Ok(_) => continue,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(_) => continue,
+        let canonical = if revalidate_no_symlink {
+            match canonicalize_member_root_no_symlink(&root) {
+                Ok(canonical) => canonical,
+                Err(_) if skip_unavailable => continue,
+                Err(error) => return Err(error),
             }
-        }
-        let canonical = if revalidate_no_symlink && !skip_unavailable {
-            canonicalize_member_root_no_symlink(&root)?
         } else {
             fs::canonicalize(&root)
                 .map_err(|_| source_unavailable("database member path is unavailable"))?

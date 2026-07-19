@@ -6,8 +6,11 @@
 
 #![deny(missing_docs)]
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 use std::{fs, io, io::IsTerminal, io::Read, io::Write};
 
@@ -530,6 +533,17 @@ async fn execute_query(
     .await
     .map_err(|_| deadline_exceeded("query timed out"))??;
     diagnostic_timing(diagnostics, "authorize", authorize_started);
+    if explain && output != Output::Table {
+        return Err(invalid_argument("EXPLAIN supports only the default table output").into());
+    }
+    // `tokio::signal::ctrl_c()` installs the process handler only when first
+    // polled. Poll it once before creating a named private temporary so SIGINT
+    // cannot bypass cleanup through the platform's default termination path.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    poll_ctrl_c(ctrl_c.as_mut(), &cancellation).await?;
+    let mut transactional_output = TransactionalOutput::create(output_file.as_deref())?;
+    ensure_before_deadline(deadline)?;
     let inputs = resolve_database_inputs(&database)?;
     ensure_before_deadline(deadline)?;
     let probe_started = Instant::now();
@@ -539,16 +553,7 @@ async fn execute_query(
     if sources.is_empty() {
         return Err(source_unavailable("probe returned no compatible source").into());
     }
-    // Arm one ctrl-c listener before the private output temporary exists so a
-    // SIGINT always takes the cancellation path instead of bypassing cleanup.
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-    let mut transactional_output = TransactionalOutput::create(output_file.as_deref())?;
-    ensure_before_deadline(deadline)?;
     if explain {
-        if output != Output::Table {
-            return Err(invalid_argument("EXPLAIN supports only the default table output").into());
-        }
         let summary = prepared.plan_summary();
         let mut rendered = String::new();
         use std::fmt::Write as _;
@@ -593,8 +598,10 @@ async fn execute_query(
                 )?;
             }
         }
+        poll_ctrl_c(ctrl_c.as_mut(), &cancellation).await?;
         budget.charge_output_bytes(rendered_publication_len(&rendered) as u64)?;
         write_rendered(transactional_output.writer(), &rendered, &cancellation)?;
+        poll_ctrl_c(ctrl_c.as_mut(), &cancellation).await?;
         transactional_output.publish(&cancellation)?;
         return Ok(());
     }
@@ -704,6 +711,21 @@ async fn execute_query(
             summary.returned_rows,
             query_started.elapsed().as_millis()
         );
+    }
+    Ok(())
+}
+
+async fn poll_ctrl_c<F>(
+    ctrl_c: Pin<&mut F>,
+    cancellation: &CancellationToken,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    if let Poll::Ready(signal) = futures::poll!(ctrl_c) {
+        signal?;
+        cancellation.cancel();
+        return Err(query_cancelled().into());
     }
     Ok(())
 }

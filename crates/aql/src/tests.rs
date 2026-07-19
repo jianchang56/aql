@@ -510,6 +510,31 @@ fn broken_pipe_cancels_without_panicking() {
 }
 
 #[test]
+fn polling_ctrl_c_arms_pending_and_cancels_ready_signals() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let pending_cancellation = CancellationToken::default();
+        let pending = std::future::pending::<io::Result<()>>();
+        tokio::pin!(pending);
+        poll_ctrl_c(pending.as_mut(), &pending_cancellation)
+            .await
+            .expect("pending listener remains armed");
+        assert!(!pending_cancellation.is_cancelled());
+
+        let ready_cancellation = CancellationToken::default();
+        let ready = std::future::ready(Ok(()));
+        tokio::pin!(ready);
+        let error = poll_ctrl_c(ready.as_mut(), &ready_cancellation)
+            .await
+            .expect_err("ready signal cancels the query");
+        assert!(ready_cancellation.is_cancelled());
+        assert_eq!(error.to_string(), "query cancelled");
+    });
+}
+
+#[test]
 fn json_output_preserves_arrow_types_and_json_columns() {
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
