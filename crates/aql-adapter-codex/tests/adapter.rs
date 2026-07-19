@@ -1107,6 +1107,8 @@ fn symlink_rollout_component_fails_closed() {
     let outside = fixtures.join("outside.jsonl");
     fs::write(&outside, b"{\"type\":\"session_meta\",\"payload\":{}}\n")
         .expect("outside rollout must be writable");
+    fs::remove_file(root.join("sessions/2026/01/01/rollout-minimal.jsonl"))
+        .expect("original rollout must be removable");
     std::os::unix::fs::symlink(
         &outside,
         root.join("sessions/2026/01/01/rollout-minimal.jsonl"),
