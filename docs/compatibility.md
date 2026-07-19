@@ -14,7 +14,7 @@
 
 ## 平台支持
 
-AQL 当前支持 macOS 和 Linux；Windows 是 deferred 平台。无法安全实现的保证一律 fail closed 而不是静默降级：`aql-fs` 的原子发布原语（no-replace rename、目录 metadata sync）在非 Unix 平台返回明确的 `unsupported on this platform` 错误。因此在 Windows 上，`--output-file` 发布、配置写入（`database add`/`database remove`）和首次运行的 installation salt 创建都会失败；stdout 查询不受影响。
+AQL 当前发布支持 macOS 和 Linux；Windows 仍是 deferred 验证平台，不提供正式发布或兼容性承诺。Windows 构建会运行 stdout 查询、installation salt、配置写入和 `--output-file` 测试：普通文件使用原子 hard-link claim 实现 no-replace 发布，目录 metadata sync 在非 Unix 平台是安全 no-op。无法维持 nofollow、identity 或 no-clobber 保证的操作仍必须 fail closed，不能静默降级。
 
 ## Canonical schema
 
