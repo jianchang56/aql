@@ -738,9 +738,11 @@ fn query_persists_nothing_beyond_the_preexisting_installation_key() {
     // Pre-create a valid key so this test can assert that queries leave an
     // existing installation identity unchanged.
     fs::create_dir(&environment.state).expect("create isolated state root");
+    aql_fs::set_mode(&environment.state, 0o700).expect("state root is private");
     let salt = [7_u8; 32];
     let key = environment.state.join("installation.key");
     fs::write(&key, salt).expect("pre-create installation key");
+    aql_fs::set_mode(&key, 0o600).expect("installation key is private");
     let home_before = tree_snapshot(&environment.home);
 
     let select = environment.run([
