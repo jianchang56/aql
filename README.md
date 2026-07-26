@@ -69,11 +69,20 @@ Release workflow 已配置 macOS/Linux 的 `aarch64/x86_64` 构建、SHA256 校�
 
 直接从 GitHub 安装（适用于支持 `skills` CLI 的 Agent）：
 
+当前 `skills` CLI 需要 Node.js `22.20.0` 或更高版本，以及随 npm 提供的 `npx`。下面的命令会自动检测已安装的兼容 Agent：
+
 ```bash
 npx --yes skills add jianchang56/aql --skill aql --global --yes
 ```
 
-如果环境没有 `npx`，再克隆仓库并复制完整的 `skills/aql` 目录到对应 Agent 的 Skill 目录；不要只复制单个 `SKILL.md`。
+明确指定 Agent 时使用 `--agent claude-code`、`--agent codex`、`--agent kimi-code-cli` 或 `--agent opencode`。安装后验证：
+
+```bash
+npx --yes skills list --global
+aql --version
+```
+
+如果环境没有 `npx`，再克隆仓库并复制完整的 `skills/aql` 目录到对应 Agent 的 Skill 目录；不要只复制单个 `SKILL.md`。`$aql` 是提示词中的 Skill 名称，不是终端命令；真正的可执行文件是 `aql`。安装后请新建一个 Agent 会话。
 
 ```text
 使用 $aql 查询 codex 的会话数，按模型分组。

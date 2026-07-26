@@ -84,4 +84,4 @@ opencode.db-shm
 | symlink、root replacement、identity mismatch | fail closed |
 | 单值、读取量、records、memory 或 deadline 超限 | 取消完整查询 |
 
-升级 Agent 后若 `doctor` 报告 format drift，应升级 AQL Adapter，不要绕过校验或直接查询 Agent 私有数据库。
+升级 Agent 后若 `doctor` 报告 format drift，应升级完整的 AQL，不要绕过校验或直接查询 Agent 私有数据库。

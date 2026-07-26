@@ -44,19 +44,34 @@ Cargo 通常把程序安装到 `~/.cargo/bin`。如果 `aql` 不在 PATH 中，�
 
 ## 下一步：安装 AQL Skill
 
-安装 CLI 后，推荐立即把 Skill 安装到正在使用的 Agent。它让 Agent 默认先检查数据库和 schema，再生成显式、只读且有界的查询：
+安装 CLI 后，推荐立即把 Skill 安装到正在使用的 Agent。它让 Agent 默认先检查数据库、可用表和字段，再生成显式、只读且有界的查询：
 
 ```text
 请从 GitHub 仓库 jianchang56/aql 安装完整的 aql Skill。优先使用 skills CLI 全局安装到当前 Agent；不要只复制 SKILL.md，安装后确认你能识别 $aql。
 ```
 
-支持 `skills` CLI 时，可以直接运行：
+支持 `skills` CLI 时，可以直接运行。当前版本要求 Node.js `22.20.0` 或更高版本，并需要 npm 提供的 `npx`：
+
+```bash
+node --version
+npm --version
+npx --version
+```
+
+下面的命令自动检测已安装的兼容 Agent：
 
 ```bash
 npx --yes skills add jianchang56/aql --skill aql --global --yes
 ```
 
-如果环境没有 `npx`，请克隆仓库后复制完整的 `skills/aql` 目录到对应 Agent 的 Skill 目录。
+明确指定目标时，Agent ID 分别是 `claude-code`、`codex`、`kimi-code-cli` 和 `opencode`。安装后运行：
+
+```bash
+npx --yes skills list --global
+aql --version
+```
+
+如果环境没有 `npx`，请克隆仓库后复制完整的 `skills/aql` 目录到对应 Agent 的 Skill 目录。不要只复制 `SKILL.md`。`$aql` 是提示词中的 Skill 名称，不是 shell 命令；安装后需要新建或重启 Agent 会话。
 
 ## 预编译 Release 发布后
 

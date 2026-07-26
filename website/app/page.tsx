@@ -290,7 +290,7 @@ export default function HomePage() {
                 安装 AQL Skill
               </h3>
               <p className="mt-2 leading-7 text-muted-foreground">
-                Skill 教 Agent 先检查数据库、可用表和字段，再生成有边界的查询，并只申请任务需要的最小临时授权。无需先克隆仓库，直接从 GitHub 安装。
+                Skill 教 Agent 先检查数据库、可用表和字段，再生成有边界的查询，并只申请任务需要的最小临时授权。有 Node.js 与 npx 时可直接从 GitHub 安装。
               </p>
               <CodeBlock
                 ai="请从 GitHub 仓库 jianchang56/aql 安装完整的 aql Skill。优先使用 skills CLI 全局安装到当前 Agent；安装后确认你能识别 $aql。"
