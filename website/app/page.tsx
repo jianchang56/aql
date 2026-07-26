@@ -24,33 +24,51 @@ const builtInAgents = ["Claude Code", "Codex", "Kimi Code", "OpenCode"];
 const guarantees = [
   {
     icon: Database,
-    title: "统一的公开表",
-    description: "Agent 私有格式由 Adapter 处理；AI 始终面对同一套 canonical tables。",
+    title: "不同工具，同一种问法",
+    description: "Claude Code、Codex、Kimi Code 和 OpenCode 都可以按会话、消息、用量等统一概念查询。",
   },
   {
     icon: KeyRound,
-    title: "授权先于读取",
-    description: "正文、路径和工具载荷默认不可见，只在任务确实需要时申请最小临时授权。",
+    title: "敏感内容默认隐藏",
+    description: "正文、路径和工具输入输出不会因为安装了 Skill 就自动暴露；确实需要时才临时授权。",
   },
   {
     icon: ShieldCheck,
-    title: "数据库必须显式选择",
-    description: "Skill 不会猜测默认来源；只有用户明确要求联合查询时才使用 all。",
+    title: "每次都确认数据来源",
+    description: "AQL 不会猜一个默认 Agent；只有你明确要求跨工具汇总时，才会使用 all。",
   },
   {
     icon: FileOutput,
-    title: "完整结果再发布",
-    description: "任一来源失败都不会输出部分结果，文件采用 no-replace 原子发布。",
+    title: "失败时不交付残缺结果",
+    description: "查询完整成功后才显示或保存结果，也不会覆盖已经存在的输出文件。",
+  },
+];
+
+const useCases = [
+  {
+    icon: MessageSquareText,
+    title: "回顾最近做过什么",
+    description: "查看最近会话、按模型统计数量，或找到一段工作的时间范围。",
+  },
+  {
+    icon: Database,
+    title: "理解模型与 Token 使用",
+    description: "按模型汇总输入、输出和使用分布，不必逐个打开 Agent 的私有文件。",
+  },
+  {
+    icon: FileOutput,
+    title: "导出给表格或脚本",
+    description: "把只读结果输出为 table、JSON、JSONL 或 CSV，继续做分析和自动化。",
   },
 ];
 
 const safetyRules = [
-  "只接受一条只读 SELECT、CTE 或 EXPLAIN SELECT",
-  "不递归扫描 HOME，也不调用任何 Agent 程序",
-  "Secret 字段永远不可授权或读取",
-  "跨源查询共享预算、deadline 与取消信号",
-  "不在 Agent 数据旁创建缓存或 sidecar",
-  "不提供 mutation、覆盖写入或部分成功输出",
+  "一次只执行一条只读查询",
+  "不递归扫描主目录，也不启动任何 Agent 程序",
+  "密钥类字段永远不能授权或读取",
+  "跨工具查询仍共享一次预算和超时限制",
+  "不在 Agent 数据目录旁创建缓存文件",
+  "不会修改原始数据、覆盖文件或输出残缺结果",
 ];
 
 const releaseInstall = publishedRelease
@@ -67,10 +85,10 @@ const skillInstallCommand =
   "npx --yes skills add jianchang56/aql --skill aql --global --yes";
 
 const heroQuery = [
-  "aql query -d all \\",
-  "  'SELECT agent_id, COUNT(*) AS sessions",
+  "aql query -d codex \\",
+  "  'SELECT model, COUNT(*) AS sessions",
   "   FROM sessions",
-  "   GROUP BY agent_id",
+  "   GROUP BY model",
   "   ORDER BY sessions DESC'",
 ].join("\n");
 
@@ -90,7 +108,7 @@ export default function HomePage() {
               <span className="block text-primary">安全查询本地 Agent 数据。</span>
             </h1>
             <p className="mt-6 max-w-xl text-lg leading-8 text-muted-foreground sm:text-xl">
-              AQL 推荐由 AI 使用。安装 CLI 与 Skill 后，只需描述问题；AQL 会把目标落实为显式数据库、只读 SQL 和最小授权。
+              AQL 推荐由 AI 使用。安装 CLI 与 Skill 后，只需描述问题；它适合统计会话、汇总模型与 Token 使用、导出只读结果，不会替你修改 Agent 数据。
             </p>
 
             <div className="mt-8 flex flex-col gap-3 sm:flex-row">
@@ -110,7 +128,7 @@ export default function HomePage() {
 
             <div className="mt-9 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
               <span className="font-mono text-xs font-semibold text-foreground/75">
-                natural language
+                自然语言
               </span>
               <ArrowRight className="size-3.5 text-primary/60" aria-hidden="true" />
               <span className="font-mono text-xs font-semibold text-foreground/75">
@@ -118,7 +136,7 @@ export default function HomePage() {
               </span>
               <ArrowRight className="size-3.5 text-primary/60" aria-hidden="true" />
               <span className="font-mono text-xs font-semibold text-primary">
-                read-only SQL
+                只读查询
               </span>
             </div>
           </div>
@@ -141,7 +159,7 @@ export default function HomePage() {
               </div>
 
               <CodeBlock
-                ai="使用 $aql 联合查询所有可用 Agent 的会话数量，按 Agent 分组并降序返回。只返回聚合结果。"
+                ai="使用 $aql 查询 codex 的会话数量，按模型分组并按数量降序返回 table。不要读取会话正文。"
                 code={heroQuery}
                 language="bash"
                 label="同一个问题，两种方式"
@@ -154,7 +172,7 @@ export default function HomePage() {
                   <thead>
                     <tr className="border-b border-border font-mono text-[11px] uppercase tracking-[0.12em] text-muted-foreground">
                       <th scope="col" className="pb-2 text-left font-medium">
-                        agent_id
+                        model
                       </th>
                       <th scope="col" className="pb-2 text-right font-medium">
                         sessions
@@ -163,13 +181,12 @@ export default function HomePage() {
                   </thead>
                   <tbody>
                     {[
-                      ["claude", "42"],
-                      ["codex", "37"],
-                      ["kimi", "18"],
-                      ["opencode", "11"],
-                    ].map(([agent, sessions]) => (
-                      <tr key={agent} className="border-b border-border last:border-0">
-                        <td className="py-2 text-foreground/75">{agent}</td>
+                      ["gpt-5-codex", "37"],
+                      ["gpt-5-mini", "12"],
+                      ["gpt-4.1", "3"],
+                    ].map(([model, sessions]) => (
+                      <tr key={model} className="border-b border-border last:border-0">
+                        <td className="py-2 text-foreground/75">{model}</td>
                         <td className="py-2 text-right text-primary">{sessions}</td>
                       </tr>
                     ))}
@@ -178,10 +195,10 @@ export default function HomePage() {
               </div>
 
               <div className="flex items-center justify-between border-t border-border bg-muted/30 px-5 py-3 font-mono text-[11px] uppercase tracking-[0.12em] sm:px-6">
-                <span className="text-muted-foreground">query contract</span>
+                <span className="text-muted-foreground">查询边界</span>
                 <span className="inline-flex items-center gap-2 text-mint-foreground">
                   <span className="size-1.5 rounded-full bg-mint-foreground" />
-                  read-only / complete
+                  只读 / 完整结果
                 </span>
               </div>
             </div>
@@ -191,7 +208,7 @@ export default function HomePage() {
         <div className="border-t border-border bg-card/65">
           <div className="mx-auto flex w-full max-w-7xl flex-col gap-3 px-5 py-4 sm:px-8 lg:flex-row lg:items-center lg:justify-between">
             <p className="font-mono text-[11px] font-bold uppercase tracking-[0.14em] text-muted-foreground">
-              当前内置 Adapter
+              当前支持的数据来源
             </p>
             <div className="flex flex-wrap items-center gap-x-7 gap-y-2">
               {builtInAgents.map((agent) => (
@@ -273,7 +290,7 @@ export default function HomePage() {
                 安装 AQL Skill
               </h3>
               <p className="mt-2 leading-7 text-muted-foreground">
-                Skill 教 Agent 先检查数据库与 schema，再生成有边界的查询，并只申请任务需要的最小临时授权。无需先克隆仓库，直接从 GitHub 安装。
+                Skill 教 Agent 先检查数据库、可用表和字段，再生成有边界的查询，并只申请任务需要的最小临时授权。无需先克隆仓库，直接从 GitHub 安装。
               </p>
               <CodeBlock
                 ai="请从 GitHub 仓库 jianchang56/aql 安装完整的 aql Skill。优先使用 skills CLI 全局安装到当前 Agent；安装后确认你能识别 $aql。"
@@ -306,7 +323,7 @@ export default function HomePage() {
               </p>
             </div>
             <CodeBlock
-              ai="使用 $aql 查询 codex 最近 30 天的会话数，按模型分组并降序返回 table。"
+              ai="使用 $aql 查询 codex 的会话数，按模型分组并降序返回 table。"
               code="aql query -d codex 'SELECT model, COUNT(*) AS sessions FROM sessions GROUP BY model ORDER BY sessions DESC'"
               language="bash"
               label="第一次查询"
@@ -318,7 +335,7 @@ export default function HomePage() {
       <section id="why-aql" className="scroll-mt-24 border-y border-border bg-card/60 py-20 sm:py-24">
         <div className="mx-auto w-full max-w-7xl px-5 sm:px-8">
           <div className="max-w-3xl">
-            <Badge>Natural language → Canonical SQL</Badge>
+            <Badge>Natural language → Read-only query</Badge>
             <h2 className="mt-4 text-balance font-display text-3xl font-extrabold tracking-[-0.05em] sm:text-5xl">
               自然语言在前，
               <span className="text-primary">SQL 始终可检查。</span>
@@ -326,6 +343,28 @@ export default function HomePage() {
             <p className="mt-5 text-lg leading-8 text-muted-foreground">
               你可以让 AI 完成日常查询，也可以随时切到代码视图审计 SQL、复用命令或接入自动化。
             </p>
+          </div>
+
+          <div className="mt-10 grid gap-4 md:grid-cols-3">
+            {useCases.map((item) => {
+              const Icon = item.icon;
+              return (
+                <article
+                  key={item.title}
+                  className="rounded-2xl border border-border bg-background/70 p-5"
+                >
+                  <span className="grid size-10 place-items-center rounded-xl bg-primary/10 text-primary">
+                    <Icon className="size-5" aria-hidden="true" />
+                  </span>
+                  <h3 className="mt-4 font-display text-lg font-extrabold tracking-[-0.03em]">
+                    {item.title}
+                  </h3>
+                  <p className="mt-2 leading-7 text-muted-foreground">
+                    {item.description}
+                  </p>
+                </article>
+              );
+            })}
           </div>
 
           <div className="mt-12 grid grid-cols-[minmax(0,1fr)] gap-12 lg:grid-cols-[minmax(0,0.82fr)_minmax(0,1.18fr)] lg:items-start lg:gap-16">
@@ -386,8 +425,33 @@ export default function HomePage() {
               </h2>
             </div>
             <p className="max-w-2xl text-lg leading-8 text-white/58 lg:justify-self-end">
-              Skill 不会扩大权限。数据库选择、SQL firewall、字段授权、共享预算和完整结果发布仍由 AQL 强制执行。
+              Skill 负责理解你的问题，但不会扩大权限。选择哪个数据来源、哪些字段可以读取、查询何时停止，以及失败后是否交付结果，仍由 AQL 强制执行。
             </p>
+          </div>
+
+          <div className="mt-10 grid overflow-hidden rounded-2xl border border-white/10 bg-white/[0.035] lg:grid-cols-2">
+            <article className="border-b border-white/10 p-5 sm:p-6 lg:border-b-0 lg:border-r">
+              <p className="font-mono text-[11px] font-bold uppercase tracking-[0.14em] text-mint-foreground">
+                AQL 的边界
+              </p>
+              <h3 className="mt-2 font-display text-xl font-extrabold">
+                查询在本机执行，AQL 本身不上传数据
+              </h3>
+              <p className="mt-3 leading-7 text-white/62">
+                AQL 不调用模型，不访问远程数据源，也不读取 Agent 的认证配置。默认先返回聚合结果和非敏感字段。
+              </p>
+            </article>
+            <article className="p-5 sm:p-6">
+              <p className="font-mono text-[11px] font-bold uppercase tracking-[0.14em] text-[#ffd978]">
+                你使用的 AI 产品
+              </p>
+              <h3 className="mt-2 font-display text-xl font-extrabold">
+                提示词与工具结果仍受该产品的隐私设置约束
+              </h3>
+              <p className="mt-3 leading-7 text-white/62">
+                如果 Agent 连接云端模型，它发送给模型的提示词或 AQL 输出可能离开本机。使用前请确认服务条款、企业策略或本地模式；不要把“本地查询”等同于“AI 对话一定离线”。
+              </p>
+            </article>
           </div>
 
           <div className="mt-3 grid sm:grid-cols-2 lg:grid-cols-3">

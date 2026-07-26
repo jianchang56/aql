@@ -8,14 +8,14 @@ import {
   MessageSquareText,
 } from "lucide-react";
 
-import { DocsPage, DocsSection } from "@/components/docs/docs-page";
+import { DocsNote, DocsPage, DocsSection } from "@/components/docs/docs-page";
 import { Badge } from "@/components/ui/badge";
 import { docsSections } from "@/lib/docs";
 import { publishedRelease } from "@/lib/project-status";
 
 export const metadata = {
   title: "使用文档",
-  description: "从一行安装、Skill 安装到自然语言查询的 AQL 多页使用文档。",
+  description: "从安装 AQL、安装 Skill 到完成第一条自然语言查询的多页使用文档。",
 };
 
 const learningPath = [
@@ -38,6 +38,21 @@ const learningPath = [
     title: "直接用自然语言提问",
     description: "说明数据库、目标和范围；需要时再切换到等价代码。",
     href: "/docs/getting-started",
+  },
+];
+
+const concepts = [
+  {
+    term: "Agent",
+    description: "这里指 Claude Code、Codex、Kimi Code 或 OpenCode 等在本机保存工作记录的 AI 编程工具。",
+  },
+  {
+    term: "数据库",
+    description: "你要查询的具体数据来源，例如 codex。它不是要你另外安装一台数据库服务器。",
+  },
+  {
+    term: "Skill",
+    description: "安装到 Agent 的一组使用说明，教它怎样安全调用 AQL；Skill 本身不会获得额外权限。",
   },
 ];
 
@@ -81,6 +96,25 @@ export default function DocsIndexPage() {
             );
           })}
         </div>
+      </DocsSection>
+
+      <DocsSection title="先认识三个词">
+        <div className="grid gap-4 md:grid-cols-3">
+          {concepts.map((concept) => (
+            <article
+              key={concept.term}
+              className="rounded-xl border border-border bg-card p-5"
+            >
+              <h3 className="font-display text-lg font-extrabold text-foreground">
+                {concept.term}
+              </h3>
+              <p className="mt-2 text-sm leading-6">{concept.description}</p>
+            </article>
+          ))}
+        </div>
+        <DocsNote title="关于“本地优先”" tone="amber">
+          AQL 的查询在本机执行，AQL 本身不上传数据；但如果你使用的是云端 Agent，它发送给模型的提示词和工具结果仍受该产品的隐私设置与服务条款约束。
+        </DocsNote>
       </DocsSection>
 
       <DocsSection title="按主题查找">

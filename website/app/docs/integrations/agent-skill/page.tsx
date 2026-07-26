@@ -44,7 +44,7 @@ export default function AgentSkillPage() {
 
       <DocsSection title="3. 用自然语言查询">
         <CodeBlock
-          ai="使用 $aql 查询 codex 最近 30 天的会话数，按模型分组并按数量降序返回 table。"
+          ai="使用 $aql 查询 codex 的会话数，按模型分组并按数量降序返回 table。"
           code="aql query -d codex 'SELECT model, COUNT(*) AS sessions FROM sessions GROUP BY model ORDER BY sessions DESC'"
           language="bash"
           label="同一个查询"

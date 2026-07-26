@@ -23,6 +23,12 @@ AQL 自己拥有的持久状态只有：
 
 AQL 不持久化 SQL、shell history、查询结果、授权、诊断、凭据或敏感 payload。
 
+## AI 与 AQL 的边界
+
+AQL 进程不调用模型，也不把 Agent 数据上传到网络。通过 Skill 调用 AQL 的 Claude Code、Codex、Kimi Code、OpenCode 或其他宿主 Agent 不在这个进程边界内。
+
+如果宿主 Agent 使用云端模型，它可能按照自身产品配置，把用户提示词、命令以及选入上下文的 AQL 工具输出发送给模型服务。AQL 的只读、字段授权和本地执行保证不能替代宿主 Agent 的隐私设置、企业数据策略或服务条款。面向 AI 的工作流应先使用聚合、Safe 字段和有界输出，仅在任务确实需要时扩大字段授权与返回范围。
+
 ## 显式数据库选择
 
 没有默认数据库。非交互查询和 doctor 必须传 `-d`；Shell 必须先 `USE`。`all` 必须显式选择。

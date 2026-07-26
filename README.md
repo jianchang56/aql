@@ -1,9 +1,9 @@
 # AQL
 
-AQL 是一个推荐由 AI 使用、本地优先、严格只读，并面向主流 Agent 持续扩展的数据 SQL CLI。安装 CLI 与仓库内置 Skill 后，可以直接用自然语言查询本机 Agent 数据；AQL 会把目标落实为显式数据库、统一表和只读 SQL：
+AQL 是一个推荐由 AI 使用、本地优先、严格只读，并面向主流 Agent 持续扩展的数据查询 CLI。安装 CLI 与仓库内置 Skill 后，可以直接用自然语言查询本机 Agent 数据：
 
 ```text
-database → canonical tables → read-only SELECT
+选择具体 Agent → 只读查询 → 完整结果
 ```
 
 ```sql
@@ -21,11 +21,13 @@ ORDER BY sessions DESC;
 | 项目 | 状态 |
 |---|---|
 | macOS / Linux | 支持 |
-| 内置 Adapter | Claude Code / Codex / Kimi Code / OpenCode；沿统一接口持续扩展 |
+| 数据来源 | Claude Code / Codex / Kimi Code / OpenCode；沿统一接口持续扩展 |
 | Windows | 支持（当前使用 Cargo 源码安装） |
 | 修改 Agent 原始数据 | 不支持 |
 
 AQL 不上传数据，不调用 Agent 程序，不读取认证配置，也不会自动选择数据库或扫描未明确选择的位置。
+
+如果通过云端 Agent 使用 AQL，提示词以及 Agent 发送给模型的 AQL 输出仍受该产品的隐私设置和服务条款约束。AQL 的本地查询边界不能替代 Agent 的云端隐私配置；建议先使用聚合和 Safe 字段，再按需扩大返回范围。
 
 ## 安装
 
@@ -74,7 +76,7 @@ npx --yes skills add jianchang56/aql --skill aql --global --yes
 如果环境没有 `npx`，再克隆仓库并复制完整的 `skills/aql` 目录到对应 Agent 的 Skill 目录；不要只复制单个 `SKILL.md`。
 
 ```text
-使用 $aql 查询 codex 最近 30 天的会话数，按模型分组。
+使用 $aql 查询 codex 的会话数，按模型分组。
 ```
 
 Skill 仍会显式选择数据库，并只在任务确实需要时申请最小的 `path`、`content`、`tool-input` 或 `tool-output` 临时授权；使用前需先安装 AQL CLI。
@@ -84,7 +86,7 @@ Skill 仍会显式选择数据库，并只在任务确实需要时申请最小�
 推荐直接使用自然语言：
 
 ```text
-使用 $aql 查询 codex 最近 30 天的会话数，按模型分组并按数量降序返回 table。
+使用 $aql 查询 codex 的会话数，按模型分组并按数量降序返回 table。
 ```
 
 等价代码可以用于审计或自动化。启动交互式 Shell：
