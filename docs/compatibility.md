@@ -14,7 +14,9 @@
 
 ## 平台支持
 
-AQL 当前发布支持 macOS 和 Linux；Windows 仍是 deferred 验证平台，不提供正式发布或兼容性承诺。Windows 构建会运行 stdout 查询、installation salt、配置写入和 `--output-file` 测试：普通文件使用原子 hard-link claim 实现 no-replace 发布，目录 metadata sync 在非 Unix 平台是安全 no-op。无法维持 nofollow、identity 或 no-clobber 保证的操作仍必须 fail closed，不能静默降级。
+AQL 当前支持 macOS、Linux 和 Windows。GitHub Releases 尚无正式资产；当前三个平台都使用 Rust `1.97.0` 通过 Cargo 从源码安装。首个正式 Release 的预编译目标矩阵覆盖 macOS 与 Linux，Windows 暂不提供预编译 archive。
+
+Windows 支持 stdout 查询、installation salt、配置写入和 `--output-file`：普通文件使用原子 hard-link claim 实现 no-replace 发布，目录 metadata sync 在非 Unix 平台是安全 no-op。无法维持 nofollow、identity 或 no-clobber 保证的操作仍必须 fail closed，不能静默降级。
 
 ## Canonical schema
 

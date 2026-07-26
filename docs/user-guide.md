@@ -1,6 +1,23 @@
 # AQL 用户指南
 
-AQL 的完整用户模型只有一条路径：选择数据库，查询 canonical tables，输出结果。
+AQL 推荐由 AI 使用。先安装 CLI，再安装 AQL Skill，然后直接用自然语言描述问题；需要审计或自动化时，再切换到等价代码。无论入口是什么，AQL 的完整用户模型只有一条路径：选择数据库，查询 canonical tables，输出结果。
+
+## 推荐开始方式
+
+把下面的请求交给正在使用的 Agent：
+
+```text
+使用 $aql 查询 codex 最近 30 天的会话数，按模型分组并按数量降序返回 table。请先确认数据库和 schema，不要读取敏感字段。
+```
+
+等价代码如下；网站和文档中的操作示例都提供这两种可切换的视图：
+
+```bash
+aql query -d codex \
+  'SELECT model, COUNT(*) AS sessions FROM sessions GROUP BY model ORDER BY sessions DESC'
+```
+
+安装路径、Release 预编译包和 Skill 安装见 [安装、升级与卸载](installation.md)。
 
 ## 交互式 Shell
 
