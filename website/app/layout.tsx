@@ -6,6 +6,7 @@ import "@fontsource-variable/jetbrains-mono";
 import { SiteFooter } from "@/components/site-footer";
 import { SiteHeader } from "@/components/site-header";
 import { ThemeProvider } from "@/components/theme-provider";
+import { ExampleViewProvider } from "@/components/example-view-provider";
 
 import "./globals.css";
 
@@ -44,21 +45,23 @@ export default function RootLayout({
           enableSystem
           disableTransitionOnChange
         >
-          <a
-            href="#main-content"
-            className="fixed left-4 top-3 z-50 -translate-y-20 rounded-full bg-foreground px-4 py-2 text-sm font-semibold text-background transition-transform focus:translate-y-0"
-          >
-            跳到正文
-          </a>
-          <SiteHeader />
-          <main
-            id="main-content"
-            tabIndex={-1}
-            className="outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-          >
-            {children}
-          </main>
-          <SiteFooter />
+          <ExampleViewProvider>
+            <a
+              href="#main-content"
+              className="fixed left-4 top-3 z-50 -translate-y-20 rounded-full bg-foreground px-4 py-2 text-sm font-semibold text-background transition-transform focus:translate-y-0"
+            >
+              跳到正文
+            </a>
+            <SiteHeader />
+            <main
+              id="main-content"
+              tabIndex={-1}
+              className="outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+            >
+              {children}
+            </main>
+            <SiteFooter />
+          </ExampleViewProvider>
         </ThemeProvider>
       </body>
     </html>

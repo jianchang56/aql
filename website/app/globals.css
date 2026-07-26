@@ -167,16 +167,41 @@ body {
   font-size: 0.86em;
 }
 
+.syntax-code {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
 .syntax-code .shiki {
+  width: max-content;
+  min-width: 100%;
   max-width: 100%;
   margin: 0;
-  overflow-x: auto;
+  overflow: visible;
   background-color: var(--shiki-light-bg) !important;
   padding: 1.25rem;
   font-family: "JetBrains Mono Variable", "Cascadia Code", monospace;
   font-size: 0.84rem;
   font-variant-numeric: tabular-nums;
   line-height: 1.75;
+}
+
+@media (max-width: 639px) {
+  .syntax-code .shiki {
+    width: 100%;
+    min-width: 0;
+    padding: 1rem;
+    font-size: 0.78rem;
+    line-height: 1.7;
+  }
+
+  .syntax-code .shiki code {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
 }
 
 .syntax-code .shiki span {
