@@ -2,7 +2,7 @@
 
 import { Moon, Sun } from "lucide-react";
 import { useTheme } from "next-themes";
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 
 import { Button } from "@/components/ui/button";
 
@@ -19,6 +19,17 @@ export function ThemeToggle() {
       ? "切换到暗色模式"
       : "切换到亮色模式"
     : "切换颜色模式";
+
+  useEffect(() => {
+    if (resolvedTheme !== "light" && resolvedTheme !== "dark") {
+      return;
+    }
+
+    const color = resolvedTheme === "dark" ? "#07101d" : "#f7f9fc";
+    document
+      .querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]')
+      .forEach((meta) => meta.setAttribute("content", color));
+  }, [resolvedTheme]);
 
   return (
     <Button

@@ -12,10 +12,10 @@ export const metadata = {
 
 const accessClasses = [
   ["Safe", "无需授权，例如 session_id、model、时间和计数"],
-  ["Path", "cwd、project、artifact path"],
-  ["Content", "title、preview、消息正文和 artifact payload"],
-  ["ToolInput", "工具参数"],
-  ["ToolOutput", "工具结果"],
+  ["Path", "工作目录、项目目录和产物路径"],
+  ["Content", "标题、摘要、消息正文和产物内容"],
+  ["ToolInput", "工具调用参数"],
+  ["ToolOutput", "工具调用结果"],
   ["Secret", "永远不可授权"],
 ];
 
@@ -24,23 +24,25 @@ export default function AccessPage() {
     <DocsPage
       currentPath="/docs/guides/access"
       title="只授予完成任务所需的字段"
-      description="AQL 在敏感 source read 之前完成 SQL 校验、投影检查与访问授权。未授权字段不会用 NULL 伪装成正常结果。"
+      description="AQL 会在读取敏感数据前检查 SQL 选择了哪些字段，以及是否获得了对应的临时授权。未授权字段会直接报错，不会用 NULL 伪装成正常结果。"
     >
-      <DocsSection title="访问级别">
-        <div className="overflow-hidden rounded-2xl border border-border bg-card">
+      <DocsSection id="access-levels" title="访问级别">
+        <dl className="overflow-hidden rounded-2xl border border-border bg-card">
           {accessClasses.map(([name, description]) => (
             <div
               key={name}
               className="grid gap-1 border-b border-border px-4 py-3 last:border-0 sm:grid-cols-[8rem_1fr]"
             >
-              <code className="w-fit">{name}</code>
-              <span className="text-sm leading-6">{description}</span>
+              <dt>
+                <code className="w-fit">{name}</code>
+              </dt>
+              <dd className="text-sm leading-6">{description}</dd>
             </div>
           ))}
-        </div>
+        </dl>
       </DocsSection>
 
-      <DocsSection title="非交互查询授权">
+      <DocsSection id="query-access" title="非交互查询授权">
         <CodeBlock
           ai="使用 $aql 查询 codex 最近 10 条消息的角色和正文。先确认 schema，只申请 content 这一项临时授权。"
           code={[
@@ -51,11 +53,11 @@ export default function AccessPage() {
             "   LIMIT 10'",
           ].join("\n")}
           language="bash"
-          label="terminal"
+          label="命令行"
         />
       </DocsSection>
 
-      <DocsSection title="Shell 临时授权">
+      <DocsSection id="shell-access" title="Shell 临时授权">
         <CodeBlock
           ai="在 AQL Shell 中临时授予 Content 访问，查看当前授权，读取最多 10 条消息，然后立即撤销全部授权。"
           code={[
@@ -65,7 +67,7 @@ export default function AccessPage() {
             "REVOKE ALL FOR SESSION;",
           ].join("\n")}
           language="sql"
-          label="aql shell"
+          label="AQL Shell"
         />
         <DocsNote title="授权不会持久化" tone="mint">
           非交互授权只对当前查询有效；Shell 授权只对当前进程有效。AQL
@@ -73,7 +75,7 @@ export default function AccessPage() {
         </DocsNote>
       </DocsSection>
 
-      <DocsSection title="安全的查询顺序">
+      <DocsSection id="safe-query-order" title="安全的查询顺序">
         <ol className="grid gap-3">
           {[
             "先使用 Safe 字段完成聚合和筛选。",

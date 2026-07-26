@@ -82,7 +82,7 @@ export function DocsSection({
   title,
   children,
 }: {
-  id?: string;
+  id: string;
   title: string;
   children: ReactNode;
 }) {

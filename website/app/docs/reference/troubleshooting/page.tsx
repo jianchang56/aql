@@ -13,12 +13,36 @@ export const metadata = {
 };
 
 const issues = [
-  ["aql: command not found / 无法识别 aql", "先从 Cargo bin 目录直接运行，再检查当前终端的 PATH。"],
-  ["no database selected", "在 Shell 中先运行 SHOW DATABASES;，再明确 USE 一个数据库。"],
-  ["unknown database / unavailable database", "运行 database list、database discover 和对应的 doctor。"],
-  ["requires --access content", "先检查字段，只添加错误要求的最小临时授权。"],
-  ["resource budget exceeded", "先减少字段、增加 WHERE 与 LIMIT，不要先放大预算。"],
-  ["unsupported source format at stage", "升级完整 AQL，不要绕过校验或直接读取底层文件。"],
+  [
+    "aql: command not found / 无法识别 aql",
+    "先从 Cargo bin 目录直接运行，再检查当前终端的 PATH。",
+    "aql-command-not-found",
+  ],
+  [
+    "no database selected",
+    "在 Shell 中先运行 SHOW DATABASES;，再明确 USE 一个数据库。",
+    "database-selection-errors",
+  ],
+  [
+    "unknown database / unavailable database",
+    "运行 database list、database discover 和对应的 doctor。",
+    "database-selection-errors",
+  ],
+  [
+    "requires --access content",
+    "先检查字段，只添加错误要求的最小临时授权。",
+    "access-required",
+  ],
+  [
+    "resource budget exceeded",
+    "先减少字段、增加 WHERE 与 LIMIT，不要先放大预算。",
+    "resource-budget",
+  ],
+  [
+    "unsupported source format at stage",
+    "升级完整 AQL，不要绕过校验或直接读取底层文件。",
+    "source-format",
+  ],
 ];
 
 const inlineLinkClass =
@@ -31,15 +55,22 @@ export default function TroubleshootingPage() {
       title="按你看到的错误文本排查"
       description="先在下面找到错误中出现的短语，再执行对应的最小检查。不要因为排障而扩大扫描范围、读取私有文件或一次授予全部敏感权限。"
     >
-      <DocsSection title="先查这张表">
+      <DocsSection id="quick-reference" title="先查这张表">
         <dl className="overflow-hidden rounded-2xl border border-border bg-card">
-          {issues.map(([issue, solution]) => (
+          {issues.map(([issue, solution, target]) => (
             <div
               key={issue}
               className="grid gap-2 border-b border-border px-4 py-4 last:border-0 sm:grid-cols-[minmax(0,14rem)_1fr] sm:gap-5"
             >
               <dt>
-                <code className="w-fit max-w-full break-words">{issue}</code>
+                <a
+                  href={`#${target}`}
+                  className="group inline-flex max-w-full rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <code className="w-fit max-w-full break-words transition-colors group-hover:border-primary/50 group-hover:text-primary">
+                    {issue}
+                  </code>
+                </a>
               </dt>
               <dd className="text-sm leading-6">{solution}</dd>
             </div>
@@ -47,7 +78,7 @@ export default function TroubleshootingPage() {
         </dl>
       </DocsSection>
 
-      <DocsSection title="aql: command not found / 无法识别 aql">
+      <DocsSection id="aql-command-not-found" title="aql: command not found / 无法识别 aql">
         <p>
           Cargo 默认把可执行文件放在用户目录下。先用绝对路径验证文件是否存在；确认可运行后，再只为当前终端补充 PATH。
         </p>
@@ -84,7 +115,7 @@ export default function TroubleshootingPage() {
         </DocsNote>
       </DocsSection>
 
-      <DocsSection title="brew 或 npx 找不到">
+      <DocsSection id="brew-or-npx-not-found" title="brew 或 npx 找不到">
         <div className="grid gap-4 md:grid-cols-2">
           <DocsNote title="brew: command not found" tone="amber">
             当前尚无正式预编译 AQL Release，因此现在不需要为了 AQL 专门安装 Homebrew；请使用 Cargo 源码安装。正式 Release 发布后，Homebrew 仍只是 macOS/Linux 的可选方式。
@@ -103,7 +134,7 @@ export default function TroubleshootingPage() {
         />
       </DocsSection>
 
-      <DocsSection title="Agent 不识别 $aql">
+      <DocsSection id="skill-not-recognized" title="Agent 不识别 $aql">
         <p>
           <code>$aql</code> 是提示词中的 Skill 名称，不是终端命令。CLI 验证与 Skill 验证必须分别完成。
         </p>
@@ -132,7 +163,7 @@ export default function TroubleshootingPage() {
         </ol>
       </DocsSection>
 
-      <DocsSection title="no database selected / unknown database">
+      <DocsSection id="database-selection-errors" title="no database selected / unknown database">
         <p>
           Shell 会显示 <code>no database selected; run SHOW DATABASES; and USE &lt;database&gt;;</code>。
           非交互查询可能显示 <code>unknown database; run SHOW DATABASES</code> 或来源不可用。
@@ -153,7 +184,7 @@ export default function TroubleshootingPage() {
         </DocsNote>
       </DocsSection>
 
-      <DocsSection title="requires --access content">
+      <DocsSection id="access-required" title="requires --access content">
         <p>
           错误 <code>query references a field that requires --access content</code> 表示查询选择了敏感字段。先确认该字段确实必要，再只添加错误要求的授权。
         </p>
@@ -173,7 +204,7 @@ export default function TroubleshootingPage() {
         </DocsNote>
       </DocsSection>
 
-      <DocsSection title="resource budget exceeded / timeout">
+      <DocsSection id="resource-budget" title="resource budget exceeded / timeout">
         <CodeBlock
           ai="把查询缩小为 codex 最近更新的 20 个会话，只返回 session_id 和 model。不要先提高预算或超时。"
           code={[
@@ -192,9 +223,9 @@ export default function TroubleshootingPage() {
         </p>
       </DocsSection>
 
-      <DocsSection title="unsupported source format at stage">
+      <DocsSection id="source-format" title="unsupported source format at stage">
         <p>
-          这表示 Agent 的本地格式与当前 AQL 版本不兼容。正确动作是升级 AQL，而不是“升级 Adapter”、关闭校验或直接读取私有文件。
+          这表示 Agent 的本地格式与当前 AQL 版本不兼容。正确动作是升级完整 AQL，而不是寻找单独的组件更新、关闭校验或直接读取私有文件。
         </p>
         <CodeBlock
           ai="在现有 AQL 源码仓库中获取最新提交，使用 Rust 1.97.0 和 locked 依赖重新安装完整 AQL，然后验证版本。不要修改 Agent 数据。"
@@ -209,7 +240,7 @@ export default function TroubleshootingPage() {
         />
       </DocsSection>
 
-      <DocsSection title="运行去敏诊断">
+      <DocsSection id="diagnostics" title="运行去敏诊断">
         <CodeBlock
           ai="使用 $aql 检查可发现数据库，诊断 codex，并对一个最多返回 10 条 session_id 的查询开启去敏 diagnostics。"
           code={[
@@ -226,7 +257,7 @@ export default function TroubleshootingPage() {
         </p>
       </DocsSection>
 
-      <DocsSection title="自动化读取 JSON 错误">
+      <DocsSection id="json-errors" title="自动化读取 JSON 错误">
         <CodeBlock
           ai="使用 $aql 对名为 missing 的数据库执行计数查询，并把错误输出为机器可读 JSON。"
           code={[
@@ -254,7 +285,7 @@ export default function TroubleshootingPage() {
       </DocsSection>
 
       <DocsNote title="Windows 仍会保持安全失败">
-        Windows 上无法维持 nofollow、identity 或 no-clobber 保证的文件操作会拒绝执行，而不会静默降级为不安全行为。
+        Windows 上如果 AQL 无法确认文件没有被重定向、替换或覆盖，它会拒绝执行，而不会降低安全检查。
       </DocsNote>
     </DocsPage>
   );

@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { BookOpen, ChevronDown } from "lucide-react";
 import { usePathname } from "next/navigation";
+import { useEffect, useRef } from "react";
 
 import { docsSections, normalizeDocsPath } from "@/lib/docs";
 import { cn } from "@/lib/utils";
@@ -43,10 +44,18 @@ function NavGroups({ pathname }: { pathname: string }) {
 
 export function DocsNav() {
   const pathname = usePathname();
+  const mobileNavRef = useRef<HTMLDetailsElement>(null);
+
+  useEffect(() => {
+    mobileNavRef.current?.removeAttribute("open");
+  }, [pathname]);
 
   return (
     <>
-      <details className="group rounded-xl border border-border bg-card p-3 lg:hidden">
+      <details
+        ref={mobileNavRef}
+        className="group rounded-xl border border-border bg-card p-3 lg:hidden"
+      >
         <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between rounded-lg px-1 font-display font-extrabold outline-none focus-visible:ring-2 focus-visible:ring-ring">
           <span className="flex items-center gap-2">
             <BookOpen className="size-4 text-primary" aria-hidden="true" />

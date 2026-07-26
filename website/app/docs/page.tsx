@@ -63,7 +63,7 @@ export default function DocsIndexPage() {
       title="先安装，再把问题交给 AI"
       description="推荐顺序是安装 AQL、安装 Skill、直接提问。每个操作示例都可以在 AI 自然语言与代码之间切换；需要审计或自动化时再查看代码。"
     >
-      <DocsSection title="推荐的新手路径">
+      <DocsSection id="beginner-path" title="推荐的新手路径">
         <div className="grid gap-4 md:grid-cols-3">
           {learningPath.map((item, index) => {
             const Icon = item.icon;
@@ -98,7 +98,7 @@ export default function DocsIndexPage() {
         </div>
       </DocsSection>
 
-      <DocsSection title="先认识三个词">
+      <DocsSection id="core-terms" title="先认识三个词">
         <div className="grid gap-4 md:grid-cols-3">
           {concepts.map((concept) => (
             <article
@@ -117,7 +117,7 @@ export default function DocsIndexPage() {
         </DocsNote>
       </DocsSection>
 
-      <DocsSection title="按主题查找">
+      <DocsSection id="browse-by-topic" title="按主题查找">
         <div className="grid gap-6 sm:grid-cols-2">
           {docsSections.slice(1).map((section) => (
             <section
@@ -156,7 +156,7 @@ export default function DocsIndexPage() {
         </div>
       </DocsSection>
 
-      <DocsSection title="平台支持">
+      <DocsSection id="platform-support" title="平台支持">
         <div className="flex flex-wrap gap-2">
           <Badge variant="mint">macOS</Badge>
           <Badge variant="mint">Linux</Badge>

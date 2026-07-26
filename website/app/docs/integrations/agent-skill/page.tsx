@@ -32,7 +32,7 @@ export default function AgentSkillPage() {
       title="安装 Skill，然后直接提问"
       description="Skill 是安装到 Agent 的使用说明：它教 AI 先确认数据来源和可用字段，再生成只读、有边界的 AQL 查询。它不会安装 AQL CLI，也不会获得额外权限。"
     >
-      <DocsSection title="1. 先确认 AQL CLI">
+      <DocsSection id="verify-aql-cli" title="1. 先确认 AQL CLI">
         <CodeBlock
           ai="确认 AQL CLI 已安装并可调用，然后只做版本检查。不要修改配置，也不要替我选择数据库。"
           code="aql --version"
@@ -45,7 +45,7 @@ export default function AgentSkillPage() {
         </p>
       </DocsSection>
 
-      <DocsSection title="2. 检查 Node.js 与 npx">
+      <DocsSection id="check-node-and-npx" title="2. 检查 Node.js 与 npx">
         <p>
           推荐安装方式使用 <code>skills</code> CLI，它通过 <code>npx</code> 运行。当前
           <code>skills</code> CLI 要求 Node.js <code>22.20.0</code> 或更高版本；
@@ -64,7 +64,7 @@ export default function AgentSkillPage() {
         </DocsNote>
       </DocsSection>
 
-      <DocsSection title="3. 选择 Agent 并安装">
+      <DocsSection id="install-skill" title="3. 选择 Agent 并安装">
         <p>
           下面的命令会自动检测已经安装的兼容 Agent，并把 <code>aql</code> Skill 安装到当前用户。若检测结果不符合预期，请使用表格中的
           <code>--agent</code> 值明确指定目标。
@@ -132,7 +132,7 @@ export default function AgentSkillPage() {
         />
       </DocsSection>
 
-      <DocsSection title="4. 验证 Agent 已加载 Skill">
+      <DocsSection id="verify-skill" title="4. 验证 Agent 已加载 Skill">
         <CodeBlock
           ai="确认当前 Agent 已安装并能识别 aql Skill，同时确认本机 aql CLI 可运行。不要执行真实数据查询。"
           code={[
@@ -156,7 +156,7 @@ export default function AgentSkillPage() {
         </p>
       </DocsSection>
 
-      <DocsSection title="5. 用自然语言查询">
+      <DocsSection id="first-ai-query" title="5. 用自然语言查询">
         <CodeBlock
           ai="使用 $aql 查询 codex 的会话数，按模型分组并按数量降序返回 table。不要读取会话正文。"
           code="aql query -d codex 'SELECT model, COUNT(*) AS sessions FROM sessions GROUP BY model ORDER BY sessions DESC'"
@@ -166,7 +166,7 @@ export default function AgentSkillPage() {
         <p>一个好的请求包含具体数据库、查询目标、必要的范围和输出格式。</p>
       </DocsSection>
 
-      <DocsSection title="Skill 会遵守什么">
+      <DocsSection id="skill-safety" title="Skill 会遵守什么">
         <ul className="grid gap-3">
           {[
             "不会猜测默认数据库，all 仍需用户明确要求。",

@@ -30,10 +30,10 @@ export default function GettingStartedPage() {
       title="5 分钟完成第一条只读查询"
       description="这条路径只做三件事：确认安装、找到一个具体的数据来源、得到一个可以核对的结果。示例使用 codex；如果你使用其他 Agent，请替换成实际发现的数据库名称。"
     >
-      <DocsSection title="开始前：确认两项安装">
-        <div className="grid gap-3 sm:grid-cols-2">
+      <DocsSection id="prerequisites" title="开始前：确认两项安装">
+        <ul className="grid gap-3 sm:grid-cols-2">
           {prerequisites.map((item) => (
-            <div
+            <li
               key={item}
               className="flex items-start gap-3 rounded-2xl border border-border bg-card p-4"
             >
@@ -42,9 +42,9 @@ export default function GettingStartedPage() {
                 aria-hidden="true"
               />
               <span className="text-sm leading-6 text-foreground/75">{item}</span>
-            </div>
+            </li>
           ))}
-        </div>
+        </ul>
         <p>
           如果还没有完成，请先看{" "}
           <Link href="/docs/getting-started/installation" className={inlineLinkClass}>
@@ -70,7 +70,7 @@ export default function GettingStartedPage() {
         </DocsNote>
       </DocsSection>
 
-      <DocsSection title="1. 找到一个具体数据库">
+      <DocsSection id="select-database" title="1. 找到一个具体数据库">
         <p>
           在 AQL 中，“数据库”只是一个数据来源名称：<code>codex</code> 代表 Codex，
           <code>claude</code> 代表 Claude Code。你不需要另外安装数据库服务器。
@@ -88,7 +88,7 @@ export default function GettingStartedPage() {
         </DocsNote>
       </DocsSection>
 
-      <DocsSection title="如果没有发现数据库">
+      <DocsSection id="no-database-found" title="如果没有发现数据库">
         <p>
           这通常不代表 AQL 安装失败。对应 Agent 可能还没有生成本地记录，或者数据位于非默认目录。
         </p>
@@ -113,7 +113,7 @@ export default function GettingStartedPage() {
         </ol>
       </DocsSection>
 
-      <DocsSection title="2. 完成第一条查询">
+      <DocsSection id="first-query" title="2. 完成第一条查询">
         <p>
           下面只统计会话总数，不读取会话正文。示例使用 <code>codex</code>；请替换为上一步已经确认的具体数据库。
         </p>
@@ -128,7 +128,7 @@ export default function GettingStartedPage() {
         </DocsNote>
       </DocsSection>
 
-      <DocsSection title="3. 查看一个更有用的汇总">
+      <DocsSection id="useful-summary" title="3. 查看一个更有用的汇总">
         <p>
           现在按模型统计会话数量。仍然只读取普通统计字段，并按数量从高到低返回。
         </p>
