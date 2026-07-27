@@ -1,6 +1,6 @@
 # AQL 架构
 
-AQL 将四种 Agent 本机格式映射为统一、只读的 canonical tables。SQL engine 不依赖具体文件布局，CLI 只公开 database 和 SELECT。
+AQL 将不同 Agent 的本机格式映射为统一、只读的 canonical tables。SQL engine 不依赖具体文件布局，CLI 只公开 database 和 SELECT。
 
 ```mermaid
 flowchart LR

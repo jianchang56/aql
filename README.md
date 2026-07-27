@@ -1,9 +1,9 @@
 # AQL
 
-AQL 是一个本地优先、严格只读的 Agent 数据 SQL CLI。它把 Claude Code、Codex、Kimi Code 和 OpenCode 的本机数据映射为统一表，用户只需要：
+AQL 是一个推荐由 AI 使用、本地优先、严格只读，并面向主流 Agent 持续扩展的数据查询 CLI。安装 CLI 与仓库内置 Skill 后，可以直接用自然语言查询本机 Agent 数据：
 
 ```text
-database → canonical tables → read-only SELECT
+选择具体 Agent → 只读查询 → 完整结果
 ```
 
 ```sql
@@ -21,31 +21,84 @@ ORDER BY sessions DESC;
 | 项目 | 状态 |
 |---|---|
 | macOS / Linux | 支持 |
-| Claude Code / Codex / Kimi Code / OpenCode | 支持只读查询 |
-| Windows | 暂缓 |
+| 数据来源 | Claude Code / Codex / Kimi Code / OpenCode；沿统一接口持续扩展 |
+| Windows | 支持（当前使用 Cargo 源码安装） |
 | 修改 Agent 原始数据 | 不支持 |
 
 AQL 不上传数据，不调用 Agent 程序，不读取认证配置，也不会自动选择数据库或扫描未明确选择的位置。
 
+如果通过云端 Agent 使用 AQL，提示词以及 Agent 发送给模型的 AQL 输出仍受该产品的隐私设置和服务条款约束。AQL 的本地查询边界不能替代 Agent 的云端隐私配置；建议先使用聚合和 Safe 字段，再按需扩大返回范围。
+
 ## 安装
 
-当前版本需要 Rust `1.97.0`：
+### 推荐：让 AI 安装
 
-```bash
-cargo build --locked --release -p aql
+把下面的内容交给正在使用的 Agent：
+
+```text
+当前还没有正式 AQL Release。请使用 Rust 1.97.0 和 locked 依赖从 GitHub 源码安装，不要使用 sudo，不要修改 shell 配置，完成后运行 aql --version。
 ```
 
-或者安装到 Cargo bin 目录：
+### 当前可用：源码安装
+
+macOS、Linux 和 Windows 当前都使用 Cargo。需要 Git、rustup 与 Rust `1.97.0`：
 
 ```bash
-cargo install --locked --path crates/aql
+git clone https://github.com/jianchang56/aql.git
+cd aql
+rustup toolchain install 1.97.0
+cargo +1.97.0 install --locked --path crates/aql
+aql --version
 ```
 
-下文假设 `aql` 已加入 `PATH`。GitHub release、Homebrew Formula、本地可验证 archive、升级和卸载见 [安装文档](docs/installation.md)。
+PowerShell 中把 `cd aql` 替换为 `Set-Location aql`。
+
+### 预编译一行安装（首个正式 Release 发布后）
+
+Release workflow 已配置 macOS/Linux 的 `aarch64/x86_64` 构建、SHA256 校验和 Homebrew Formula。当前 GitHub Releases 尚无正式资产，因此不要运行指向 `releases/latest` 的安装命令。首个 tag 发布并验证完成后，本节会启用一行安装。
+
+下文假设 `aql` 已加入 `PATH`。当前安装、未来的预编译 Release、升级和卸载见 [安装文档](docs/installation.md)。
+
+## Agent Skill
+
+安装 CLI 后，立即安装仓库内置的 [AQL Skill](skills/aql/SKILL.md)。推荐直接告诉 Agent：
+
+```text
+请从 GitHub 仓库 jianchang56/aql 安装完整的 aql Skill。优先使用 skills CLI 全局安装到当前 Agent；不要只复制 SKILL.md，安装后确认你能识别 $aql。
+```
+
+直接从 GitHub 安装（适用于支持 `skills` CLI 的 Agent）：
+
+当前 `skills` CLI 需要 Node.js `22.20.0` 或更高版本，以及随 npm 提供的 `npx`。下面的命令会自动检测已安装的兼容 Agent：
+
+```bash
+npx --yes skills add jianchang56/aql --skill aql --global --yes
+```
+
+明确指定 Agent 时使用 `--agent claude-code`、`--agent codex`、`--agent kimi-code-cli` 或 `--agent opencode`。安装后验证：
+
+```bash
+npx --yes skills list --global
+aql --version
+```
+
+如果环境没有 `npx`，再克隆仓库并复制完整的 `skills/aql` 目录到对应 Agent 的 Skill 目录；不要只复制单个 `SKILL.md`。`$aql` 是提示词中的 Skill 名称，不是终端命令；真正的可执行文件是 `aql`。安装后请新建一个 Agent 会话。
+
+```text
+使用 $aql 查询 codex 的会话数，按模型分组。
+```
+
+Skill 仍会显式选择数据库，并只在任务确实需要时申请最小的 `path`、`content`、`tool-input` 或 `tool-output` 临时授权；使用前需先安装 AQL CLI。
 
 ## 快速开始
 
-启动交互式 Shell：
+推荐直接使用自然语言：
+
+```text
+使用 $aql 查询 codex 的会话数，按模型分组并按数量降序返回 table。
+```
+
+等价代码可以用于审计或自动化。启动交互式 Shell：
 
 ```bash
 aql
@@ -206,6 +259,13 @@ aql query -d codex --diagnostics 'SELECT model FROM sessions LIMIT 10'
 - [Canonical Schema](docs/canonical-schema-v0.md)
 - [隐私与威胁模型](docs/privacy-threat-model.md)
 - [文档索引](docs/README.md)
+
+文档网站位于 [`website`](website)。本地预览：
+
+```bash
+pnpm --dir website install
+pnpm --dir website dev
+```
 
 ## License
 

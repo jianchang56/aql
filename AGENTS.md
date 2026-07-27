@@ -4,7 +4,7 @@ This file is the operating guide for coding agents working in this repository. `
 
 ## Project status
 
-AQL is a local-first Rust CLI that exposes read-only SQL over local Claude Code, Codex, Kimi Code, and OpenCode data. Windows is deferred. Agent mutation is outside the product.
+AQL is a local-first Rust CLI that exposes read-only SQL over local Claude Code, Codex, Kimi Code, and OpenCode data. Windows is supported through source builds. The prebuilt release target matrix is macOS/Linux-only, and no official GitHub Release has been published yet. Agent mutation is outside the product.
 
 Current user model:
 

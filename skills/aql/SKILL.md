@@ -13,6 +13,7 @@ description: 使用 AQL 对本机 Claude Code、Codex、Kimi Code 和 OpenCode �
 - 始终显式选择数据库。内置名称为 `claude`、`codex`、`kimi`、`opencode` 和 `all`；只有用户明确要求联合查询时才选择 `all`。
 - 默认只查询 Safe 字段。仅在任务确实需要时添加最小的 `path`、`content`、`tool-input` 或 `tool-output` 授权；Secret 永远不可授权。
 - 先聚合、筛选和限制结果，再考虑读取正文或工具载荷。不要无界输出敏感字段。
+- 不要把“AQL 在本机查询”描述成“AI 对话一定离线”。宿主 Agent 可能按自身配置把提示词和选入上下文的工具结果发送给云端模型；继续保持最小字段和有界输出。
 - 除非用户明确要求，不要把 SQL、结果或授权持久化。使用 `--output-file` 时只写入用户指定的、不存在的新文件。
 - `database add` 和 `database remove` 会修改 AQL 自己的配置。只在用户明确要求配置数据库时使用；它们不得修改 Agent 数据。
 

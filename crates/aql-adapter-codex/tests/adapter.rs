@@ -1176,12 +1176,16 @@ fn database_replacement_or_shrink_invalidates_the_bound_snapshot() {
     );
 
     // Replacement keeps the same schema but changes the database identity.
-    fs::remove_file(&database).expect("original database must be removable");
+    // Create the replacement while the original still exists so Unix filesystems
+    // cannot reuse the original inode for the replacement fixture.
+    let replacement = database.with_file_name("state_5.sqlite.replacement");
     fs::copy(
         fixtures.join("separate-root-a/sqlite/state_5.sqlite"),
-        &database,
+        &replacement,
     )
     .expect("replacement database must copy");
+    fs::remove_file(&database).expect("original database must be removable");
+    fs::rename(&replacement, &database).expect("replacement database must move into place");
     let mut result = adapter
         .scan(request(
             source.clone(),

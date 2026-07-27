@@ -12,3 +12,8 @@ rollout-*.jsonl
 .DS_Store
 __pycache__/
 *.pyc
+/.playwright-cli/
+/website/.next/
+/website/node_modules/
+/website/out/
+/website/*.tsbuildinfo
