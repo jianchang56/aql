@@ -13,6 +13,7 @@
 - [架构](architecture.md)
 - [Adapter Contract](adapter-contract-v0.md)
 - [Query Engine ADR](adr/0001-query-engine.md)
+- [Single-Pass Scan ADR](adr/0002-single-pass-scan.md)
 - [Engine Spike Scorecard](engine-spike-scorecard.md)
 
 ## Source format evidence

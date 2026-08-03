@@ -70,6 +70,8 @@ AQL 进程不调用模型，也不把 Agent 数据上传到网络。通过 Skill
 - 单值大小检查；
 - cancellation 和 shared budget。
 
+授权数据可在查询生命周期内驻留 Adapter 内存（如 Claude Code 的单遍解析缓存，64 MiB 上界、填满即回退重解析），随 Adapter 实例在查询结束时释放，不持久化、不跨查询共享。
+
 Agent auth、配置、日志、插件、项目树和未声明 sibling 文件不属于 source。
 
 ## Federation 与预算

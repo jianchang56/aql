@@ -61,6 +61,8 @@ state-declared agents/*/wire.jsonl
 
 `session_index.jsonl` 的 `sessionDir` locator 接受两种形式：固定的落盘绝对路径，或严格两段相对路径 `<bucket>/<session>`（相对 sessions root 解析，两段都必须是安全 normal 组件：非空、非 `.`/`..`，只含 ASCII 字母数字和 `.`、`_`、`-`）。其他相对形状、prefix/root/`..` 组件一律 fail closed。两种形式都要求解析结果位于 sessions root 内且目录 basename 与 `sessionId` 一致，否则该条目被忽略并产生脱敏 warning。
 
+`state.json` 的 `workDir`（含 legacy `custom.cwd` 回退）只验证过 POSIX 绝对路径形态：路径必须规范化（不含空、`.`、`..` 组件或控制字符），且其 SHA-256 编码必须与所在 bucket 后缀一致（与官方 `reindex()` 一致）。Windows 风格 `workDir` 不在已验证格式内，fail closed。
+
 ## OpenCode
 
 只允许根目录及：
@@ -78,6 +80,8 @@ opencode.db-shm
 | 情况 | 行为 |
 |---|---|
 | 缺少已知 optional 字段 | 返回 NULL 并产生 warning |
+| 时间戳可解析但时区无法确定 | 不套用本地时区，warning 并返回 NULL |
+| 时间戳完全无法解析（含越界 epoch 值） | fail closed |
 | 未知但可安全跳过的 event | bounded warning |
 | 截断 append tail | 保留已完成记录并 warning |
 | schema/user-version/protocol 超出规则 | fail closed |

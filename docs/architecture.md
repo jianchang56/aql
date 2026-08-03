@@ -36,7 +36,7 @@ Adapter 只读取固定格式白名单。未知格式或无法证明安全兼容
 
 ## Agent adapters
 
-- `aql-adapter-claude-code`：固定深度 transcript JSONL。
+- `aql-adapter-claude-code`：固定深度 transcript JSONL；同一查询内多表 scan 共享单遍解析的有界内存缓存（见 [ADR 0002](adr/0002-single-pass-scan.md)）。
 - `aql-adapter-codex`：SQLite/session index/rollout JSONL。
 - `aql-adapter-kimi-code`：session index、state 和 state-declared wire JSONL。
 - `aql-adapter-opencode`：pinned SQLite schema 和 active WAL snapshot。
@@ -117,5 +117,6 @@ parse and validate SQL
 - [Canonical Schema](canonical-schema-v0.md)
 - [Adapter Contract](adapter-contract-v0.md)
 - [Query Engine ADR](adr/0001-query-engine.md)
+- [Single-Pass Scan ADR](adr/0002-single-pass-scan.md)
 - [隐私与威胁模型](privacy-threat-model.md)
 - [兼容性](compatibility.md)

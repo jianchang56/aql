@@ -149,6 +149,7 @@ pub struct ResourceBudget {
 - SQLite watermark 可由 schema version、数据库标识和只读事务快照信息构成，不能只用 mtime。
 - JSONL watermark 至少包含文件 identity、size 和安全时间信息。
 - scan 开始与结束检查 watermark。
+- 查询内缓存的解析结果在 replay 结束时必须对该文件重查 identity 与长度（对齐 scan-end watermark 检查），失配返回 `SnapshotUnavailable`。
 - 变化时查询可返回 `StaleSnapshot` warning；Catalog 不得声称 strong consistency。
 - 查询不会把 weak snapshot 表述为 strong consistency；发生变化时必须返回 sanitized warning 或失败。
 
@@ -224,7 +225,7 @@ Capability 是运行时事实，不由 Agent 名硬编码推断。
 - 动态第三方插件加载。
 - 网络数据源。
 - 增量订阅/watch。
-- Adapter 自有缓存。
+- 跨查询或持久化的 Adapter 缓存。查询生命周期内、随 Adapter 实例释放的有界解析缓存不在此列（见 `docs/adr/0002-single-pass-scan.md`）。
 - 向量或语义搜索。
 
 ## 15. Multi-source and Kimi requirements

@@ -34,7 +34,8 @@ Canonical Model 是 Adapter、Catalog 和查询引擎之间唯一稳定的数据
 ### 2.2 时间
 
 - 内部使用 UTC instant，精度至少毫秒。
-- 原始时间无法确定时区时不得擅自套用本地时区；记录 parse warning 并返回 NULL。
+- 原始时间完全无法解析时 fail closed，不得静默置 NULL。
+- 原始时间可解析但无法确定时区时不得擅自套用本地时区；记录 parse warning 并返回 NULL。
 - 保留 `observed_at` 作为 AQL 读取时间，它不能替代来源事件时间。
 
 ### 2.3 NULL
@@ -240,7 +241,7 @@ pub struct FieldValue<T> {
    - 仅当 incoming authority 严格更高时覆盖；authority 相同（包括双方都没有该字段 provenance）时保留先扫描到的值，结果因此依赖来源扫描顺序；
    - 既有值为 NULL 时被任何非 NULL incoming 值填充，不产生 warning；incoming NULL 永不覆盖既有值；
    - `identity_confidence` 不参与字段合并，保留先扫描记录的取值；
-   - `extensions` 按键并入，相同 key 由后扫描记录静默覆盖，不产生 warning。
+   - `extensions` 按键并入，相同 key 由后扫描记录覆盖；两侧值不同时产生 FieldConflict warning（`field` 为 `extensions.<key>`），值相同则静默。
 5. 不同物理 source identity 永不自动合并。
 6. identity 不确定时保留两个实体，优先重复而不是误合并。
 
