@@ -1,22 +1,27 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Take};
+use std::io::{BufReader, Read};
+use std::sync::Arc;
 
 use aql_adapter_api::{
-    AdapterError, AdapterWarning, AdapterWarningKind, RecordStream, ScanDiagnostics, ScanRequest,
-    TableName, check_scan_state,
+    AdapterError, AdapterWarning, AdapterWarningKind, ColumnName, RecordStream, ScanDiagnostics,
+    ScanRequest, TableName, check_scan_state,
+    util::{append_content, projected, read_limited_line},
 };
 use aql_model::{CanonicalRecord, EntityId, MessageRecord, NativeId, ToolCallRecord, UsageRecord};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+use super::cache::{
+    CacheLookup, FileCacheKey, ParseCacheHandle, ParsedFile, SensitiveClasses, required_classes,
+};
 use super::{
     LogicalTranscript, MAX_RECORD_BYTES, MainTranscripts, RootBinding, TranscriptDescriptor,
-    TranscriptKind, open_transcript, projected, revalidate_transcript,
+    TranscriptKind, open_transcript, revalidate_transcript, revalidate_transcript_path,
 };
 
-pub(super) struct SessionSummary {
+#[derive(Clone)]
+pub(crate) struct SessionSummary {
     pub preview: Option<String>,
     pub cwd: Option<String>,
     pub model: Option<String>,
@@ -26,27 +31,45 @@ pub(super) struct SessionSummary {
     pub tokens_used: Option<i64>,
 }
 
+impl SessionSummary {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            preview: None,
+            cwd: None,
+            model: None,
+            created_at: None,
+            message_count: None,
+            tool_call_count: None,
+            tokens_used: None,
+        }
+    }
+}
+
+/// Streams one canonical transcript table, parsing each transcript once per
+/// adapter (query) lifetime and replaying cached parses afterwards.
 struct TranscriptStream {
     root: RootBinding,
     request: ScanRequest,
     diagnostics: ScanDiagnostics,
+    cache: ParseCacheHandle,
     descriptors: VecDeque<TranscriptDescriptor>,
     mains: MainTranscripts,
-    current: Option<CurrentTranscript>,
-    ready: VecDeque<CanonicalRecord>,
+    current: Option<ReplayFile>,
     emitted: u64,
     finished: bool,
 }
 
-struct CurrentTranscript {
-    reader: BufReader<Take<File>>,
-    logical: LogicalTranscript,
-    sequence: i64,
-    tool_sequence: i64,
-    pending_tools: BTreeMap<String, PendingTool>,
-    seen_entries: BTreeSet<String>,
-    seen_usage: BTreeMap<String, UsageValues>,
+/// Projection-masked records of one transcript being replayed, plus the
+/// end-of-file identity re-check owed when the parse came from the cache.
+struct ReplayFile {
+    descriptor: TranscriptDescriptor,
+    records: VecDeque<CanonicalRecord>,
+    recheck: bool,
+    since_check: u64,
 }
+
+/// Cancellation/deadline polling cadence while replaying a cached parse.
+const REPLAY_CHECK_RECORDS: u64 = 1024;
 
 struct PendingTool {
     native_id: String,
@@ -120,15 +143,16 @@ pub(super) fn scan(
     mains: MainTranscripts,
     request: ScanRequest,
     diagnostics: ScanDiagnostics,
+    cache: ParseCacheHandle,
 ) -> RecordStream {
     Box::new(TranscriptStream {
         root,
         request,
         diagnostics,
+        cache,
         descriptors: descriptors.into(),
         mains,
         current: None,
-        ready: VecDeque::new(),
         emitted: 0,
         finished: false,
     })
@@ -165,411 +189,397 @@ pub(super) fn resolve_logical(
     }
 }
 
-pub(super) fn summarize(
+pub(super) struct LoadedFile {
+    pub(super) logical: LogicalTranscript,
+    pub(super) parsed: Arc<ParsedFile>,
+    pub(super) from_cache: bool,
+}
+
+/// Returns the single-pass parse of one transcript, served from the per-query
+/// cache when identity, pinned length, grant, and needed classes all match.
+pub(super) fn load_parsed(
+    root: &RootBinding,
+    descriptor: TranscriptDescriptor,
+    mains: &MainTranscripts,
+    request: &ScanRequest,
+    diagnostics: &ScanDiagnostics,
+    cache: &ParseCacheHandle,
+) -> Result<LoadedFile, AdapterError> {
+    let needed = required_classes(request.table, &request.projection);
+    let key = FileCacheKey::new(
+        &request.source.source_id,
+        descriptor.identity,
+        descriptor.len,
+        request.access,
+    );
+    let lookup = cache
+        .lock()
+        .map_err(|_| AdapterError::Internal {
+            stage: "claude_parse_cache".to_string(),
+        })?
+        .lookup(&key, needed);
+    match lookup {
+        CacheLookup::Hit(parsed) => {
+            // The cached parse already validated agent parentage under the
+            // same pinned watermark; repeat only the membership check against
+            // this scan's inventory. The file itself is re-validated by the
+            // caller's end-of-file identity re-check.
+            if parsed.agent.is_some()
+                && !mains.contains(&(descriptor.project_key.clone(), parsed.main_native.clone()))
+            {
+                return Err(AdapterError::CorruptSource {
+                    stage: "claude_agent_parent".to_string(),
+                });
+            }
+            let logical = LogicalTranscript {
+                descriptor,
+                main_native: parsed.main_native.clone(),
+                logical_native: parsed.logical_native.clone(),
+                agent: parsed.agent.clone(),
+            };
+            Ok(LoadedFile {
+                logical,
+                parsed,
+                from_cache: true,
+            })
+        }
+        CacheLookup::Miss(widened) => {
+            let logical = resolve_logical(root, descriptor, mains, request, diagnostics)?;
+            let extract = needed.union(widened).granted(request.access);
+            let (parsed, complete) = parse_file(root, &logical, request, extract, diagnostics)?;
+            let parsed = Arc::new(parsed);
+            if complete {
+                cache
+                    .lock()
+                    .map_err(|_| AdapterError::Internal {
+                        stage: "claude_parse_cache".to_string(),
+                    })?
+                    .insert(key, Arc::clone(&parsed));
+            }
+            Ok(LoadedFile {
+                logical,
+                parsed,
+                from_cache: false,
+            })
+        }
+    }
+}
+
+/// Parses one transcript once, fanning every envelope out to the messages,
+/// tool_calls, and usage builders plus the Safe session summary accumulator.
+///
+/// Sensitive values are extracted only for classes in `extract` (already
+/// narrowed to the request grant); Safe aggregates are always computed. A
+/// scan whose effective limit is reached mid-file stops early and reports
+/// `complete = false` so the partial parse is never cached.
+fn parse_file(
     root: &RootBinding,
     logical: &LogicalTranscript,
     request: &ScanRequest,
+    extract: SensitiveClasses,
     diagnostics: &ScanDiagnostics,
-) -> Result<SessionSummary, AdapterError> {
-    let wants_preview = projected(&request.projection, "preview");
-    let wants_path =
-        projected(&request.projection, "cwd") || projected(&request.projection, "project");
-    let wants_model = projected(&request.projection, "model");
-    let wants_created = projected(&request.projection, "created_at");
-    let wants_messages = projected(&request.projection, "message_count");
-    let wants_tools = projected(&request.projection, "tool_call_count");
-    let wants_tokens = projected(&request.projection, "tokens_used");
-    if !(wants_preview
-        || wants_path
-        || wants_model
-        || wants_created
-        || wants_messages
-        || wants_tools
-        || wants_tokens)
-    {
-        return Ok(SessionSummary {
-            preview: None,
-            cwd: None,
-            model: None,
-            created_at: None,
-            message_count: None,
-            tool_call_count: None,
-            tokens_used: None,
-        });
-    }
-
+) -> Result<(ParsedFile, bool), AdapterError> {
     let file = open_transcript(root, &logical.descriptor)?;
     let mut reader = BufReader::new(file.take(logical.descriptor.len));
-    let mut preview = None;
-    let mut cwd = None;
-    let mut model = None;
-    let mut created_at: Option<DateTime<Utc>> = None;
-    let mut message_count = 0_i64;
-    let mut tool_call_count = 0_i64;
-    let mut tokens_used = 0_i64;
-    let mut has_tokens = false;
-    let mut seen_assistant_messages = BTreeSet::new();
-    let mut seen_usage = BTreeMap::new();
-    let mut seen_entries = BTreeSet::new();
-    while let Some((line, complete, bytes)) = read_limited_line(&mut reader)? {
+    let mut line = Vec::new();
+    let mut builders = ParseBuilders::default();
+    let mut complete = true;
+    while let Some((terminated, bytes)) = read_limited_line(
+        &mut reader,
+        &mut line,
+        MAX_RECORD_BYTES,
+        "claude_record_bytes",
+        "claude_transcript_read",
+    )? {
         check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
         request.budget.charge_bytes_read(bytes as u64)?;
-        let envelope = match parse_envelope(&line, complete, diagnostics)? {
-            Some(value) => value,
-            None => break,
+        let Some(envelope) = parse_envelope(&line, terminated, diagnostics)? else {
+            break;
         };
         validate_envelope_identity(&envelope, logical)?;
+        builders.feed(&envelope, logical, request, extract, diagnostics)?;
+        let produced = match request.table {
+            TableName::Messages => Some(builders.messages.len()),
+            TableName::ToolCalls => Some(builders.tool_calls.len()),
+            TableName::Usage => Some(builders.usage.len()),
+            _ => None,
+        };
+        if let (Some(produced), Some(limit)) = (produced, request.limit)
+            && produced as u64 >= limit
+        {
+            complete = false;
+            break;
+        }
+    }
+    if complete {
+        revalidate_transcript(root, &logical.descriptor, reader.get_ref().get_ref())?;
+        for (_, pending) in std::mem::take(&mut builders.pending_tools) {
+            builders
+                .tool_calls
+                .push(tool_record(request, pending, None, "interrupted", None));
+        }
+    }
+    Ok((builders.finish(logical, extract), complete))
+}
+
+/// Per-transcript parse state shared by the three table builders and the
+/// session summary accumulator.
+#[derive(Default)]
+struct ParseBuilders {
+    sequence: i64,
+    tool_sequence: i64,
+    pending_tools: BTreeMap<String, PendingTool>,
+    seen_entries: BTreeSet<String>,
+    seen_usage: BTreeMap<String, UsageValues>,
+    seen_assistant_messages: BTreeSet<String>,
+    messages: Vec<MessageRecord>,
+    tool_calls: Vec<ToolCallRecord>,
+    usage: Vec<UsageRecord>,
+    preview: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+    created_at: Option<DateTime<Utc>>,
+    message_count: i64,
+    tool_call_count: i64,
+    tokens_used: i64,
+    has_tokens: bool,
+}
+
+/// Immutable context every builder stage of one envelope shares.
+struct FeedContext<'a> {
+    logical: &'a LogicalTranscript,
+    request: &'a ScanRequest,
+    extract: SensitiveClasses,
+    diagnostics: &'a ScanDiagnostics,
+}
+
+impl ParseBuilders {
+    fn feed(
+        &mut self,
+        envelope: &Envelope<'_>,
+        logical: &LogicalTranscript,
+        request: &ScanRequest,
+        extract: SensitiveClasses,
+        diagnostics: &ScanDiagnostics,
+    ) -> Result<(), AdapterError> {
+        let context = FeedContext {
+            logical,
+            request,
+            extract,
+            diagnostics,
+        };
         let timestamp = parse_timestamp(envelope.timestamp)?;
-        if wants_created && timestamp.is_some() {
-            created_at = match (created_at, timestamp) {
-                (Some(current), Some(candidate)) => Some(current.min(candidate)),
-                (None, candidate) => candidate,
-                (current, None) => current,
-            };
+        self.created_at = match (self.created_at, timestamp) {
+            (Some(current), Some(candidate)) => Some(current.min(candidate)),
+            (None, candidate) => candidate,
+            (current, None) => current,
+        };
+        if extract.includes(SensitiveClasses::PATH)
+            && let Some(raw) = envelope.cwd
+        {
+            self.cwd = Some(raw_string(raw, request.budget.max_single_value_bytes)?);
         }
-        if wants_path && let Some(raw) = envelope.cwd {
-            cwd = Some(raw_string(raw, request.budget.max_single_value_bytes)?);
-        }
-        if envelope.kind == "last-prompt" && wants_preview {
-            if let Some(raw) = envelope.last_prompt {
-                preview = Some(raw_string(raw, request.budget.max_single_value_bytes)?);
+        if envelope.kind == "last-prompt" {
+            if extract.includes(SensitiveClasses::CONTENT)
+                && let Some(raw) = envelope.last_prompt
+            {
+                self.preview = Some(raw_string(raw, request.budget.max_single_value_bytes)?);
             }
-            continue;
+            return Ok(());
         }
         if !matches!(envelope.kind, "user" | "assistant") {
             if !known_event(envelope.kind) {
                 warn_unknown(diagnostics)?;
             }
-            continue;
+            return Ok(());
         }
         let uuid = envelope.uuid.ok_or_else(|| AdapterError::CorruptSource {
             stage: "claude_message_uuid".to_string(),
         })?;
-        if !seen_entries.insert(uuid.to_string()) {
+        if !self.seen_entries.insert(uuid.to_string()) {
             return Err(AdapterError::CorruptSource {
                 stage: "claude_duplicate_entry".to_string(),
             });
         }
-        let message = parse_message_envelope(&envelope)?;
-        if wants_messages {
-            let unique = if envelope.kind == "assistant" {
-                message.id.unwrap_or(uuid)
-            } else {
-                uuid
-            };
-            if envelope.kind != "assistant" || seen_assistant_messages.insert(unique.to_string()) {
-                message_count =
-                    message_count
-                        .checked_add(1)
-                        .ok_or_else(|| AdapterError::CorruptSource {
-                            stage: "claude_message_count".to_string(),
-                        })?;
-            }
-        }
-        if wants_model && let Some(value) = message.model {
-            model = Some(value.to_string());
-        }
-        if wants_tools {
-            let blocks = content_blocks(message.content)?;
-            let count = blocks
-                .iter()
-                .filter(|block| block.kind == "tool_use")
-                .count();
-            tool_call_count = tool_call_count
-                .checked_add(
-                    i64::try_from(count).map_err(|_| AdapterError::CorruptSource {
-                        stage: "claude_tool_count".to_string(),
-                    })?,
-                )
-                .ok_or_else(|| AdapterError::CorruptSource {
-                    stage: "claude_tool_count".to_string(),
-                })?;
-        }
-        if wants_tokens
-            && envelope.kind == "assistant"
-            && let Some(raw) = message.usage
-        {
-            let key = message.id.ok_or_else(|| AdapterError::CorruptSource {
-                stage: "claude_usage_id".to_string(),
-            })?;
-            if let Some(value) = usage_values(raw)? {
-                if let Some(previous) = seen_usage.get(key) {
-                    if previous != &value {
-                        return Err(AdapterError::CorruptSource {
-                            stage: "claude_usage_conflict".to_string(),
-                        });
-                    }
-                } else {
-                    tokens_used = tokens_used.checked_add(value.total).ok_or_else(|| {
-                        AdapterError::CorruptSource {
-                            stage: "claude_usage_overflow".to_string(),
-                        }
-                    })?;
-                    seen_usage.insert(key.to_string(), value);
-                    has_tokens = true;
-                }
-            }
-        }
-    }
-    revalidate_transcript(root, &logical.descriptor, reader.get_ref().get_ref())?;
-    Ok(SessionSummary {
-        preview,
-        cwd,
-        model,
-        created_at,
-        message_count: wants_messages.then_some(message_count),
-        tool_call_count: wants_tools.then_some(tool_call_count),
-        tokens_used: (wants_tokens && has_tokens).then_some(tokens_used),
-    })
-}
-
-impl Iterator for TranscriptStream {
-    type Item = Result<CanonicalRecord, AdapterError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.finished
-            || self
-                .request
-                .limit
-                .is_some_and(|limit| self.emitted >= limit)
-        {
-            self.finished = true;
-            return None;
-        }
-        loop {
-            if let Some(record) = self.ready.pop_front() {
-                if let Err(error) = self.request.budget.charge_records(1) {
-                    self.finished = true;
-                    return Some(Err(error));
-                }
-                self.emitted += 1;
-                return Some(Ok(record));
-            }
-            if let Err(error) = check_scan_state(
-                &self.request.cancellation,
-                &self.request.budget,
-                self.emitted,
-                self.request.budget.bytes_read_used(),
-            ) {
-                self.finished = true;
-                return Some(Err(error));
-            }
-            if self.current.is_none() {
-                let Some(descriptor) = self.descriptors.pop_front() else {
-                    self.finished = true;
-                    return None;
-                };
-                let logical = match resolve_logical(
-                    &self.root,
-                    descriptor,
-                    &self.mains,
-                    &self.request,
-                    &self.diagnostics,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        self.finished = true;
-                        return Some(Err(error));
-                    }
-                };
-                let file = match open_transcript(&self.root, &logical.descriptor) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        self.finished = true;
-                        return Some(Err(error));
-                    }
-                };
-                self.current = Some(CurrentTranscript {
-                    reader: BufReader::new(file.take(logical.descriptor.len)),
-                    logical,
-                    sequence: 0,
-                    tool_sequence: 0,
-                    pending_tools: BTreeMap::new(),
-                    seen_entries: BTreeSet::new(),
-                    seen_usage: BTreeMap::new(),
-                });
-            }
-            let read = {
-                let current = self.current.as_mut()?;
-                read_limited_line(&mut current.reader)
-            };
-            match read {
-                Ok(Some((line, complete, bytes))) => {
-                    if let Err(error) = self.request.budget.charge_bytes_read(bytes as u64) {
-                        self.finished = true;
-                        return Some(Err(error));
-                    }
-                    if let Err(error) = self.parse_line(&line, complete) {
-                        self.finished = true;
-                        return Some(Err(error));
-                    }
-                }
-                Ok(None) => {
-                    let mut current = self.current.take()?;
-                    if let Err(error) = revalidate_transcript(
-                        &self.root,
-                        &current.logical.descriptor,
-                        current.reader.get_ref().get_ref(),
-                    ) {
-                        self.finished = true;
-                        return Some(Err(error));
-                    }
-                    if self.request.table == TableName::ToolCalls {
-                        for (_, pending) in std::mem::take(&mut current.pending_tools) {
-                            self.ready.push_back(CanonicalRecord::ToolCall(tool_record(
-                                &self.request,
-                                pending,
-                                None,
-                                "interrupted",
-                                None,
-                            )));
-                        }
-                    }
-                }
-                Err(error) => {
-                    self.finished = true;
-                    return Some(Err(error));
-                }
-            }
-        }
-    }
-}
-
-impl TranscriptStream {
-    fn parse_line(&mut self, line: &[u8], complete: bool) -> Result<(), AdapterError> {
-        let Some(envelope) = parse_envelope(line, complete, &self.diagnostics)? else {
-            return Ok(());
-        };
-        let current = self
-            .current
-            .as_ref()
-            .ok_or_else(|| AdapterError::Internal {
-                stage: "claude_current_transcript".to_string(),
-            })?;
-        validate_envelope_identity(&envelope, &current.logical)?;
-        if matches!(envelope.kind, "user" | "assistant") {
-            let uuid = envelope.uuid.ok_or_else(|| AdapterError::CorruptSource {
-                stage: "claude_message_uuid".to_string(),
-            })?;
-            let current = self
-                .current
-                .as_mut()
-                .ok_or_else(|| AdapterError::Internal {
-                    stage: "claude_current_transcript".to_string(),
-                })?;
-            if !current.seen_entries.insert(uuid.to_string()) {
-                return Err(AdapterError::CorruptSource {
-                    stage: "claude_duplicate_entry".to_string(),
-                });
-            }
-        }
-        match self.request.table {
-            TableName::Messages if matches!(envelope.kind, "user" | "assistant") => {
-                self.parse_message(&envelope)?;
-            }
-            TableName::ToolCalls if matches!(envelope.kind, "user" | "assistant") => {
-                self.parse_tools(&envelope)?;
-            }
-            TableName::Usage if envelope.kind == "assistant" => {
-                self.parse_usage(&envelope)?;
-            }
-            _ if known_event(envelope.kind) => {}
-            _ => warn_unknown(&self.diagnostics)?,
-        }
-        Ok(())
-    }
-
-    fn parse_message(&mut self, envelope: &Envelope<'_>) -> Result<(), AdapterError> {
         let message = parse_message_envelope(envelope)?;
         if message.role != envelope.kind {
             return Err(AdapterError::CorruptSource {
                 stage: "claude_message_role".to_string(),
             });
         }
-        let uuid = envelope.uuid.ok_or_else(|| AdapterError::CorruptSource {
-            stage: "claude_message_uuid".to_string(),
-        })?;
-        let wants_content = projected(&self.request.projection, "content");
-        let wants_json = projected(&self.request.projection, "content_json");
-        let parsed = sanitized_message_content(
-            message.content,
-            wants_content,
-            wants_json,
-            self.request.budget.max_single_value_bytes,
-        )?;
-        if parsed.unknown_blocks {
-            self.diagnostics.push(AdapterWarning {
+        let raw_content = message.content;
+        let blocks = if raw_content.get().trim_start().starts_with('[') {
+            content_blocks(raw_content)?
+        } else {
+            Vec::new()
+        };
+        if blocks
+            .iter()
+            .any(|block| !matches!(block.kind, "text" | "thinking" | "tool_use" | "tool_result"))
+        {
+            diagnostics.push(AdapterWarning {
                 kind: AdapterWarningKind::UnknownField,
                 source_kind: "claude_transcript".to_string(),
                 stage: "unknown_content_block".to_string(),
             })?;
         }
-        let current = self
-            .current
-            .as_mut()
-            .ok_or_else(|| AdapterError::Internal {
-                stage: "claude_current_transcript".to_string(),
+        let unique = if envelope.kind == "assistant" {
+            message.id.unwrap_or(uuid)
+        } else {
+            uuid
+        };
+        if envelope.kind != "assistant" || self.seen_assistant_messages.insert(unique.to_string()) {
+            self.message_count =
+                self.message_count
+                    .checked_add(1)
+                    .ok_or_else(|| AdapterError::CorruptSource {
+                        stage: "claude_message_count".to_string(),
+                    })?;
+        }
+        if let Some(model) = message.model {
+            self.model = Some(model.to_string());
+        }
+        let tool_uses = blocks
+            .iter()
+            .filter(|block| block.kind == "tool_use")
+            .count();
+        self.tool_call_count = self
+            .tool_call_count
+            .checked_add(
+                i64::try_from(tool_uses).map_err(|_| AdapterError::CorruptSource {
+                    stage: "claude_tool_count".to_string(),
+                })?,
+            )
+            .ok_or_else(|| AdapterError::CorruptSource {
+                stage: "claude_tool_count".to_string(),
             })?;
-        current.sequence += 1;
-        let native = NativeId::new(format!("{}/message/{uuid}", current.logical.logical_native));
+        if envelope.kind == "assistant"
+            && let Some(raw) = message.usage
+        {
+            self.feed_usage(envelope, &message, raw, timestamp, &context)?;
+        }
+        self.feed_message(envelope, &message, &blocks, uuid, timestamp, &context)?;
+        self.feed_tools(envelope, &blocks, uuid, timestamp, &context)?;
+        Ok(())
+    }
+
+    /// Feeds one assistant usage payload to the usage table builder and the
+    /// summary token accumulator; both share one dedup/conflict check per
+    /// API message ID.
+    fn feed_usage(
+        &mut self,
+        envelope: &Envelope<'_>,
+        message: &MessageEnvelope<'_>,
+        raw: &RawValue,
+        timestamp: Option<DateTime<Utc>>,
+        context: &FeedContext<'_>,
+    ) -> Result<(), AdapterError> {
+        let Some(values) = usage_values(raw)? else {
+            return Ok(());
+        };
+        let key = message.id.ok_or_else(|| AdapterError::CorruptSource {
+            stage: "claude_usage_id".to_string(),
+        })?;
+        if let Some(previous) = self.seen_usage.get(key) {
+            if previous != &values {
+                return Err(AdapterError::CorruptSource {
+                    stage: "claude_usage_conflict".to_string(),
+                });
+            }
+            return Ok(());
+        }
+        self.seen_usage.insert(key.to_string(), values.clone());
+        self.tokens_used = self.tokens_used.checked_add(values.total).ok_or_else(|| {
+            AdapterError::CorruptSource {
+                stage: "claude_usage_overflow".to_string(),
+            }
+        })?;
+        self.has_tokens = true;
+        let native = NativeId::new(format!("{}/usage/{key}", context.logical.logical_native));
+        self.usage.push(UsageRecord {
+            usage_id: EntityId::from_parts(
+                "claude-code",
+                &context.request.source.source_id,
+                &native,
+            ),
+            source_id: context.request.source.source_id.clone(),
+            agent_id: "claude-code".to_string(),
+            session_id: Some(logical_session_id(context.request, context.logical)),
+            model: message.model.map(str::to_string),
+            provider: None,
+            bucket_start: timestamp,
+            input_tokens: values.input,
+            output_tokens: values.output,
+            cached_tokens: values.cached,
+            total_tokens: Some(values.total),
+            message_count: 0,
+            tool_call_count: 0,
+            error_count: i64::from(envelope.is_api_error_message == Some(true)),
+            provenance: BTreeMap::new(),
+            extensions: BTreeMap::new(),
+        });
+        Ok(())
+    }
+
+    fn feed_message(
+        &mut self,
+        envelope: &Envelope<'_>,
+        message: &MessageEnvelope<'_>,
+        blocks: &[ContentBlock<'_>],
+        uuid: &str,
+        timestamp: Option<DateTime<Utc>>,
+        context: &FeedContext<'_>,
+    ) -> Result<(), AdapterError> {
+        let wants_content = context.extract.includes(SensitiveClasses::CONTENT);
+        let parsed = sanitized_message_content(
+            message.content,
+            blocks,
+            wants_content,
+            wants_content,
+            context.request.budget.max_single_value_bytes,
+        )?;
+        self.sequence += 1;
+        let native = NativeId::new(format!("{}/message/{uuid}", context.logical.logical_native));
         let role = if parsed.only_tool_results {
             "tool".to_string()
         } else {
             message.role.to_string()
         };
-        self.ready
-            .push_back(CanonicalRecord::Message(MessageRecord {
-                message_id: EntityId::from_parts(
-                    "claude-code",
-                    &self.request.source.source_id,
-                    &native,
-                ),
-                session_id: logical_session_id(&self.request, &current.logical),
-                source_id: self.request.source.source_id.clone(),
-                sequence: current.sequence,
-                role,
-                kind: Some(parsed.kind),
-                content: parsed.content,
-                content_json: parsed.content_json,
-                model: message.model.map(str::to_string),
-                created_at: parse_timestamp(envelope.timestamp)?,
-                input_tokens: None,
-                output_tokens: None,
-                cached_tokens: None,
-                is_error: Some(
-                    envelope.is_api_error_message == Some(true) || parsed.tool_result_error,
-                ),
-                provenance: BTreeMap::new(),
-                extensions: BTreeMap::new(),
-            }));
+        self.messages.push(MessageRecord {
+            message_id: EntityId::from_parts(
+                "claude-code",
+                &context.request.source.source_id,
+                &native,
+            ),
+            session_id: logical_session_id(context.request, context.logical),
+            source_id: context.request.source.source_id.clone(),
+            sequence: self.sequence,
+            role,
+            kind: Some(parsed.kind),
+            content: parsed.content,
+            content_json: parsed.content_json,
+            model: message.model.map(str::to_string),
+            created_at: timestamp,
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            is_error: Some(envelope.is_api_error_message == Some(true) || parsed.tool_result_error),
+            provenance: BTreeMap::new(),
+            extensions: BTreeMap::new(),
+        });
         Ok(())
     }
 
-    fn parse_tools(&mut self, envelope: &Envelope<'_>) -> Result<(), AdapterError> {
-        let message = parse_message_envelope(envelope)?;
-        let blocks = content_blocks(message.content)?;
-        if blocks
-            .iter()
-            .any(|block| !matches!(block.kind, "text" | "thinking" | "tool_use" | "tool_result"))
-        {
-            self.diagnostics.push(AdapterWarning {
-                kind: AdapterWarningKind::UnknownField,
-                source_kind: "claude_transcript".to_string(),
-                stage: "unknown_content_block".to_string(),
-            })?;
-        }
-        let timestamp = parse_timestamp(envelope.timestamp)?;
-        let current = self
-            .current
-            .as_mut()
-            .ok_or_else(|| AdapterError::Internal {
-                stage: "claude_current_transcript".to_string(),
-            })?;
+    fn feed_tools(
+        &mut self,
+        envelope: &Envelope<'_>,
+        blocks: &[ContentBlock<'_>],
+        uuid: &str,
+        timestamp: Option<DateTime<Utc>>,
+        context: &FeedContext<'_>,
+    ) -> Result<(), AdapterError> {
         if envelope.kind == "assistant" {
-            let uuid = envelope.uuid.ok_or_else(|| AdapterError::CorruptSource {
-                stage: "claude_message_uuid".to_string(),
-            })?;
-            for block in blocks.into_iter().filter(|block| block.kind == "tool_use") {
+            for block in blocks.iter().filter(|block| block.kind == "tool_use") {
                 let id = block.id.ok_or_else(|| AdapterError::CorruptSource {
                     stage: "claude_tool_id".to_string(),
                 })?;
@@ -584,49 +594,42 @@ impl TranscriptStream {
                 let input = block.input.ok_or_else(|| AdapterError::CorruptSource {
                     stage: "claude_tool_input".to_string(),
                 })?;
-                let arguments = if projected(&self.request.projection, "arguments") {
-                    bounded_json(input, self.request.budget.max_single_value_bytes)?
+                let arguments = if context.extract.includes(SensitiveClasses::TOOL_INPUT) {
+                    bounded_json(input, context.request.budget.max_single_value_bytes)?
                 } else {
                     None
                 };
-                current.tool_sequence += 1;
+                self.tool_sequence += 1;
                 let message_native =
-                    NativeId::new(format!("{}/message/{uuid}", current.logical.logical_native));
+                    NativeId::new(format!("{}/message/{uuid}", context.logical.logical_native));
                 let pending = PendingTool {
-                    native_id: format!("{}/tool/{id}", current.logical.logical_native),
+                    native_id: format!("{}/tool/{id}", context.logical.logical_native),
                     name: name.to_string(),
                     arguments,
-                    session_id: logical_session_id(&self.request, &current.logical),
+                    session_id: logical_session_id(context.request, context.logical),
                     message_id: EntityId::from_parts(
                         "claude-code",
-                        &self.request.source.source_id,
+                        &context.request.source.source_id,
                         &message_native,
                     ),
-                    sequence: current.tool_sequence,
+                    sequence: self.tool_sequence,
                     started_at: timestamp,
                 };
-                if current
-                    .pending_tools
-                    .insert(id.to_string(), pending)
-                    .is_some()
-                {
+                if self.pending_tools.insert(id.to_string(), pending).is_some() {
                     return Err(AdapterError::CorruptSource {
                         stage: "claude_duplicate_tool".to_string(),
                     });
                 }
             }
         } else {
-            for block in blocks
-                .into_iter()
-                .filter(|block| block.kind == "tool_result")
-            {
+            for block in blocks.iter().filter(|block| block.kind == "tool_result") {
                 let id = block
                     .tool_use_id
                     .ok_or_else(|| AdapterError::CorruptSource {
                         stage: "claude_tool_result_id".to_string(),
                     })?;
-                let Some(pending) = current.pending_tools.remove(id) else {
-                    self.diagnostics.push(AdapterWarning {
+                let Some(pending) = self.pending_tools.remove(id) else {
+                    context.diagnostics.push(AdapterWarning {
                         kind: AdapterWarningKind::IncompleteCapability,
                         source_kind: "claude_transcript".to_string(),
                         stage: "unpaired_tool_result".to_string(),
@@ -644,73 +647,191 @@ impl TranscriptStream {
                 let is_error = block.is_error.ok_or_else(|| AdapterError::CorruptSource {
                     stage: "claude_tool_result_status".to_string(),
                 })?;
-                let output = if projected(&self.request.projection, "output") {
+                let output = if context.extract.includes(SensitiveClasses::TOOL_OUTPUT) {
                     Some(tool_output(
                         raw_output,
-                        self.request.budget.max_single_value_bytes,
+                        context.request.budget.max_single_value_bytes,
                     )?)
                 } else {
                     None
                 };
                 let status = if is_error { "error" } else { "completed" };
-                self.ready.push_back(CanonicalRecord::ToolCall(tool_record(
-                    &self.request,
+                self.tool_calls.push(tool_record(
+                    context.request,
                     pending,
                     output,
                     status,
                     timestamp,
-                )));
+                ));
             }
         }
         Ok(())
     }
 
-    fn parse_usage(&mut self, envelope: &Envelope<'_>) -> Result<(), AdapterError> {
-        let message = parse_message_envelope(envelope)?;
-        let Some(raw) = message.usage else {
-            return Ok(());
-        };
-        let key = message.id.ok_or_else(|| AdapterError::CorruptSource {
-            stage: "claude_usage_id".to_string(),
-        })?;
-        let current = self
-            .current
-            .as_mut()
-            .ok_or_else(|| AdapterError::Internal {
-                stage: "claude_current_transcript".to_string(),
-            })?;
-        let Some(values) = usage_values(raw)? else {
-            return Ok(());
-        };
-        if let Some(previous) = current.seen_usage.get(key) {
-            if previous != &values {
-                return Err(AdapterError::CorruptSource {
-                    stage: "claude_usage_conflict".to_string(),
-                });
-            }
-            return Ok(());
+    fn finish(self, logical: &LogicalTranscript, extract: SensitiveClasses) -> ParsedFile {
+        ParsedFile {
+            main_native: logical.main_native.clone(),
+            logical_native: logical.logical_native.clone(),
+            agent: logical.agent.clone(),
+            messages: self.messages,
+            tool_calls: self.tool_calls,
+            usage: self.usage,
+            summary: SessionSummary {
+                preview: self.preview,
+                cwd: self.cwd,
+                model: self.model,
+                created_at: self.created_at,
+                message_count: Some(self.message_count),
+                tool_call_count: Some(self.tool_call_count),
+                tokens_used: self.has_tokens.then_some(self.tokens_used),
+            },
+            extracted: extract,
         }
-        current.seen_usage.insert(key.to_string(), values.clone());
-        let native = NativeId::new(format!("{}/usage/{key}", current.logical.logical_native));
-        self.ready.push_back(CanonicalRecord::Usage(UsageRecord {
-            usage_id: EntityId::from_parts("claude-code", &self.request.source.source_id, &native),
-            source_id: self.request.source.source_id.clone(),
-            agent_id: "claude-code".to_string(),
-            session_id: Some(logical_session_id(&self.request, &current.logical)),
-            model: message.model.map(str::to_string),
-            provider: None,
-            bucket_start: parse_timestamp(envelope.timestamp)?,
-            input_tokens: values.input,
-            output_tokens: values.output,
-            cached_tokens: values.cached,
-            total_tokens: Some(values.total),
-            message_count: 0,
-            tool_call_count: 0,
-            error_count: i64::from(envelope.is_api_error_message == Some(true)),
-            provenance: BTreeMap::new(),
-            extensions: BTreeMap::new(),
-        }));
-        Ok(())
+    }
+}
+
+/// Clones the cached records of `table`, masking sensitive fields down to the
+/// requesting projection (the cache stores class-wide extractions).
+fn replay_records(
+    parsed: &ParsedFile,
+    table: TableName,
+    projection: &[ColumnName],
+) -> VecDeque<CanonicalRecord> {
+    match table {
+        TableName::Messages => {
+            let wants_content = projected(projection, "content");
+            let wants_json = projected(projection, "content_json");
+            parsed
+                .messages
+                .iter()
+                .map(|record| {
+                    let mut record = record.clone();
+                    if !wants_content {
+                        record.content = None;
+                    }
+                    if !wants_json {
+                        record.content_json = None;
+                    }
+                    CanonicalRecord::Message(record)
+                })
+                .collect()
+        }
+        TableName::ToolCalls => {
+            let wants_arguments = projected(projection, "arguments");
+            let wants_output = projected(projection, "output");
+            parsed
+                .tool_calls
+                .iter()
+                .map(|record| {
+                    let mut record = record.clone();
+                    if !wants_arguments {
+                        record.arguments = None;
+                    }
+                    if !wants_output {
+                        record.output = None;
+                    }
+                    CanonicalRecord::ToolCall(record)
+                })
+                .collect()
+        }
+        TableName::Usage => parsed
+            .usage
+            .iter()
+            .cloned()
+            .map(CanonicalRecord::Usage)
+            .collect(),
+        _ => VecDeque::new(),
+    }
+}
+
+impl Iterator for TranscriptStream {
+    type Item = Result<CanonicalRecord, AdapterError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished
+            || self
+                .request
+                .limit
+                .is_some_and(|limit| self.emitted >= limit)
+        {
+            self.finished = true;
+            return None;
+        }
+        loop {
+            if let Some(current) = self.current.as_mut() {
+                if current.since_check >= REPLAY_CHECK_RECORDS {
+                    if let Err(error) = check_scan_state(
+                        &self.request.cancellation,
+                        &self.request.budget,
+                        self.emitted,
+                        self.request.budget.bytes_read_used(),
+                    ) {
+                        self.finished = true;
+                        return Some(Err(error));
+                    }
+                    current.since_check = 0;
+                }
+                if let Some(record) = current.records.pop_front() {
+                    if let Err(error) = self.request.budget.charge_records(1) {
+                        self.finished = true;
+                        return Some(Err(error));
+                    }
+                    current.since_check += 1;
+                    self.emitted += 1;
+                    return Some(Ok(record));
+                }
+            } else {
+                if let Err(error) = check_scan_state(
+                    &self.request.cancellation,
+                    &self.request.budget,
+                    self.emitted,
+                    self.request.budget.bytes_read_used(),
+                ) {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+                let Some(descriptor) = self.descriptors.pop_front() else {
+                    self.finished = true;
+                    return None;
+                };
+                match load_parsed(
+                    &self.root,
+                    descriptor,
+                    &self.mains,
+                    &self.request,
+                    &self.diagnostics,
+                    &self.cache,
+                ) {
+                    Ok(loaded) => {
+                        let records = replay_records(
+                            &loaded.parsed,
+                            self.request.table,
+                            &self.request.projection,
+                        );
+                        self.current = Some(ReplayFile {
+                            descriptor: loaded.logical.descriptor,
+                            records,
+                            recheck: loaded.from_cache,
+                            since_check: 0,
+                        });
+                    }
+                    Err(error) => {
+                        self.finished = true;
+                        return Some(Err(error));
+                    }
+                }
+                continue;
+            }
+            // The current file's records are drained; a cache-sourced parse
+            // still owes the §9 end-of-scan identity re-check.
+            let current = self.current.take()?;
+            if current.recheck
+                && let Err(error) = revalidate_transcript_path(&self.root, &current.descriptor)
+            {
+                self.finished = true;
+                return Some(Err(error));
+            }
+        }
     }
 }
 
@@ -723,8 +844,16 @@ fn first_identity(
 ) -> Result<String, AdapterError> {
     let file = open_transcript(root, descriptor)?;
     let mut reader = BufReader::new(file.take(descriptor.len));
+    let mut line = Vec::new();
     loop {
-        let Some((line, complete, bytes)) = read_limited_line(&mut reader)? else {
+        let Some((complete, bytes)) = read_limited_line(
+            &mut reader,
+            &mut line,
+            MAX_RECORD_BYTES,
+            "claude_record_bytes",
+            "claude_transcript_read",
+        )?
+        else {
             return Err(AdapterError::UnsupportedFormat {
                 stage: "claude_transcript_identity".to_string(),
             });
@@ -880,11 +1009,14 @@ struct ParsedMessageContent {
     kind: String,
     only_tool_results: bool,
     tool_result_error: bool,
-    unknown_blocks: bool,
 }
 
+/// Builds the sanitized message view from already validated `blocks` (empty
+/// when `raw` is not a JSON array), so one envelope's content is parsed once
+/// for every table builder.
 fn sanitized_message_content(
     raw: &RawValue,
+    blocks: &[ContentBlock<'_>],
     wants_content: bool,
     wants_json: bool,
     maximum: u64,
@@ -904,10 +1036,8 @@ fn sanitized_message_content(
             kind: "message".to_string(),
             only_tool_results: false,
             tool_result_error: false,
-            unknown_blocks: false,
         });
     }
-    let blocks = content_blocks(raw)?;
     let only_tool_results =
         !blocks.is_empty() && blocks.iter().all(|block| block.kind == "tool_result");
     let tool_result_error = blocks
@@ -916,9 +1046,6 @@ fn sanitized_message_content(
     let has_text = blocks.iter().any(|block| block.kind == "text");
     let has_thinking = blocks.iter().any(|block| block.kind == "thinking");
     let has_tool_use = blocks.iter().any(|block| block.kind == "tool_use");
-    let unknown_blocks = blocks
-        .iter()
-        .any(|block| !matches!(block.kind, "text" | "thinking" | "tool_use" | "tool_result"));
     let kind = match (has_text, has_thinking, has_tool_use, only_tool_results) {
         (_, _, _, true) => "tool_result",
         (false, false, true, false) => "tool_use",
@@ -964,7 +1091,6 @@ fn sanitized_message_content(
         kind,
         only_tool_results,
         tool_result_error,
-        unknown_blocks,
     })
 }
 
@@ -985,34 +1111,6 @@ fn raw_string(raw: &RawValue, maximum: u64) -> Result<String, AdapterError> {
     serde_json::from_str(raw.get()).map_err(|_| AdapterError::CorruptSource {
         stage: "claude_sensitive_string".to_string(),
     })
-}
-
-fn append_content(
-    current: &mut Option<String>,
-    value: &str,
-    maximum: u64,
-) -> Result<(), AdapterError> {
-    let separator = usize::from(current.is_some());
-    let existing = current.as_ref().map_or(0, String::len);
-    let total = existing
-        .checked_add(separator)
-        .and_then(|value_len| value_len.checked_add(value.len()))
-        .ok_or_else(|| AdapterError::BudgetExceeded {
-            resource: "single_value_bytes".to_string(),
-            actual: u64::MAX,
-        })?;
-    if total as u64 > maximum {
-        return Err(AdapterError::BudgetExceeded {
-            resource: "single_value_bytes".to_string(),
-            actual: total as u64,
-        });
-    }
-    let target = current.get_or_insert_with(String::new);
-    if !target.is_empty() {
-        target.push('\n');
-    }
-    target.push_str(value);
-    Ok(())
 }
 
 fn bounded_json(raw: &RawValue, maximum: u64) -> Result<Option<serde_json::Value>, AdapterError> {
@@ -1179,40 +1277,4 @@ fn warn_unknown(diagnostics: &ScanDiagnostics) -> Result<(), AdapterError> {
         source_kind: "claude_transcript".to_string(),
         stage: "unknown_event".to_string(),
     })
-}
-
-fn read_limited_line(
-    reader: &mut BufReader<Take<File>>,
-) -> Result<Option<(Vec<u8>, bool, usize)>, AdapterError> {
-    let mut output = Vec::new();
-    let mut consumed = 0;
-    loop {
-        let buffer = reader
-            .fill_buf()
-            .map_err(|_| AdapterError::PermissionDenied {
-                stage: "claude_transcript_read".to_string(),
-            })?;
-        if buffer.is_empty() {
-            return if output.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some((output, false, consumed)))
-            };
-        }
-        let newline = buffer.iter().position(|byte| *byte == b'\n');
-        let take = newline.map_or(buffer.len(), |index| index + 1);
-        let payload = if newline.is_some() { take - 1 } else { take };
-        if output.len() + payload > MAX_RECORD_BYTES {
-            return Err(AdapterError::BudgetExceeded {
-                resource: "claude_record_bytes".to_string(),
-                actual: (output.len() + payload) as u64,
-            });
-        }
-        output.extend_from_slice(&buffer[..payload]);
-        reader.consume(take);
-        consumed += take;
-        if newline.is_some() {
-            return Ok(Some((output, true, consumed)));
-        }
-    }
 }

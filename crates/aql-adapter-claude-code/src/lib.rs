@@ -5,21 +5,26 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use aql_adapter_api::{
     AdapterError, AdapterSchema, AgentAdapter, Capabilities, ColumnCapability, ColumnName,
     ProbeRequest, ProbeResult, PushdownReport, PushdownState, ScanDiagnostics, ScanRequest,
     ScanResult, SnapshotReport, SnapshotStrength, TableName, check_scan_state,
+    util::{column_capability, normalize_limit, projected},
     validate_projection_access,
 };
 use aql_model::{
-    AccessClass, CanonicalRecord, EntityId, IdentityConfidence, NativeId, SessionEdgeRecord,
-    SessionRecord, SnapshotState, SourceId, SourceManifest,
+    CanonicalRecord, EntityId, IdentityConfidence, NativeId, SessionEdgeRecord, SessionRecord,
+    SnapshotState, SourceId, SourceManifest,
 };
 use chrono::{DateTime, Utc};
 
+mod cache;
 mod transcript;
+
+use cache::{ParseCache, ParseCacheHandle};
+use transcript::SessionSummary;
 
 const FORMAT: &str = "claude-code-2.x-jsonl-observed-v1";
 const MAX_TRANSCRIPTS: usize = 100_000;
@@ -29,9 +34,14 @@ pub(crate) type MainTranscripts = BTreeSet<(String, String)>;
 type TranscriptInventory = (Vec<TranscriptDescriptor>, MainTranscripts);
 
 /// Read-only adapter for bounded Claude Code project transcripts.
+///
+/// One adapter instance serves one query (callers rebind sources per query);
+/// `parse_cache` holds the single-pass parse of each transcript for that
+/// lifetime only, bounded by an in-memory byte cap.
 pub struct ClaudeCodeAdapter {
     installation_salt: Vec<u8>,
     roots: Mutex<BTreeMap<SourceId, RootBinding>>,
+    parse_cache: ParseCacheHandle,
 }
 
 #[derive(Clone)]
@@ -74,6 +84,7 @@ struct SessionStream {
     root: RootBinding,
     request: ScanRequest,
     diagnostics: ScanDiagnostics,
+    cache: ParseCacheHandle,
     descriptors: VecDeque<TranscriptDescriptor>,
     mains: MainTranscripts,
     emitted: u64,
@@ -97,6 +108,20 @@ impl ClaudeCodeAdapter {
         Self {
             installation_salt: installation_salt.into(),
             roots: Mutex::new(BTreeMap::new()),
+            parse_cache: Arc::new(Mutex::new(ParseCache::new())),
+        }
+    }
+
+    /// Creates an adapter with a test-sized parse cache limit.
+    #[cfg(test)]
+    pub(crate) fn new_with_parse_cache_limit(
+        installation_salt: impl Into<Vec<u8>>,
+        parse_cache_bytes: usize,
+    ) -> Self {
+        Self {
+            installation_salt: installation_salt.into(),
+            roots: Mutex::new(BTreeMap::new()),
+            parse_cache: Arc::new(Mutex::new(ParseCache::with_limit(parse_cache_bytes))),
         }
     }
 
@@ -246,14 +271,20 @@ impl AgentAdapter for ClaudeCodeAdapter {
                 root,
                 request,
                 diagnostics: diagnostics.clone(),
+                cache: Arc::clone(&self.parse_cache),
                 descriptors: descriptors.into(),
                 mains,
                 emitted: 0,
                 finished: false,
             }) as aql_adapter_api::RecordStream,
-            TableName::Messages | TableName::ToolCalls | TableName::Usage => {
-                transcript::scan(root, descriptors, mains, request, diagnostics.clone())
-            }
+            TableName::Messages | TableName::ToolCalls | TableName::Usage => transcript::scan(
+                root,
+                descriptors,
+                mains,
+                request,
+                diagnostics.clone(),
+                Arc::clone(&self.parse_cache),
+            ),
             TableName::SessionEdges => Box::new(EdgeStream {
                 root,
                 request,
@@ -309,27 +340,46 @@ impl Iterator for SessionStream {
             return Some(Err(error));
         }
         let descriptor = self.descriptors.pop_front()?;
-        let logical = match transcript::resolve_logical(
-            &self.root,
-            descriptor,
-            &self.mains,
-            &self.request,
-            &self.diagnostics,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                self.finished = true;
-                return Some(Err(error));
-            }
-        };
-        let summary =
-            match transcript::summarize(&self.root, &logical, &self.request, &self.diagnostics) {
+        let (logical, summary) = if wants_session_summary(&self.request.projection) {
+            let loaded = match transcript::load_parsed(
+                &self.root,
+                descriptor,
+                &self.mains,
+                &self.request,
+                &self.diagnostics,
+                &self.cache,
+            ) {
                 Ok(value) => value,
                 Err(error) => {
                     self.finished = true;
                     return Some(Err(error));
                 }
             };
+            if loaded.from_cache
+                && let Err(error) =
+                    revalidate_transcript_path(&self.root, &loaded.logical.descriptor)
+            {
+                self.finished = true;
+                return Some(Err(error));
+            }
+            let summary = mask_session_summary(&loaded.parsed.summary, &self.request.projection);
+            (loaded.logical, summary)
+        } else {
+            let logical = match transcript::resolve_logical(
+                &self.root,
+                descriptor,
+                &self.mains,
+                &self.request,
+                &self.diagnostics,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+            };
+            (logical, SessionSummary::empty())
+        };
         let native_id = NativeId::new(logical.logical_native.clone());
         let record = SessionRecord {
             session_id: EntityId::from_parts(
@@ -690,6 +740,72 @@ pub(crate) fn revalidate_transcript(
     validate_descriptor_chain(root, descriptor)
 }
 
+/// Re-checks one transcript by path at the end of a cache replay: the same
+/// identity/length watermark `open_transcript` enforces, aligned with the §9
+/// scan-end check for parses that were not re-read this scan.
+pub(crate) fn revalidate_transcript_path(
+    root: &RootBinding,
+    descriptor: &TranscriptDescriptor,
+) -> Result<(), AdapterError> {
+    validate_descriptor_chain(root, descriptor)?;
+    let metadata = fs::symlink_metadata(&descriptor.path).map_err(|_| AdapterError::NotFound {
+        stage: "claude_transcript".to_string(),
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || aql_fs::file_identity(&descriptor.path).map_err(|_| AdapterError::SnapshotUnavailable)?
+            != descriptor.identity
+        || metadata.len() < descriptor.len
+    {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    Ok(())
+}
+
+/// Returns whether the projection needs any transcript-derived session
+/// summary column; Safe-only identity projections skip transcript reads.
+fn wants_session_summary(projection: &[ColumnName]) -> bool {
+    [
+        "preview",
+        "cwd",
+        "project",
+        "model",
+        "created_at",
+        "message_count",
+        "tool_call_count",
+        "tokens_used",
+    ]
+    .iter()
+    .any(|name| projected(projection, name))
+}
+
+/// Masks a cached summary down to the requesting projection, reproducing the
+/// per-column gating the pre-cache summarize pass applied.
+fn mask_session_summary(summary: &SessionSummary, projection: &[ColumnName]) -> SessionSummary {
+    let wants_path = projected(projection, "cwd") || projected(projection, "project");
+    SessionSummary {
+        preview: projected(projection, "preview")
+            .then(|| summary.preview.clone())
+            .flatten(),
+        cwd: wants_path.then(|| summary.cwd.clone()).flatten(),
+        model: projected(projection, "model")
+            .then(|| summary.model.clone())
+            .flatten(),
+        created_at: projected(projection, "created_at")
+            .then_some(summary.created_at)
+            .flatten(),
+        message_count: projected(projection, "message_count")
+            .then_some(summary.message_count)
+            .flatten(),
+        tool_call_count: projected(projection, "tool_call_count")
+            .then_some(summary.tool_call_count)
+            .flatten(),
+        tokens_used: projected(projection, "tokens_used")
+            .then_some(summary.tokens_used)
+            .flatten(),
+    }
+}
+
 fn safe_component(value: &str, maximum: usize) -> bool {
     !matches!(value, "." | "..")
         && !value.is_empty()
@@ -717,73 +833,55 @@ fn uuid(value: &str) -> bool {
         })
 }
 
-fn normalize_limit(request: &mut ScanRequest) -> Option<PushdownState> {
-    request.limit.map(|_| {
-        if request.predicates.is_empty() && request.order_hint.is_empty() {
-            PushdownState::Exact
-        } else {
-            request.limit = None;
-            PushdownState::Unsupported
-        }
-    })
-}
-
-pub(crate) fn projected(projection: &[ColumnName], name: &str) -> bool {
-    projection.iter().any(|column| column.as_str() == name)
-}
-
 fn columns() -> Vec<ColumnCapability> {
     [
-        ("session_id", AccessClass::Safe),
-        ("native_id", AccessClass::Safe),
-        ("source_id", AccessClass::Safe),
-        ("agent_id", AccessClass::Safe),
-        ("title", AccessClass::Content),
-        ("preview", AccessClass::Content),
-        ("cwd", AccessClass::Path),
-        ("project", AccessClass::Path),
-        ("created_at", AccessClass::Safe),
-        ("updated_at", AccessClass::Safe),
-        ("archived", AccessClass::Safe),
-        ("model", AccessClass::Safe),
-        ("provider", AccessClass::Safe),
-        ("message_count", AccessClass::Safe),
-        ("tool_call_count", AccessClass::Safe),
-        ("tokens_used", AccessClass::Safe),
-        ("message_id", AccessClass::Safe),
-        ("sequence", AccessClass::Safe),
-        ("role", AccessClass::Safe),
-        ("kind", AccessClass::Safe),
-        ("content", AccessClass::Content),
-        ("content_json", AccessClass::Content),
-        ("is_error", AccessClass::Safe),
-        ("tool_call_id", AccessClass::Safe),
-        ("tool_name", AccessClass::Safe),
-        ("namespace", AccessClass::Safe),
-        ("arguments", AccessClass::ToolInput),
-        ("output", AccessClass::ToolOutput),
-        ("status", AccessClass::Safe),
-        ("started_at", AccessClass::Safe),
-        ("ended_at", AccessClass::Safe),
-        ("duration_ms", AccessClass::Safe),
-        ("exit_code", AccessClass::Safe),
-        ("usage_id", AccessClass::Safe),
-        ("bucket_start", AccessClass::Safe),
-        ("input_tokens", AccessClass::Safe),
-        ("output_tokens", AccessClass::Safe),
-        ("cached_tokens", AccessClass::Safe),
-        ("total_tokens", AccessClass::Safe),
-        ("error_count", AccessClass::Safe),
-        ("edge_id", AccessClass::Safe),
-        ("parent_session_id", AccessClass::Safe),
-        ("child_session_id", AccessClass::Safe),
-        ("edge_kind", AccessClass::Safe),
-        ("native_edge_id", AccessClass::Safe),
+        "session_id",
+        "native_id",
+        "source_id",
+        "agent_id",
+        "title",
+        "preview",
+        "cwd",
+        "project",
+        "created_at",
+        "updated_at",
+        "archived",
+        "model",
+        "provider",
+        "message_count",
+        "tool_call_count",
+        "tokens_used",
+        "message_id",
+        "sequence",
+        "role",
+        "kind",
+        "content",
+        "content_json",
+        "is_error",
+        "tool_call_id",
+        "tool_name",
+        "namespace",
+        "arguments",
+        "output",
+        "status",
+        "started_at",
+        "ended_at",
+        "duration_ms",
+        "exit_code",
+        "usage_id",
+        "bucket_start",
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+        "total_tokens",
+        "error_count",
+        "edge_id",
+        "parent_session_id",
+        "child_session_id",
+        "edge_kind",
+        "native_edge_id",
     ]
     .into_iter()
-    .map(|(name, access)| ColumnCapability {
-        name: ColumnName::new(name),
-        access,
-    })
+    .map(column_capability)
     .collect()
 }
