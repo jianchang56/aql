@@ -40,6 +40,35 @@ pub fn identity(metadata: &Metadata) -> FileIdentity {
     }
 }
 
+/// Failure to bind the identity of an optional regular file.
+#[derive(Debug)]
+pub enum OptionalFileError {
+    /// The path exists but is a symlink or not a regular file.
+    NotRegularFile,
+    /// The file exists but its identity could not be established.
+    IdentityUnavailable,
+    /// Metadata access failed for a reason other than the file being absent.
+    Io(io::Error),
+}
+
+/// Returns the identity of an optional regular file, or `None` when absent.
+///
+/// Symlinks and non-regular files are rejected so identity binding fails
+/// closed instead of following a replaced path. Absence is not an error:
+/// optional sidecars such as SQLite `-wal`/`-shm` files come and go.
+pub fn optional_file_identity(path: &Path) -> Result<Option<FileIdentity>, OptionalFileError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(OptionalFileError::NotRegularFile)
+        }
+        Ok(_) => file_identity(path)
+            .map(Some)
+            .map_err(|_| OptionalFileError::IdentityUnavailable),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(OptionalFileError::Io(error)),
+    }
+}
+
 /// Opens a directory without following symlinks and returns its identity.
 pub fn directory_identity(path: &Path) -> io::Result<FileIdentity> {
     let directory = open_dir(path)?;

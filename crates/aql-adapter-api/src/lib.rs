@@ -15,6 +15,8 @@ use thiserror::Error;
 
 pub use aql_model as model;
 
+pub mod util;
+
 /// Input to a bounded source probe.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProbeRequest {
