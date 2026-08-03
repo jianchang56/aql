@@ -217,7 +217,35 @@ fn merge_session(
             .or_default()
             .extend(provenance);
     }
-    existing.extensions.extend(incoming.extensions);
+    merge_extensions(
+        &existing.session_id,
+        &mut existing.extensions,
+        incoming.extensions,
+        warnings,
+    );
+}
+
+/// Extension keys merge per key with the incoming value winning, but a key
+/// present on both sides with a different value is a conflict like any other
+/// field and must not be overwritten silently.
+fn merge_extensions<T: PartialEq>(
+    entity_id: &EntityId,
+    existing: &mut BTreeMap<String, T>,
+    incoming: BTreeMap<String, T>,
+    warnings: &mut Vec<CatalogWarning>,
+) {
+    for (key, value) in incoming {
+        if let Some(current) = existing.get(&key)
+            && *current != value
+        {
+            warnings.push(CatalogWarning {
+                kind: CatalogWarningKind::FieldConflict,
+                entity_id: entity_id.clone(),
+                field: Some(format!("extensions.{key}")),
+            });
+        }
+        existing.insert(key, value);
+    }
 }
 
 fn merge_field<T: Clone + PartialEq>(
@@ -398,5 +426,53 @@ mod tests {
             CanonicalRecord::Session(rollout),
         ]);
         assert_eq!(result.records[0].title.as_deref(), Some("Database"));
+    }
+
+    #[test]
+    fn conflicting_extension_keys_warn_and_take_the_incoming_value() {
+        let mut existing = session("codex:root-a", "session-1", "Synthetic", "state_database");
+        existing
+            .extensions
+            .insert("codex.tone".to_string(), 1_i64.into());
+        existing
+            .extensions
+            .insert("codex.same".to_string(), 7_i64.into());
+        let mut incoming = session("codex:root-a", "session-1", "Synthetic", "state_database");
+        incoming
+            .extensions
+            .insert("codex.tone".to_string(), 2_i64.into());
+        incoming
+            .extensions
+            .insert("codex.same".to_string(), 7_i64.into());
+        incoming
+            .extensions
+            .insert("codex.new".to_string(), 3_i64.into());
+        let expected_tone = incoming.extensions.get("codex.tone").cloned();
+
+        let result = Catalog.reconcile_sessions(vec![
+            CanonicalRecord::Session(existing),
+            CanonicalRecord::Session(incoming),
+        ]);
+        let merged = &result.records[0];
+        assert_eq!(
+            merged.extensions.get("codex.tone"),
+            expected_tone.as_ref(),
+            "the incoming value still wins the conflicting key"
+        );
+        assert!(
+            merged.extensions.contains_key("codex.new"),
+            "disjoint keys merge silently"
+        );
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "only the differing shared key warns: {:?}",
+            result.warnings
+        );
+        assert_eq!(result.warnings[0].kind, CatalogWarningKind::FieldConflict);
+        assert_eq!(
+            result.warnings[0].field.as_deref(),
+            Some("extensions.codex.tone")
+        );
     }
 }
