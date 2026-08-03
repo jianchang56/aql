@@ -322,7 +322,7 @@ fn sql_file_input_is_bounded_regular_and_no_follow() {
 
 #[test]
 fn errors_have_stable_hints_for_database_workflows() {
-    let database = database_not_found("unknown database; run SHOW DATABASES");
+    let database = database_not_found("unknown database; run `aql database list`");
     assert_eq!(error_category(&database), "not_found");
     assert_eq!(error_exit_code(&database), 4);
     assert!(error_hint(&database).is_some());
@@ -343,7 +343,7 @@ fn command_line_and_shell_errors_offer_contextual_recovery() {
     };
     assert!(cli_parse_error_hint(&missing_database).contains("aql database list"));
 
-    let access = aql_engine_datafusion::QueryError::AccessDenied("content");
+    let access = aql_engine_datafusion::QueryError::AccessDenied(AccessClass::Content);
     let rendered = shell_query_error(&access);
     assert!(rendered.contains("GRANT CONTENT FOR SESSION;"));
     assert!(!rendered.contains("--access"));
@@ -407,6 +407,13 @@ fn shell_welcome_guides_selection_without_choosing_a_default() {
         selected
             .iter()
             .any(|line| line == "Selected database: codex")
+    );
+
+    let empty = shell_welcome(&[], None);
+    assert!(
+        empty
+            .iter()
+            .any(|line| line == "no database found; exit and run `aql database discover`")
     );
 }
 
@@ -534,13 +541,20 @@ fn polling_ctrl_c_arms_pending_and_cancels_ready_signals() {
     });
 }
 
+fn json_field(name: &str, nullable: bool) -> Field {
+    Field::new(name, DataType::Utf8, nullable).with_metadata(std::collections::HashMap::from([(
+        aql_engine_datafusion::JSON_TYPE_METADATA_KEY.to_string(),
+        aql_engine_datafusion::JSON_TYPE_METADATA_VALUE.to_string(),
+    )]))
+}
+
 #[test]
 fn json_output_preserves_arrow_types_and_json_columns() {
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("count", DataType::Int64, false),
             Field::new("ok", DataType::Boolean, false),
-            Field::new("arguments", DataType::Utf8, true),
+            json_field("arguments", true),
             Field::new("missing", DataType::Utf8, true),
         ])),
         vec![
@@ -556,6 +570,29 @@ fn json_output_preserves_arrow_types_and_json_columns() {
     assert_eq!(rows[0]["ok"], serde_json::json!(true));
     assert_eq!(rows[0]["arguments"], serde_json::json!({"synthetic": true}));
     assert_eq!(rows[0]["missing"], serde_json::Value::Null);
+}
+
+#[test]
+fn json_output_detection_uses_field_metadata_not_column_names() {
+    // `SELECT arguments AS args` keeps the engine's JSON marker, while
+    // `SELECT model AS arguments` is plain text despite the JSON-looking name.
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            json_field("args", true),
+            Field::new("arguments", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec![Some("{\"synthetic\":true}")])),
+            Arc::new(StringArray::from(vec![Some("{\"synthetic\":true}")])),
+        ],
+    )
+    .expect("synthetic batch must be valid");
+    let rows = batches_to_values(&[batch]).expect("metadata-driven JSON conversion must succeed");
+    assert_eq!(rows[0]["args"], serde_json::json!({"synthetic": true}));
+    assert_eq!(
+        rows[0]["arguments"],
+        serde_json::json!("{\"synthetic\":true}")
+    );
 }
 
 #[test]
@@ -743,7 +780,7 @@ fn csv_output_preserves_typed_json_and_timestamp_values() {
         Arc::new(Schema::new(vec![
             Field::new("count", DataType::Int64, false),
             Field::new("ok", DataType::Boolean, false),
-            Field::new("arguments", DataType::Utf8, false),
+            json_field("arguments", false),
             Field::new(
                 "created_at",
                 DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -803,14 +840,14 @@ fn csv_output_rejects_controls_and_inconsistent_schemas() {
 
 #[test]
 fn csv_output_escapes_formula_text_under_json_column_names() {
-    // Canonical JSON column names are not a security signal: output field
-    // names are user-controllable aliases, so formula escaping must apply to
-    // JSON-parsed string payloads too.
+    // The JSON field metadata is not a security signal: metadata survives
+    // user-controllable aliases, so formula escaping must apply to JSON-parsed
+    // string payloads too.
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
-            Field::new("arguments", DataType::Utf8, false),
-            Field::new("content_json", DataType::Utf8, false),
-            Field::new("capabilities", DataType::Utf8, false),
+            json_field("arguments", false),
+            json_field("content_json", false),
+            json_field("capabilities", false),
         ])),
         vec![
             Arc::new(StringArray::from(vec!["\"=1+1\""])),
@@ -1022,13 +1059,15 @@ fn agents_plan_capability_is_manifest_derived() {
 fn stable_error_categories_have_stable_exit_codes() {
     assert_eq!(
         error_exit_code(&aql_engine_datafusion::QueryError::SqlRejected {
-            stage: "parse",
+            stage: aql_engine_datafusion::SqlStage::Parse,
             reason: "synthetic",
         }),
         2
     );
     assert_eq!(
-        error_exit_code(&aql_engine_datafusion::QueryError::AccessDenied("content")),
+        error_exit_code(&aql_engine_datafusion::QueryError::AccessDenied(
+            AccessClass::Content
+        )),
         3
     );
     assert_eq!(
@@ -1079,12 +1118,55 @@ fn stable_error_categories_have_stable_exit_codes() {
     assert_eq!(error_category(&cancelled), "cancelled");
     assert_eq!(error_exit_code(&cancelled), 130);
     let parameters = aql_engine_datafusion::QueryError::SqlRejected {
-        stage: "parameters",
+        stage: aql_engine_datafusion::SqlStage::Parameters,
         reason: "synthetic",
     };
     assert_eq!(error_stage(&parameters), "parameters");
     assert!(error_hint(&parameters).is_some());
     assert_eq!(error_location(&parameters), None);
+
+    let lifecycle = aql_engine_datafusion::QueryError::StreamLifecycle {
+        reason: "synthetic",
+    };
+    assert_eq!(
+        lifecycle.to_string(),
+        "SQL rejected at stage metadata: synthetic"
+    );
+    assert_eq!(error_category(&lifecycle), "invalid_request");
+    assert_eq!(error_exit_code(&lifecycle), 2);
+    assert_eq!(error_stage(&lifecycle), "metadata");
+    assert!(error_hint(&lifecycle).is_none());
+}
+
+#[test]
+fn operational_sql_stages_have_stable_hints() {
+    for stage in [
+        aql_engine_datafusion::SqlStage::Parse,
+        aql_engine_datafusion::SqlStage::Parameters,
+        aql_engine_datafusion::SqlStage::Allowlist,
+        aql_engine_datafusion::SqlStage::Wildcard,
+        aql_engine_datafusion::SqlStage::Complexity,
+        aql_engine_datafusion::SqlStage::Bind,
+        aql_engine_datafusion::SqlStage::Budget,
+    ] {
+        let error = aql_engine_datafusion::QueryError::SqlRejected {
+            stage,
+            reason: "synthetic",
+        };
+        assert_eq!(error_stage(&error), stage.as_str());
+        assert!(
+            error_hint(&error).is_some(),
+            "stage {} must offer a recovery hint",
+            stage.as_str()
+        );
+    }
+    // Internal query metadata state is not user-actionable and stays hintless.
+    let metadata = aql_engine_datafusion::QueryError::SqlRejected {
+        stage: aql_engine_datafusion::SqlStage::Metadata,
+        reason: "synthetic",
+    };
+    assert_eq!(error_stage(&metadata), "metadata");
+    assert!(error_hint(&metadata).is_none());
 }
 
 #[test]

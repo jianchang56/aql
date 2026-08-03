@@ -26,8 +26,8 @@ use aql_config::{
     CONFIG_SCHEMA_VERSION, ConfigError, ConfigStore, Database as ConfiguredDatabase, DatabaseMember,
 };
 use aql_engine_datafusion::{
-    FederatedSource, QUERY_SCHEMAS, QueryDataType, QueryOptions, SqlParameter, bind_sql_parameters,
-    prepare_query, validate_read_only_sql,
+    FederatedSource, QUERY_SCHEMAS, QueryDataType, QueryOptions, QuerySession, SqlParameter,
+    bind_sql_parameters, prepare_query, validate_read_only_sql,
 };
 use aql_model::AccessClass;
 use cap_std::fs::OpenOptions as CapOpenOptions;
@@ -44,6 +44,7 @@ use rustyline::{Context, Helper};
 mod cli_args;
 mod command_artifacts;
 mod database;
+mod error_rendering;
 mod output;
 mod query_runtime;
 mod render;
@@ -52,6 +53,7 @@ mod shell;
 use cli_args::*;
 use command_artifacts::*;
 use database::*;
+use error_rendering::*;
 #[cfg(test)]
 use output::SecureOutputFile;
 use output::TransactionalOutput;
@@ -83,6 +85,8 @@ enum CliErrorHint {
     None,
     DatabaseSelection,
     SqlInput,
+    SchemaList,
+    ExamplesList,
 }
 
 #[derive(Debug)]
@@ -169,7 +173,7 @@ impl CliError {
     }
 }
 
-const MAX_SQL_INPUT_BYTES: u64 = 64 * 1024;
+const MAX_SQL_INPUT_BYTES: u64 = aql_engine_datafusion::MAX_SQL_BYTES as u64;
 
 fn read_sql_input(
     sql: Option<String>,
@@ -323,6 +327,16 @@ fn requested_error_format() -> ErrorFormat {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_query_session(cli, None).await
+}
+
+/// Runs one command, optionally reusing a shell-scoped engine session for the
+/// query path. The non-interactive entry point passes no session and keeps
+/// building a fresh DataFusion state per process.
+async fn run_with_query_session(
+    cli: Cli,
+    query_session: Option<&QuerySession>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let quiet = cli.quiet;
     let Some(command) = cli.command else {
         return run_shell(None).await;
@@ -422,6 +436,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     stdin,
                 },
                 quiet,
+                query_session,
             )
             .await?;
         }
@@ -461,6 +476,7 @@ struct QueryRequest {
 async fn execute_query(
     request: QueryRequest,
     quiet: bool,
+    query_session: Option<&QuerySession>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let QueryRequest {
         database,
@@ -486,12 +502,7 @@ async fn execute_query(
         16 * 1024 * 1024,
         parse_byte_size,
     )?;
-    let max_memory_bytes = usize::try_from(environment_u64(
-        "AQL_MAX_MEMORY_BYTES",
-        256 * 1024 * 1024,
-        parse_byte_size,
-    )?)
-    .map_err(|_| invalid_argument("AQL_MAX_MEMORY_BYTES is too large"))?;
+    let max_memory_bytes = max_memory_bytes()?;
     let (query_budget, deadline) = execution_budget(
         max_records,
         max_bytes_read,
@@ -526,10 +537,12 @@ async fn execute_query(
     let budget = options.budget.clone();
     let authorize_started = Instant::now();
     let authorization_timeout = remaining_timeout(deadline)?;
-    let prepared = tokio::time::timeout(
-        authorization_timeout,
-        prepare_query(&validated_sql, options),
-    )
+    let prepared = tokio::time::timeout(authorization_timeout, async move {
+        match query_session {
+            Some(session) => session.prepare_query(&validated_sql, options).await,
+            None => prepare_query(&validated_sql, options).await,
+        }
+    })
     .await
     .map_err(|_| deadline_exceeded("query timed out"))??;
     diagnostic_timing(diagnostics, "authorize", authorize_started);
@@ -554,58 +567,183 @@ async fn execute_query(
         return Err(source_unavailable("probe returned no compatible source").into());
     }
     if explain {
-        let summary = prepared.plan_summary();
-        let mut rendered = String::new();
-        use std::fmt::Write as _;
-        writeln!(rendered, "plan.tables={}", summary.tables.join(","))?;
-        writeln!(rendered, "plan.columns={}", summary.columns.join(","))?;
-        writeln!(
-            rendered,
-            "plan.required_access={}",
-            summary.required_access.join(",")
-        )?;
-        for reason in &summary.access_reasons {
-            writeln!(rendered, "plan.access_reason={reason}")?;
-        }
-        for pushdown in &summary.pushdown {
-            writeln!(rendered, "plan.pushdown={pushdown}")?;
-        }
-        writeln!(rendered, "plan.max_records={}", summary.max_records)?;
-        writeln!(rendered, "plan.max_bytes_read={}", summary.max_bytes_read)?;
-        writeln!(
-            rendered,
-            "plan.max_output_bytes={}",
-            summary.max_output_bytes
-        )?;
-        writeln!(
-            rendered,
-            "plan.max_memory_bytes={}",
-            summary.max_memory_bytes
-        )?;
-        for source in &sources {
-            writeln!(rendered, "plan.source_id={}", source.manifest.source_id)?;
-            writeln!(
-                rendered,
-                "plan.format={}",
-                source.manifest.format_fingerprint
-            )?;
-            for table in &summary.tables {
-                let supported = source_supports_table(&source.manifest.capabilities, table);
-                writeln!(
-                    rendered,
-                    "plan.source_capability=source:{},table:{table},supported:{}",
-                    source.manifest.source_id, supported
-                )?;
-            }
-        }
-        poll_ctrl_c(ctrl_c.as_mut(), &cancellation).await?;
-        budget.charge_output_bytes(rendered_publication_len(&rendered) as u64)?;
-        write_rendered(transactional_output.writer(), &rendered, &cancellation)?;
-        poll_ctrl_c(ctrl_c.as_mut(), &cancellation).await?;
-        transactional_output.publish(&cancellation)?;
-        return Ok(());
+        return render_explain(
+            &prepared,
+            &sources,
+            ctrl_c.as_mut(),
+            &cancellation,
+            &budget,
+            transactional_output,
+        )
+        .await;
     }
     let execute_started = Instant::now();
+    let (renderer, metadata, mut render_duration) = consume_stream(
+        prepared,
+        sources,
+        output,
+        StreamControl {
+            budget: &budget,
+            cancellation: &cancellation,
+            ctrl_c: ctrl_c.as_mut(),
+            deadline,
+        },
+        &mut transactional_output,
+    )
+    .await?;
+    diagnostic_timing(diagnostics, "execute", execute_started);
+    if let Err(error) = ensure_before_deadline(deadline) {
+        cancellation.cancel();
+        return Err(error);
+    }
+    let render_started = Instant::now();
+    let summary = renderer.finish(transactional_output.writer())?;
+    render_duration += render_started.elapsed();
+    let metadata = metadata.finish()?;
+    ensure_before_deadline(deadline)?;
+    transactional_output.publish(&cancellation)?;
+    if matches!(output, Output::Table) && summary.returned_rows == 0 && !quiet && !shell_summary {
+        // The empty table on stdout stays byte-identical; the row count is a
+        // human-facing hint and therefore goes to stderr.
+        eprintln!("(0 rows)");
+    }
+    if !quiet {
+        for warning in &metadata.warnings {
+            eprintln!("warning={warning}");
+        }
+    }
+    if diagnostics {
+        eprintln!("metadata.sources={}", metadata.source_ids.join(","));
+        eprintln!("metadata.records_scanned={}", metadata.records_scanned);
+        eprintln!("metadata.bytes_read={}", metadata.bytes_read);
+        for scan in &metadata.scans {
+            eprintln!(
+                "metadata.scan=table:{},source:{},predicates:{},limit:{},ordering:{},snapshot:{},stale:{}",
+                scan.table,
+                scan.source_id,
+                scan.predicate_pushdown.join("+"),
+                scan.limit_pushdown.as_deref().unwrap_or("none"),
+                scan.ordering_pushdown.join("+"),
+                scan.snapshot_strength,
+                scan.stale,
+            );
+        }
+    }
+    if summary.formula_escaped && !quiet {
+        eprintln!("warning=CSV formula-like text was escaped");
+    }
+    if !access.is_empty() && (output_file.is_some() || !io::stdout().is_terminal()) && !quiet {
+        eprintln!("warning=sensitive access was granted for non-terminal output");
+    }
+    diagnostic_duration(diagnostics, "render", render_duration);
+    if shell_summary && !quiet {
+        eprintln!(
+            "({} rows, {} ms)",
+            summary.returned_rows,
+            query_started.elapsed().as_millis()
+        );
+    }
+    Ok(())
+}
+
+async fn render_explain<F>(
+    prepared: &aql_engine_datafusion::PreparedQuery,
+    sources: &[FederatedSource],
+    mut ctrl_c: Pin<&mut F>,
+    cancellation: &CancellationToken,
+    budget: &ResourceBudget,
+    mut transactional_output: TransactionalOutput,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    let summary = prepared.plan_summary();
+    let mut rendered = String::new();
+    use std::fmt::Write as _;
+    writeln!(rendered, "plan.tables={}", summary.tables.join(","))?;
+    writeln!(rendered, "plan.columns={}", summary.columns.join(","))?;
+    writeln!(
+        rendered,
+        "plan.required_access={}",
+        summary.required_access.join(",")
+    )?;
+    for reason in &summary.access_reasons {
+        writeln!(rendered, "plan.access_reason={reason}")?;
+    }
+    for pushdown in &summary.pushdown {
+        writeln!(rendered, "plan.pushdown={pushdown}")?;
+    }
+    writeln!(rendered, "plan.max_records={}", summary.max_records)?;
+    writeln!(rendered, "plan.max_bytes_read={}", summary.max_bytes_read)?;
+    writeln!(
+        rendered,
+        "plan.max_output_bytes={}",
+        summary.max_output_bytes
+    )?;
+    writeln!(
+        rendered,
+        "plan.max_memory_bytes={}",
+        summary.max_memory_bytes
+    )?;
+    for source in sources {
+        writeln!(rendered, "plan.source_id={}", source.manifest.source_id)?;
+        writeln!(
+            rendered,
+            "plan.format={}",
+            source.manifest.format_fingerprint
+        )?;
+        for table in &summary.tables {
+            let supported = source_supports_table(&source.manifest.capabilities, table);
+            writeln!(
+                rendered,
+                "plan.source_capability=source:{},table:{table},supported:{}",
+                source.manifest.source_id, supported
+            )?;
+        }
+    }
+    poll_ctrl_c(ctrl_c.as_mut(), cancellation).await?;
+    budget.charge_output_bytes(rendered_publication_len(&rendered) as u64)?;
+    write_rendered(transactional_output.writer(), &rendered, cancellation)?;
+    poll_ctrl_c(ctrl_c.as_mut(), cancellation).await?;
+    transactional_output.publish(cancellation)?;
+    Ok(())
+}
+
+/// Shared budget, cancellation, signal, and deadline handles for one stream
+/// consumption.
+struct StreamControl<'a, F>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    budget: &'a ResourceBudget,
+    cancellation: &'a CancellationToken,
+    ctrl_c: Pin<&'a mut F>,
+    deadline: Instant,
+}
+
+async fn consume_stream<F>(
+    prepared: aql_engine_datafusion::PreparedQuery,
+    sources: Vec<FederatedSource>,
+    output: Output,
+    control: StreamControl<'_, F>,
+    transactional_output: &mut TransactionalOutput,
+) -> Result<
+    (
+        StreamingRenderer,
+        aql_engine_datafusion::QueryMetadataHandle,
+        Duration,
+    ),
+    Box<dyn std::error::Error>,
+>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    let StreamControl {
+        budget,
+        cancellation,
+        mut ctrl_c,
+        deadline,
+    } = control;
     let execution_timeout = remaining_timeout(deadline)?;
     let deadline_sleep = tokio::time::sleep(execution_timeout);
     tokio::pin!(deadline_sleep);
@@ -665,54 +803,7 @@ async fn execute_query(
             return Err(error);
         }
     }
-    diagnostic_timing(diagnostics, "execute", execute_started);
-    if let Err(error) = ensure_before_deadline(deadline) {
-        cancellation.cancel();
-        return Err(error);
-    }
-    let render_started = Instant::now();
-    let summary = renderer.finish(transactional_output.writer())?;
-    render_duration += render_started.elapsed();
-    let metadata = metadata.finish()?;
-    ensure_before_deadline(deadline)?;
-    transactional_output.publish(&cancellation)?;
-    if !quiet {
-        for warning in &metadata.warnings {
-            eprintln!("warning={warning}");
-        }
-    }
-    if diagnostics {
-        eprintln!("metadata.sources={}", metadata.source_ids.join(","));
-        eprintln!("metadata.records_scanned={}", metadata.records_scanned);
-        eprintln!("metadata.bytes_read={}", metadata.bytes_read);
-        for scan in &metadata.scans {
-            eprintln!(
-                "metadata.scan=table:{},source:{},predicates:{},limit:{},ordering:{},snapshot:{},stale:{}",
-                scan.table,
-                scan.source_id,
-                scan.predicate_pushdown.join("+"),
-                scan.limit_pushdown.as_deref().unwrap_or("none"),
-                scan.ordering_pushdown.join("+"),
-                scan.snapshot_strength,
-                scan.stale,
-            );
-        }
-    }
-    if summary.formula_escaped && !quiet {
-        eprintln!("warning=CSV formula-like text was escaped");
-    }
-    if !access.is_empty() && (output_file.is_some() || !io::stdout().is_terminal()) && !quiet {
-        eprintln!("warning=sensitive access was granted for non-terminal output");
-    }
-    diagnostic_duration(diagnostics, "render", render_duration);
-    if shell_summary && !quiet {
-        eprintln!(
-            "({} rows, {} ms)",
-            summary.returned_rows,
-            query_started.elapsed().as_millis()
-        );
-    }
-    Ok(())
+    Ok((renderer, metadata, render_duration))
 }
 
 async fn poll_ctrl_c<F>(
@@ -728,346 +819,6 @@ where
         return Err(query_cancelled().into());
     }
     Ok(())
-}
-
-fn error_hint(error: &(dyn std::error::Error + 'static)) -> Option<String> {
-    if let Some(cli) = error.downcast_ref::<CliError>() {
-        return match cli.hint {
-            CliErrorHint::None => None,
-            CliErrorHint::DatabaseSelection => {
-                Some("run `aql database list`, then select one with `-d <database>`".to_string())
-            }
-            CliErrorHint::SqlInput => {
-                Some("pass SQL directly, with `--file query.sql`, or with `--stdin`".to_string())
-            }
-        };
-    }
-    if let Some(aql_engine_datafusion::QueryError::SqlRejected { stage, .. }) =
-        error.downcast_ref::<aql_engine_datafusion::QueryError>()
-    {
-        return match *stage {
-            "parse" => Some("check the SQL syntax and pass exactly one query".to_string()),
-            "parameters" => Some(
-                "bind every :name once with --param NAME=VALUE and remove unused parameters"
-                    .to_string(),
-            ),
-            "allowlist" => Some(
-                "use one read-only canonical SELECT, SHOW TABLES, DESCRIBE or EXPLAIN query"
-                    .to_string(),
-            ),
-            "wildcard" => Some(
-                "select explicit canonical columns when wildcard scope is ambiguous".to_string(),
-            ),
-            _ => None,
-        };
-    }
-    if let Some(aql_engine_datafusion::QueryError::AccessDenied(access)) =
-        error.downcast_ref::<aql_engine_datafusion::QueryError>()
-    {
-        return match *access {
-            "content" => Some(access_retry_hint("content", "Content")),
-            "path" => Some(access_retry_hint("path", "Path")),
-            "tool-input" => Some(access_retry_hint("tool-input", "tool input")),
-            "tool-output" => Some(access_retry_hint("tool-output", "tool output")),
-            _ => Some(
-                "run `aql schema <table>` and add only the required temporary access grant"
-                    .to_string(),
-            ),
-        };
-    }
-    if let Some(aql_engine_datafusion::QueryError::Engine(engine)) =
-        error.downcast_ref::<aql_engine_datafusion::QueryError>()
-        && matches!(
-            datafusion_adapter_error(engine),
-            Some(aql_adapter_api::AdapterError::AccessDenied { .. })
-        )
-    {
-        return Some(
-            "run `aql schema <table>` and add only the required temporary access grant".to_string(),
-        );
-    }
-    if matches!(
-        error.downcast_ref::<aql_adapter_api::AdapterError>(),
-        Some(aql_adapter_api::AdapterError::AccessDenied { .. })
-    ) {
-        return Some(
-            "run `aql schema <table>` and add only the required temporary access grant".to_string(),
-        );
-    }
-    None
-}
-
-fn access_retry_hint(access: &str, label: &str) -> String {
-    if io::stderr().is_terminal()
-        && let Some(command) = retry_query_command(access)
-    {
-        return format!("retry only if {label} is genuinely needed: `{command}`");
-    }
-    format!("retry with `--access {access}` only when the query genuinely needs {label}")
-}
-
-fn retry_query_command(access: &str) -> Option<String> {
-    let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    let query_index = arguments.iter().position(|argument| argument == "query")?;
-    if arguments
-        .windows(2)
-        .any(|pair| pair == ["--access", access])
-    {
-        return None;
-    }
-    arguments.splice(
-        query_index + 1..query_index + 1,
-        ["--access".to_string(), access.to_string()],
-    );
-    Some(
-        std::iter::once("aql".to_string())
-            .chain(arguments)
-            .map(|argument| shell_quote(&argument))
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
-}
-
-fn shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'=' | b':')
-        })
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\"'\"'"))
-    }
-}
-
-fn render_error(error: &(dyn std::error::Error + 'static), format: ErrorFormat) {
-    let category = error_category(error);
-    let exit_code = error_exit_code(error);
-    let hint = error_hint(error);
-    let stage = error_stage(error);
-    let location = error_location(error);
-    match format {
-        ErrorFormat::Text => {
-            eprintln!("error_category={category}");
-            eprintln!("error_stage={stage}");
-            if let Some((line, column)) = location {
-                eprintln!("error_location=line:{line},column:{column}");
-            }
-            eprintln!("error={error}");
-            if let Some(hint) = hint {
-                eprintln!("hint={hint}");
-            }
-        }
-        ErrorFormat::Json => {
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "category": category,
-                    "stage": stage,
-                    "message": error.to_string(),
-                    "hint": hint,
-                    "location": location.map(|(line, column)| serde_json::json!({
-                        "line": line,
-                        "column": column,
-                    })),
-                    "exit_code": exit_code,
-                })
-            );
-        }
-    }
-}
-
-fn error_stage(error: &(dyn std::error::Error + 'static)) -> &'static str {
-    if let Some(cli) = error.downcast_ref::<CliError>() {
-        return cli.stage;
-    }
-    if let Some(query) = error.downcast_ref::<aql_engine_datafusion::QueryError>() {
-        return match query {
-            aql_engine_datafusion::QueryError::SqlRejected { stage, .. } => stage,
-            aql_engine_datafusion::QueryError::AccessDenied(_) => "authorize",
-            aql_engine_datafusion::QueryError::Engine(_) => "execute",
-        };
-    }
-    if error
-        .downcast_ref::<aql_adapter_api::AdapterError>()
-        .is_some()
-    {
-        return "source";
-    }
-    if error.downcast_ref::<ConfigError>().is_some() {
-        return "config";
-    }
-    "internal"
-}
-
-fn error_location(error: &(dyn std::error::Error + 'static)) -> Option<(u64, u64)> {
-    error
-        .downcast_ref::<CliError>()
-        .and_then(|error| error.location)
-}
-
-fn error_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
-    if let Some(cli) = error.downcast_ref::<CliError>() {
-        return match cli.kind {
-            CliErrorKind::InvalidRequest => 2,
-            CliErrorKind::NotFound
-            | CliErrorKind::SourceUnavailable
-            | CliErrorKind::Unsupported
-            | CliErrorKind::AlreadyExists
-            | CliErrorKind::StateIntegrity
-            | CliErrorKind::StateUnavailable => 4,
-            CliErrorKind::DeadlineExceeded => 5,
-            CliErrorKind::Cancelled => 130,
-        };
-    }
-    if let Some(query) = error.downcast_ref::<aql_engine_datafusion::QueryError>() {
-        return match query {
-            aql_engine_datafusion::QueryError::SqlRejected { .. } => 2,
-            aql_engine_datafusion::QueryError::AccessDenied(_) => 3,
-            aql_engine_datafusion::QueryError::Engine(engine)
-                if datafusion_resource_limited(engine) =>
-            {
-                5
-            }
-            aql_engine_datafusion::QueryError::Engine(engine) => {
-                datafusion_adapter_error(engine).map_or(1, adapter_error_exit_code)
-            }
-        };
-    }
-    if let Some(adapter) = error.downcast_ref::<aql_adapter_api::AdapterError>() {
-        return adapter_error_exit_code(adapter);
-    }
-    if let Some(config) = error.downcast_ref::<ConfigError>() {
-        return match config {
-            ConfigError::InvalidDatabaseName | ConfigError::InvalidMember => 2,
-            ConfigError::Missing
-            | ConfigError::UnsafeRoot
-            | ConfigError::RootOverlap
-            | ConfigError::InvalidOwnershipMarker
-            | ConfigError::UnknownFile
-            | ConfigError::InvalidConfig
-            | ConfigError::UnsupportedSchema
-            | ConfigError::DatabaseExists
-            | ConfigError::DatabaseMissing
-            | ConfigError::LockHeld
-            | ConfigError::StateChanged
-            | ConfigError::Io(_) => 4,
-        };
-    }
-    1
-}
-
-fn error_category(error: &(dyn std::error::Error + 'static)) -> &'static str {
-    if let Some(cli) = error.downcast_ref::<CliError>() {
-        return match cli.kind {
-            CliErrorKind::InvalidRequest => "invalid_request",
-            CliErrorKind::NotFound => "not_found",
-            CliErrorKind::SourceUnavailable => "source_unavailable",
-            CliErrorKind::DeadlineExceeded => "deadline_exceeded",
-            CliErrorKind::Cancelled => "cancelled",
-            CliErrorKind::Unsupported => "unsupported",
-            CliErrorKind::AlreadyExists => "already_exists",
-            CliErrorKind::StateIntegrity => "state_integrity",
-            CliErrorKind::StateUnavailable => "state_unavailable",
-        };
-    }
-    if let Some(query) = error.downcast_ref::<aql_engine_datafusion::QueryError>() {
-        return match query {
-            aql_engine_datafusion::QueryError::SqlRejected { .. } => "invalid_request",
-            aql_engine_datafusion::QueryError::AccessDenied(_) => "access_denied",
-            aql_engine_datafusion::QueryError::Engine(engine)
-                if datafusion_resource_limited(engine) =>
-            {
-                "resource_limit"
-            }
-            aql_engine_datafusion::QueryError::Engine(engine) => {
-                datafusion_adapter_error(engine).map_or("execution_failed", adapter_error_category)
-            }
-        };
-    }
-    if let Some(adapter) = error.downcast_ref::<aql_adapter_api::AdapterError>() {
-        return adapter_error_category(adapter);
-    }
-    if let Some(config) = error.downcast_ref::<ConfigError>() {
-        return match config {
-            ConfigError::InvalidDatabaseName | ConfigError::InvalidMember => "invalid_request",
-            ConfigError::DatabaseExists => "already_exists",
-            ConfigError::DatabaseMissing | ConfigError::Missing => "not_found",
-            ConfigError::LockHeld => "concurrent_writer",
-            ConfigError::UnsafeRoot
-            | ConfigError::RootOverlap
-            | ConfigError::InvalidOwnershipMarker
-            | ConfigError::UnknownFile
-            | ConfigError::InvalidConfig
-            | ConfigError::UnsupportedSchema
-            | ConfigError::StateChanged => "state_integrity",
-            ConfigError::Io(_) => "state_unavailable",
-        };
-    }
-    "internal"
-}
-
-fn datafusion_resource_limited(error: &datafusion::error::DataFusionError) -> bool {
-    use datafusion::error::DataFusionError;
-
-    match error {
-        DataFusionError::ResourcesExhausted(_) => true,
-        DataFusionError::External(error) => error
-            .downcast_ref::<aql_adapter_api::AdapterError>()
-            .is_some_and(|error| {
-                matches!(error, aql_adapter_api::AdapterError::BudgetExceeded { .. })
-            }),
-        DataFusionError::Context(_, error) | DataFusionError::Diagnostic(_, error) => {
-            datafusion_resource_limited(error)
-        }
-        DataFusionError::Collection(errors) => errors.iter().any(datafusion_resource_limited),
-        DataFusionError::Shared(error) => datafusion_resource_limited(error),
-        _ => false,
-    }
-}
-
-fn datafusion_adapter_error(
-    error: &datafusion::error::DataFusionError,
-) -> Option<&aql_adapter_api::AdapterError> {
-    use datafusion::error::DataFusionError;
-
-    match error {
-        DataFusionError::External(error) => error.downcast_ref::<aql_adapter_api::AdapterError>(),
-        DataFusionError::Context(_, error) | DataFusionError::Diagnostic(_, error) => {
-            datafusion_adapter_error(error)
-        }
-        DataFusionError::Collection(errors) => errors.iter().find_map(datafusion_adapter_error),
-        DataFusionError::Shared(error) => datafusion_adapter_error(error),
-        _ => None,
-    }
-}
-
-fn adapter_error_exit_code(error: &aql_adapter_api::AdapterError) -> i32 {
-    match error {
-        aql_adapter_api::AdapterError::AccessDenied { .. } => 3,
-        aql_adapter_api::AdapterError::BudgetExceeded { .. }
-        | aql_adapter_api::AdapterError::Cancelled => 5,
-        aql_adapter_api::AdapterError::NotFound { .. }
-        | aql_adapter_api::AdapterError::PermissionDenied { .. }
-        | aql_adapter_api::AdapterError::UnsupportedFormat { .. }
-        | aql_adapter_api::AdapterError::CorruptSource { .. }
-        | aql_adapter_api::AdapterError::SnapshotUnavailable => 4,
-        aql_adapter_api::AdapterError::Internal { .. } => 1,
-    }
-}
-
-fn adapter_error_category(error: &aql_adapter_api::AdapterError) -> &'static str {
-    match error {
-        aql_adapter_api::AdapterError::AccessDenied { .. } => "access_denied",
-        aql_adapter_api::AdapterError::BudgetExceeded { .. } => "resource_limit",
-        aql_adapter_api::AdapterError::Cancelled => "cancelled",
-        aql_adapter_api::AdapterError::NotFound { .. }
-        | aql_adapter_api::AdapterError::PermissionDenied { .. }
-        | aql_adapter_api::AdapterError::UnsupportedFormat { .. }
-        | aql_adapter_api::AdapterError::CorruptSource { .. }
-        | aql_adapter_api::AdapterError::SnapshotUnavailable => "source_unavailable",
-        aql_adapter_api::AdapterError::Internal { .. } => "internal",
-    }
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {

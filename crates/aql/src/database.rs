@@ -332,7 +332,7 @@ pub(super) fn resolve_database_inputs(
     let candidate = candidates
         .into_iter()
         .find(|candidate| candidate.name == name)
-        .ok_or_else(|| database_not_found("unknown database; run SHOW DATABASES"))?;
+        .ok_or_else(|| database_not_found("unknown database; run `aql database list`"))?;
     Ok(SourceInputs {
         source_specs: vec![format!(
             "{}={}",
@@ -419,10 +419,32 @@ fn show_configured_database(
     Ok(())
 }
 
+fn is_built_in_database_name(name: &str) -> bool {
+    matches!(name, "claude" | "codex" | "kimi" | "opencode")
+}
+
 fn remove_configured_database(name: String) -> Result<(), Box<dyn std::error::Error>> {
     aql_config::validate_database_name(&name)?;
     let state_root = canonical_or_prospective(&aql_state_root()?)?;
-    let store = ConfigStore::open_existing(&aql_config_root()?, std::slice::from_ref(&state_root))?;
+    let store =
+        match ConfigStore::open_existing(&aql_config_root()?, std::slice::from_ref(&state_root)) {
+            Ok(store) => Some(store),
+            Err(ConfigError::Missing) => None,
+            Err(error) => return Err(error.into()),
+        };
+    let configured = match &store {
+        Some(store) => store.list()?.iter().any(|database| database.name == name),
+        None => false,
+    };
+    // Configured databases take precedence on a name collision, so a built-in
+    // name is rejected only when no configured database owns it.
+    if !configured && is_built_in_database_name(&name) {
+        return Err(invalid_argument(
+            "built-in databases cannot be removed; only configured databases can be removed",
+        )
+        .into());
+    }
+    let store = store.ok_or(ConfigError::Missing)?;
     let lock = store.acquire_write_lock()?;
     store.remove(&name, lock)?;
     println!("database={name}");

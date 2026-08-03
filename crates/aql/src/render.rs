@@ -71,21 +71,23 @@ impl StreamingRenderer {
         match &mut self.state {
             RendererState::Table(table) => table.append_batch(batch, &self.budget)?,
             RendererState::Json { first } => {
+                let names = batch_field_names(batch);
                 for row_index in 0..batch.num_rows() {
                     if !*first {
                         write_budgeted(writer, b",", &self.budget)?;
                     }
-                    let row = serde_json::to_vec(&batch_row_to_value(batch, row_index)?)?;
+                    let row = serde_json::to_vec(&batch_row_to_value(batch, &names, row_index)?)?;
                     write_budgeted(writer, &row, &self.budget)?;
                     *first = false;
                 }
             }
             RendererState::Jsonl { first } => {
+                let names = batch_field_names(batch);
                 for row_index in 0..batch.num_rows() {
                     if !*first {
                         write_budgeted(writer, b"\n", &self.budget)?;
                     }
-                    let row = serde_json::to_vec(&batch_row_to_value(batch, row_index)?)?;
+                    let row = serde_json::to_vec(&batch_row_to_value(batch, &names, row_index)?)?;
                     write_budgeted(writer, &row, &self.budget)?;
                     *first = false;
                 }
@@ -174,7 +176,7 @@ fn write_budgeted(
 }
 
 struct TableSpool {
-    file: fs::File,
+    file: io::BufWriter<fs::File>,
     schema: Option<datafusion::arrow::datatypes::SchemaRef>,
     widths: Vec<usize>,
     rows: usize,
@@ -185,7 +187,7 @@ struct TableSpool {
 impl TableSpool {
     fn new() -> io::Result<Self> {
         Ok(Self {
-            file: tempfile::tempfile()?,
+            file: io::BufWriter::new(tempfile::tempfile()?),
             schema: None,
             widths: Vec::new(),
             rows: 0,
@@ -225,7 +227,11 @@ impl TableSpool {
             let cells = formatters
                 .iter()
                 .map(|formatter| {
-                    sanitize_table_text(&formatter.value(row_index).to_string()).into_owned()
+                    let raw = formatter.value(row_index).to_string();
+                    match sanitize_table_text(&raw) {
+                        Cow::Borrowed(_) => raw,
+                        Cow::Owned(sanitized) => sanitized,
+                    }
                 })
                 .collect::<Vec<_>>();
             let height = cells
@@ -330,16 +336,18 @@ impl TableSpool {
         write_table_row(writer, &headers, &self.widths, budget)?;
         write_separator(writer, &self.widths, budget)?;
         self.file.flush()?;
-        self.file.seek(SeekFrom::Start(0))?;
+        let mut spool_file = self.file.get_ref();
+        spool_file.seek(SeekFrom::Start(0))?;
+        let mut reader = io::BufReader::new(spool_file);
         for _ in 0..self.rows {
             let mut cells = Vec::with_capacity(self.widths.len());
             for _ in &self.widths {
                 let mut length = [0_u8; 8];
-                self.file.read_exact(&mut length)?;
+                reader.read_exact(&mut length)?;
                 let length = usize::try_from(u64::from_le_bytes(length))
                     .map_err(|_| "table cell is too large")?;
                 let mut bytes = vec![0_u8; length];
-                self.file.read_exact(&mut bytes)?;
+                reader.read_exact(&mut bytes)?;
                 cells.push(String::from_utf8(bytes)?);
             }
             write_table_row(writer, &cells, &self.widths, budget)?;
@@ -398,14 +406,15 @@ fn write_table_row(
         .map(|cell| cell.split('\n').collect::<Vec<_>>())
         .collect::<Vec<_>>();
     let height = lines.iter().map(Vec::len).max().unwrap_or(1);
+    let padding = vec![b' '; widths.iter().copied().max().map_or(1, |width| width + 1)];
     for line_index in 0..height {
         write_budgeted(writer, b"|", budget)?;
         for (column_index, width) in widths.iter().enumerate() {
             let value = lines[column_index].get(line_index).copied().unwrap_or("");
             write_budgeted(writer, b" ", budget)?;
             write_budgeted(writer, value.as_bytes(), budget)?;
-            let padding = width.saturating_sub(UnicodeWidthStr::width(value));
-            write_budgeted(writer, vec![b' '; padding + 1].as_slice(), budget)?;
+            let padding_len = width.saturating_sub(UnicodeWidthStr::width(value)) + 1;
+            write_budgeted(writer, &padding[..padding_len], budget)?;
             write_budgeted(writer, b"|", budget)?;
         }
         write_budgeted(writer, b"\n", budget)?;
@@ -568,21 +577,32 @@ pub(super) fn batches_to_values(
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let mut rows = Vec::new();
     for batch in batches {
+        let names = batch_field_names(batch);
         for row_index in 0..batch.num_rows() {
-            rows.push(batch_row_to_value(batch, row_index)?);
+            rows.push(batch_row_to_value(batch, &names, row_index)?);
         }
     }
     Ok(rows)
 }
 
+fn batch_field_names(batch: &RecordBatch) -> Vec<String> {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect()
+}
+
 pub(super) fn batch_row_to_value(
     batch: &RecordBatch,
+    names: &[String],
     row_index: usize,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let mut row = serde_json::Map::new();
-    for (column_index, field) in batch.schema().fields().iter().enumerate() {
+    let mut row = serde_json::Map::with_capacity(names.len());
+    for (column_index, name) in names.iter().enumerate() {
         row.insert(
-            field.name().clone(),
+            name.clone(),
             arrow_json_value(batch, column_index, row_index)?,
         );
     }
@@ -604,7 +624,8 @@ pub(super) fn arrow_json_value(
     if array.is_null(row_index) {
         return Ok(serde_json::Value::Null);
     }
-    let field = batch.schema().field(column_index).clone();
+    let schema = batch.schema();
+    let field = schema.field(column_index);
     match field.data_type() {
         DataType::Utf8 => {
             let value = array
@@ -612,10 +633,14 @@ pub(super) fn arrow_json_value(
                 .downcast_ref::<StringArray>()
                 .ok_or("invalid UTF-8 Arrow array")?
                 .value(row_index);
-            if matches!(
-                field.name().as_str(),
-                "capabilities" | "content_json" | "arguments"
-            ) {
+            // Canonical JSON columns are marked by the engine through Arrow
+            // field metadata: output names are user-controllable aliases and
+            // cannot decide whether a text cell holds embedded JSON.
+            if field
+                .metadata()
+                .get(aql_engine_datafusion::JSON_TYPE_METADATA_KEY)
+                .is_some_and(|kind| kind == aql_engine_datafusion::JSON_TYPE_METADATA_VALUE)
+            {
                 Ok(serde_json::from_str(value)?)
             } else {
                 Ok(serde_json::Value::String(value.to_string()))

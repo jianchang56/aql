@@ -36,6 +36,60 @@ pub(super) fn execution_budget(
     ))
 }
 
+/// Resolves the shell's execution limits through the same environment
+/// variables and parsers as the non-interactive query path.
+pub(super) fn shell_execution_limits() -> Result<ExecutionLimits, CliError> {
+    Ok(ExecutionLimits {
+        max_output_bytes: environment_u64(
+            "AQL_MAX_OUTPUT_BYTES",
+            64 * 1024 * 1024,
+            parse_byte_size,
+        )?,
+        timeout: environment_duration("AQL_TIMEOUT", Duration::from_secs(30))?,
+    })
+}
+
+/// Resolves the values reported by `SHOW STATUS` from the live environment,
+/// matching the limits a shell query would actually execute under.
+pub(super) fn shell_status_limits() -> Result<(ExecutionLimits, u64), CliError> {
+    let limits = shell_execution_limits()?;
+    let max_records = environment_u64("AQL_MAX_RECORDS", 100_000, parse_count)?;
+    Ok((limits, max_records))
+}
+
+/// Resolves the DataFusion memory limit through the same environment variable
+/// and parser the query path applies.
+pub(super) fn max_memory_bytes() -> Result<usize, CliError> {
+    usize::try_from(environment_u64(
+        "AQL_MAX_MEMORY_BYTES",
+        256 * 1024 * 1024,
+        parse_byte_size,
+    )?)
+    .map_err(|_| invalid_argument("AQL_MAX_MEMORY_BYTES is too large"))
+}
+
+/// Builds the reusable engine session shared by all queries in one
+/// interactive shell. Construction is lazy so the installation salt is only
+/// loaded or created when the first shell query actually runs.
+pub(super) fn shell_query_session() -> Result<QuerySession, Box<dyn std::error::Error>> {
+    let options = QueryOptions {
+        max_memory_bytes: max_memory_bytes()?,
+        redaction_salt: installation_salt()?,
+        ..QueryOptions::default()
+    };
+    Ok(QuerySession::new(&options)?)
+}
+
+fn environment_duration(name: &str, default: Duration) -> Result<Duration, CliError> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| invalid_argument(format!("{name} must be valid UTF-8")))?;
+    parse_duration(value).map_err(|reason| invalid_argument(format!("{name}: {reason}")))
+}
+
 pub(super) fn remaining_timeout(deadline: Instant) -> Result<Duration, Box<dyn std::error::Error>> {
     deadline
         .checked_duration_since(Instant::now())

@@ -84,6 +84,7 @@ pub(super) enum Command {
         diagnostics: bool,
         #[arg(skip)]
         shell_summary: bool,
+        /// Run one read-only SELECT, WITH (CTE) or EXPLAIN query; conflicts with --file and --stdin.
         #[arg(conflicts_with_all = ["file", "stdin"], required_unless_present_any = ["file", "stdin"])]
         sql: Option<String>,
         /// Read one read-only query from a bounded local .aql file.

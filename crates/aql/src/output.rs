@@ -1,9 +1,9 @@
 use super::*;
-use std::io::{Seek, SeekFrom};
+use std::io::{BufWriter, Seek, SeekFrom};
 
 pub(super) enum TransactionalOutput {
     File(SecureOutputFile),
-    Stdout(fs::File),
+    Stdout(BufWriter<fs::File>),
 }
 
 impl TransactionalOutput {
@@ -12,11 +12,11 @@ impl TransactionalOutput {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         match path {
             Some(path) => Ok(Self::File(SecureOutputFile::create(path)?)),
-            None => Ok(Self::Stdout(tempfile::tempfile()?)),
+            None => Ok(Self::Stdout(BufWriter::new(tempfile::tempfile()?))),
         }
     }
 
-    pub(super) fn writer(&mut self) -> &mut fs::File {
+    pub(super) fn writer(&mut self) -> &mut BufWriter<fs::File> {
         match self {
             Self::File(output) => output.writer(),
             Self::Stdout(output) => output,
@@ -31,11 +31,12 @@ impl TransactionalOutput {
             Self::File(_) => {}
             Self::Stdout(spool) => {
                 spool.flush()?;
-                spool.seek(SeekFrom::Start(0))?;
+                let mut spool_file = spool.get_ref();
+                spool_file.seek(SeekFrom::Start(0))?;
                 let mut stdout = io::stdout().lock();
                 let mut buffer = [0_u8; 64 * 1024];
                 loop {
-                    let count = spool.read(&mut buffer)?;
+                    let count = spool_file.read(&mut buffer)?;
                     if count == 0 {
                         break;
                     }
@@ -69,7 +70,7 @@ pub(super) struct SecureOutputFile {
     directory_identity: aql_fs::FileIdentity,
     target_name: std::ffi::OsString,
     temporary_name: std::ffi::OsString,
-    file: fs::File,
+    file: BufWriter<fs::File>,
     committed: bool,
 }
 
@@ -102,18 +103,18 @@ impl SecureOutputFile {
             directory_identity,
             target_name,
             temporary_name,
-            file: temporary,
+            file: BufWriter::new(temporary),
             committed: false,
         })
     }
 
-    pub(super) fn writer(&mut self) -> &mut fs::File {
+    pub(super) fn writer(&mut self) -> &mut BufWriter<fs::File> {
         &mut self.file
     }
 
     pub(super) fn commit(mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.file.flush()?;
-        self.file.sync_all()?;
+        self.file.get_ref().sync_all()?;
         let current_directory = {
             let directory = open_output_directory(&self.directory_path)?;
             aql_fs::identity(&directory.dir_metadata()?)

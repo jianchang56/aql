@@ -255,10 +255,19 @@ fn query_formats_bare_output_file_and_budgets_are_end_to_end() {
         "query",
         "-d",
         "codex",
-        "SELECT session_id FROM sessions LIMIT 1",
+        "SELECT session_id FROM sessions LIMIT 2",
     ]);
     assert_success(&unordered);
     assert!(stderr(&unordered).contains("result ordering is unspecified"));
+
+    let sample = environment.run([
+        "query",
+        "-d",
+        "codex",
+        "SELECT session_id FROM sessions LIMIT 1",
+    ]);
+    assert_success(&sample);
+    assert!(!stderr(&sample).contains("result ordering is unspecified"));
 
     let show_tables = environment.run(["query", "-d", "codex", "SHOW TABLES;"]);
     assert_success(&show_tables);
@@ -823,4 +832,98 @@ fn wait_for_pending_output(directory: &Path, child: &mut std::process::Child) {
         );
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+#[test]
+fn unknown_schema_table_and_example_are_invalid_requests_with_hints() {
+    let environment = TestEnvironment::new();
+    let schema = environment.run(["schema", "no_such_table"]);
+    assert_eq!(schema.status.code(), Some(2));
+    assert!(schema.stdout.is_empty());
+    assert!(stderr(&schema).contains("error_category=invalid_request"));
+    assert!(stderr(&schema).contains("hint=run `aql schema --list`"));
+
+    let example = environment.run(["examples", "no-such-example"]);
+    assert_eq!(example.status.code(), Some(2));
+    assert!(example.stdout.is_empty());
+    assert!(stderr(&example).contains("error_category=invalid_request"));
+    assert!(stderr(&example).contains("hint=run `aql examples --list`"));
+}
+
+#[test]
+fn source_and_selection_errors_carry_recovery_hints() {
+    let environment = TestEnvironment::new();
+
+    let missing_source = environment.run([
+        "query",
+        "-d",
+        "codex",
+        "SELECT session_id FROM sessions LIMIT 1",
+    ]);
+    assert_eq!(missing_source.status.code(), Some(4));
+    assert!(missing_source.stdout.is_empty());
+    assert!(stderr(&missing_source).contains("error_category=source_unavailable"));
+    assert!(
+        stderr(&missing_source)
+            .contains("hint=run `aql database discover`, then `aql doctor -d <database>`")
+    );
+
+    let unknown = environment.run([
+        "query",
+        "-d",
+        "nosuchdb",
+        "SELECT session_id FROM sessions LIMIT 1",
+    ]);
+    assert_eq!(unknown.status.code(), Some(4));
+    assert!(stderr(&unknown).contains("unknown database; run `aql database list`"));
+}
+
+#[test]
+fn preexisting_foreign_config_root_fails_with_recovery_hint() {
+    let environment = TestEnvironment::new();
+    fs::create_dir(&environment.config).expect("create foreign config root");
+    let output = environment.run(["database", "list"]);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(stderr(&output).contains("error_category=state_integrity"));
+    assert!(stderr(&output).contains("hint=the AQL config root is an AQL-owned directory"));
+}
+
+#[test]
+fn built_in_databases_cannot_be_removed_but_configured_shadowing_can() {
+    let environment = TestEnvironment::new();
+    let built_in = environment.run(["database", "remove", "codex"]);
+    assert_eq!(built_in.status.code(), Some(2));
+    assert!(stderr(&built_in).contains(
+        "built-in databases cannot be removed; only configured databases can be removed"
+    ));
+
+    // A configured database named like a built-in shadows it and is removable.
+    let codex = environment.standalone_codex("removable");
+    let add = environment.run(vec![
+        OsString::from("database"),
+        OsString::from("add"),
+        OsString::from("codex"),
+        OsString::from("--member"),
+        OsString::from(format!("codex={}", codex.display())),
+        OsString::from("--acknowledge-persistent-path"),
+    ]);
+    assert_success(&add);
+    let removed = environment.run(["database", "remove", "codex"]);
+    assert_success(&removed);
+    assert!(stdout(&removed).contains("status=removed"));
+}
+
+#[test]
+fn empty_table_result_reports_row_count_on_stderr_only() {
+    let environment = TestEnvironment::new();
+    environment.install_codex("minimal", 0);
+    let empty = environment.run([
+        "query",
+        "-d",
+        "codex",
+        "SELECT session_id FROM sessions WHERE session_id = 'no-such-session'",
+    ]);
+    assert_success(&empty);
+    assert_eq!(stdout(&empty), "\n");
+    assert!(stderr(&empty).contains("(0 rows)"));
 }

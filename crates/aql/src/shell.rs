@@ -167,7 +167,9 @@ pub(super) fn render_schema(
             QUERY_SCHEMAS
                 .iter()
                 .find(|schema| schema.name == table)
-                .ok_or("unknown canonical table")?,
+                .ok_or_else(|| {
+                    invalid_argument("unknown canonical table").with_hint(CliErrorHint::SchemaList)
+                })?,
         ]
     } else {
         QUERY_SCHEMAS.iter().collect::<Vec<_>>()
@@ -235,7 +237,9 @@ pub(super) fn render_examples(name: Option<String>) -> Result<(), Box<dyn std::e
         let sql = SQL_EXAMPLES
             .iter()
             .find_map(|(candidate, sql)| (*candidate == name).then_some(*sql))
-            .ok_or("unknown example; run `aql examples`")?;
+            .ok_or_else(|| {
+                invalid_argument("unknown example").with_hint(CliErrorHint::ExamplesList)
+            })?;
         println!("{sql}");
     } else {
         println!("example");
@@ -374,9 +378,10 @@ pub(super) async fn run_shell(
     if let Some(database) = initial_database {
         validate_database_selection_name(&database)?;
         if !database_is_available(&database)? {
-            return Err(
-                database_not_found("unknown or unavailable database; run SHOW DATABASES").into(),
-            );
+            return Err(database_not_found(
+                "unknown or unavailable database; run `aql database list`",
+            )
+            .into());
         }
         selected_database = Some(database);
     }
@@ -395,6 +400,9 @@ pub(super) async fn run_shell(
     for line in shell_welcome(&databases, selected_database.as_deref()) {
         println!("{line}");
     }
+    // Reused across all queries in this shell session; built lazily on the
+    // first query so the installation salt is not created before it is needed.
+    let mut query_session = None;
     loop {
         let prompt = if buffer.is_empty() {
             shell_prompt(selected_database.as_deref(), &access)
@@ -452,6 +460,7 @@ pub(super) async fn run_shell(
                 }
                 [show, tables] if show == "SHOW" && tables == "TABLES" => {
                     if let Err(error) = run_shell_query(
+                        &mut query_session,
                         selected_database.clone(),
                         access.clone(),
                         statement.clone(),
@@ -472,14 +481,21 @@ pub(super) async fn run_shell(
                     }
                 }
                 [show, status] if show == "SHOW" && status == "STATUS" => {
-                    println!(
-                        "database={} access_grants={} timeout=30s max_records=100000 history=persistent:false",
-                        selected_database.as_deref().unwrap_or("none"),
-                        access.len(),
-                    );
+                    match shell_status_limits() {
+                        Ok((limits, max_records)) => {
+                            println!(
+                                "database={} access_grants={} timeout={:?} max_records={max_records} history=persistent:false",
+                                selected_database.as_deref().unwrap_or("none"),
+                                access.len(),
+                                limits.timeout,
+                            );
+                        }
+                        Err(error) => eprintln!("ERROR: {error}"),
+                    }
                 }
                 [describe, _] if describe == "DESCRIBE" || describe == "DESC" => {
                     if let Err(error) = run_shell_query(
+                        &mut query_session,
                         selected_database.clone(),
                         access.clone(),
                         statement.clone(),
@@ -514,6 +530,7 @@ pub(super) async fn run_shell(
                 }
                 [first, ..] if first == "SELECT" || first == "WITH" || first == "EXPLAIN" => {
                     if let Err(error) = run_shell_query(
+                        &mut query_session,
                         selected_database.clone(),
                         access.clone(),
                         statement.clone(),
@@ -525,7 +542,7 @@ pub(super) async fn run_shell(
                 }
                 _ => {
                     eprintln!(
-                        "ERROR: Expected HELP, SHOW, USE, DESCRIBE, GRANT, REVOKE, SELECT, EXPLAIN or EXIT"
+                        "ERROR: Expected HELP, SHOW, USE, DESCRIBE, GRANT, REVOKE, SELECT, WITH, EXPLAIN, EXIT or QUIT"
                     )
                 }
             }
@@ -537,21 +554,22 @@ pub(super) fn shell_query_error(error: &(dyn std::error::Error + 'static)) -> St
     if let Some(aql_engine_datafusion::QueryError::AccessDenied(access)) =
         error.downcast_ref::<aql_engine_datafusion::QueryError>()
     {
-        let grant = match *access {
-            "content" => "CONTENT",
-            "path" => "PATH",
-            "tool-input" => "TOOL INPUT",
-            "tool-output" => "TOOL OUTPUT",
-            _ => return format!("ERROR: {error}"),
+        let (label, grant) = match access {
+            AccessClass::Content => ("content", "CONTENT"),
+            AccessClass::Path => ("path", "PATH"),
+            AccessClass::ToolInput => ("tool-input", "TOOL INPUT"),
+            AccessClass::ToolOutput => ("tool-output", "TOOL OUTPUT"),
+            AccessClass::Safe | AccessClass::Secret => return format!("ERROR: {error}"),
         };
         return format!(
-            "ERROR: Query requires {access} access. Run GRANT {grant} FOR SESSION; only if it is genuinely needed."
+            "ERROR: Query requires {label} access. Run GRANT {grant} FOR SESSION; only if it is genuinely needed."
         );
     }
     format!("ERROR: {error}")
 }
 
 async fn run_shell_query(
+    query_session: &mut Option<QuerySession>,
     database: Option<String>,
     access: Vec<Access>,
     statement: String,
@@ -562,26 +580,29 @@ async fn run_shell_query(
         )
         .into());
     };
-    Box::pin(run(Cli {
-        error_format: ErrorFormat::Text,
-        quiet: false,
-        command: Some(Command::Query {
-            database,
-            output: Output::Table,
-            output_file: None,
-            access,
-            param: Vec::new(),
-            limits: ExecutionLimits {
-                max_output_bytes: 64 * 1024 * 1024,
-                timeout: Duration::from_secs(30),
-            },
-            diagnostics: false,
-            shell_summary: true,
-            sql: Some(statement),
-            file: None,
-            stdin: false,
-        }),
-    }))
+    if query_session.is_none() {
+        *query_session = Some(shell_query_session()?);
+    }
+    Box::pin(run_with_query_session(
+        Cli {
+            error_format: ErrorFormat::Text,
+            quiet: false,
+            command: Some(Command::Query {
+                database,
+                output: Output::Table,
+                output_file: None,
+                access,
+                param: Vec::new(),
+                limits: shell_execution_limits()?,
+                diagnostics: false,
+                shell_summary: true,
+                sql: Some(statement),
+                file: None,
+                stdin: false,
+            }),
+        },
+        query_session.as_ref(),
+    ))
     .await
 }
 
@@ -608,6 +629,9 @@ pub(super) fn shell_welcome(databases: &[String], selected_database: Option<&str
         "AQL interactive shell. End statements with ';'.".to_string(),
         format!("Known databases: {}", databases.join(", ")),
     ];
+    if databases.is_empty() {
+        lines.push("no database found; exit and run `aql database discover`".to_string());
+    }
     if let Some(database) = selected_database {
         lines.push(format!("Selected database: {database}"));
         lines.push("Next: SELECT * FROM sessions LIMIT 10;".to_string());
