@@ -1,85 +1,154 @@
 use super::*;
 
-pub(super) fn agents_array(column: &str, sources: &[SourceManifest]) -> Result<ArrayRef> {
-    let values = sources
-        .iter()
-        .map(|source| match column {
-            "source_id" => Ok(source.source_id.to_string()),
-            "agent_id" => Ok(source.agent_id.clone()),
-            "display_name" => Ok(source.display_name.clone()),
-            "format_fingerprint" => Ok(source.format_fingerprint.clone()),
-            "snapshot_state" => Ok(if source.snapshot.is_some() {
-                "weak"
-            } else {
-                "unavailable"
+/// Resolves projection indices to unique columns in first-use order, plus the
+/// unique-column slot for each projection entry. Repeated projections of one
+/// column share a single built array.
+fn projected_columns<'a>(
+    table: &'a QueryTableSchema,
+    projection: &[usize],
+) -> (Vec<&'a QueryColumn>, Vec<usize>) {
+    let mut columns = Vec::<&QueryColumn>::new();
+    let mut slots = Vec::with_capacity(projection.len());
+    for index in projection {
+        let column = &table.columns[*index];
+        let slot = match columns
+            .iter()
+            .position(|candidate| candidate.name == column.name)
+        {
+            Some(slot) => slot,
+            None => {
+                columns.push(column);
+                columns.len() - 1
             }
-            .to_string()),
-            "capabilities" => serde_json::to_string(&source.capabilities)
-                .map_err(|error| DataFusionError::External(Box::new(error))),
-            _ => Err(DataFusionError::Plan("unknown agents column".to_string())),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Arc::new(StringArray::from(
-        values.into_iter().map(Some).collect::<Vec<_>>(),
-    )))
-}
-
-pub(super) fn record_array(
-    table: &QueryTableSchema,
-    column: &str,
-    records: &[CanonicalRecord],
-) -> Result<ArrayRef> {
-    let data_type = table
-        .columns
-        .iter()
-        .find(|candidate| candidate.name == column)
-        .map(|candidate| candidate.data_type)
-        .ok_or_else(|| DataFusionError::Plan("unknown canonical column".to_string()))?;
-    match data_type {
-        QueryDataType::Text | QueryDataType::Json => Ok(Arc::new(StringArray::from(
-            records
-                .iter()
-                .map(|record| record_text(record, column))
-                .collect::<Vec<_>>(),
-        ))),
-        QueryDataType::Int64 => Ok(Arc::new(Int64Array::from(
-            records
-                .iter()
-                .map(|record| record_int(record, column))
-                .collect::<Vec<_>>(),
-        ))),
-        QueryDataType::Bool => Ok(Arc::new(BooleanArray::from(
-            records
-                .iter()
-                .map(|record| record_bool(record, column))
-                .collect::<Vec<_>>(),
-        ))),
-        QueryDataType::Timestamp => Ok(Arc::new(
-            TimestampMillisecondArray::from(
-                records
-                    .iter()
-                    .map(|record| record_timestamp(record, column))
-                    .collect::<Vec<_>>(),
-            )
-            .with_timezone("UTC"),
-        )),
+        };
+        slots.push(slot);
     }
+    (columns, slots)
 }
 
-fn record_text(record: &CanonicalRecord, column: &str) -> Option<String> {
+/// Builds one Arrow array per projected agents column, consuming the bound
+/// sources so manifest payload strings move into the arrays instead of being
+/// cloned.
+pub(super) fn agents_arrays(
+    table: &QueryTableSchema,
+    projection: &[usize],
+    sources: Vec<FederatedSource>,
+) -> Result<Vec<ArrayRef>> {
+    let (columns, slots) = projected_columns(table, projection);
+    for column in &columns {
+        match column.name {
+            "source_id" | "agent_id" | "display_name" | "format_fingerprint" | "snapshot_state"
+            | "capabilities" => {}
+            _ => return Err(DataFusionError::Plan("unknown agents column".to_string())),
+        }
+    }
+    let mut values = columns
+        .iter()
+        .map(|_| Vec::with_capacity(sources.len()))
+        .collect::<Vec<Vec<Option<String>>>>();
+    for source in sources {
+        let FederatedSource { adapter, manifest } = source;
+        // Values that borrow the whole manifest are produced before any field
+        // is moved out of it.
+        for (slot, column) in columns.iter().enumerate() {
+            match column.name {
+                "source_id" => values[slot].push(Some(manifest.source_id.to_string())),
+                "snapshot_state" => values[slot].push(Some(
+                    declared_snapshot_state(adapter.capabilities(&manifest).snapshot_strength)
+                        .to_string(),
+                )),
+                "capabilities" => values[slot].push(Some(
+                    serde_json::to_string(&manifest.capabilities)
+                        .map_err(|error| DataFusionError::External(Box::new(error)))?,
+                )),
+                _ => {}
+            }
+        }
+        let SourceManifest {
+            mut agent_id,
+            mut display_name,
+            mut format_fingerprint,
+            ..
+        } = manifest;
+        for (slot, column) in columns.iter().enumerate() {
+            match column.name {
+                "agent_id" => values[slot].push(Some(std::mem::take(&mut agent_id))),
+                "display_name" => values[slot].push(Some(std::mem::take(&mut display_name))),
+                "format_fingerprint" => {
+                    values[slot].push(Some(std::mem::take(&mut format_fingerprint)));
+                }
+                _ => {}
+            }
+        }
+    }
+    let arrays = values
+        .into_iter()
+        .map(|values| Arc::new(StringArray::from(values)) as ArrayRef)
+        .collect::<Vec<_>>();
+    Ok(slots.into_iter().map(|slot| arrays[slot].clone()).collect())
+}
+
+/// Builds one Arrow array per projected column, consuming the records so
+/// payload strings move into the arrays instead of being cloned. Records must
+/// already be validated against the scanned table; nothing is checked here.
+pub(super) fn record_arrays(
+    table: &QueryTableSchema,
+    projection: &[usize],
+    records: Vec<CanonicalRecord>,
+) -> Vec<ArrayRef> {
+    let (columns, slots) = projected_columns(table, projection);
+    let mut records = records;
+    let arrays = columns
+        .iter()
+        .map(|column| -> ArrayRef {
+            match column.data_type {
+                QueryDataType::Text | QueryDataType::Json => Arc::new(StringArray::from(
+                    records
+                        .iter_mut()
+                        .map(|record| take_record_text(record, column.name))
+                        .collect::<Vec<_>>(),
+                )),
+                QueryDataType::Int64 => Arc::new(Int64Array::from(
+                    records
+                        .iter()
+                        .map(|record| record_int(record, column.name))
+                        .collect::<Vec<_>>(),
+                )),
+                QueryDataType::Bool => Arc::new(BooleanArray::from(
+                    records
+                        .iter()
+                        .map(|record| record_bool(record, column.name))
+                        .collect::<Vec<_>>(),
+                )),
+                QueryDataType::Timestamp => Arc::new(
+                    TimestampMillisecondArray::from(
+                        records
+                            .iter()
+                            .map(|record| record_timestamp(record, column.name))
+                            .collect::<Vec<_>>(),
+                    )
+                    .with_timezone("UTC"),
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    slots.into_iter().map(|slot| arrays[slot].clone()).collect()
+}
+
+fn take_record_text(record: &mut CanonicalRecord, column: &str) -> Option<String> {
     match record {
         CanonicalRecord::Session(value) => match column {
             "session_id" => Some(value.session_id.to_string()),
             "native_id" => Some(value.native_id.to_string()),
             "source_id" => Some(value.source_id.to_string()),
-            "agent_id" => Some(value.agent_id.clone()),
-            "title" => value.title.clone(),
-            "preview" => value.preview.clone(),
-            "cwd" => value.cwd.clone(),
-            "project" => value.project.clone(),
-            "model" => value.model.clone(),
-            "provider" => value.provider.clone(),
-            "status" => value.status.clone(),
+            "agent_id" => Some(std::mem::take(&mut value.agent_id)),
+            "title" => value.title.take(),
+            "preview" => value.preview.take(),
+            "cwd" => value.cwd.take(),
+            "project" => value.project.take(),
+            "model" => value.model.take(),
+            "provider" => value.provider.take(),
+            "status" => value.status.take(),
             "identity_confidence" => {
                 Some(format!("{:?}", value.identity_confidence).to_ascii_lowercase())
             }
@@ -90,11 +159,11 @@ fn record_text(record: &CanonicalRecord, column: &str) -> Option<String> {
             "message_id" => Some(value.message_id.to_string()),
             "session_id" => Some(value.session_id.to_string()),
             "source_id" => Some(value.source_id.to_string()),
-            "role" => Some(value.role.clone()),
-            "kind" => value.kind.clone(),
-            "content" => value.content.clone(),
-            "content_json" => value.content_json.as_ref().map(ToString::to_string),
-            "model" => value.model.clone(),
+            "role" => Some(std::mem::take(&mut value.role)),
+            "kind" => value.kind.take(),
+            "content" => value.content.take(),
+            "content_json" => value.content_json.take().map(|json| json.to_string()),
+            "model" => value.model.take(),
             _ => None,
         },
         CanonicalRecord::ToolCall(value) => match column {
@@ -102,20 +171,20 @@ fn record_text(record: &CanonicalRecord, column: &str) -> Option<String> {
             "session_id" => Some(value.session_id.to_string()),
             "message_id" => value.message_id.as_ref().map(ToString::to_string),
             "source_id" => Some(value.source_id.to_string()),
-            "tool_name" => Some(value.tool_name.clone()),
-            "namespace" => value.namespace.clone(),
-            "arguments" => value.arguments.as_ref().map(ToString::to_string),
-            "output" => value.output.clone(),
-            "status" => value.status.clone(),
+            "tool_name" => Some(std::mem::take(&mut value.tool_name)),
+            "namespace" => value.namespace.take(),
+            "arguments" => value.arguments.take().map(|json| json.to_string()),
+            "output" => value.output.take(),
+            "status" => value.status.take(),
             _ => None,
         },
         CanonicalRecord::Usage(value) => match column {
             "usage_id" => Some(value.usage_id.to_string()),
             "source_id" => Some(value.source_id.to_string()),
-            "agent_id" => Some(value.agent_id.clone()),
+            "agent_id" => Some(std::mem::take(&mut value.agent_id)),
             "session_id" => value.session_id.as_ref().map(ToString::to_string),
-            "model" => value.model.clone(),
-            "provider" => value.provider.clone(),
+            "model" => value.model.take(),
+            "provider" => value.provider.take(),
             _ => None,
         },
         CanonicalRecord::SessionEdge(value) => match column {
@@ -123,7 +192,7 @@ fn record_text(record: &CanonicalRecord, column: &str) -> Option<String> {
             "source_id" => Some(value.source_id.to_string()),
             "parent_session_id" => Some(value.parent_session_id.to_string()),
             "child_session_id" => Some(value.child_session_id.to_string()),
-            "edge_kind" => Some(value.edge_kind.clone()),
+            "edge_kind" => Some(std::mem::take(&mut value.edge_kind)),
             "native_edge_id" => value.native_edge_id.as_ref().map(ToString::to_string),
             _ => None,
         },
@@ -132,12 +201,12 @@ fn record_text(record: &CanonicalRecord, column: &str) -> Option<String> {
             "source_id" => Some(value.source_id.to_string()),
             "session_id" => Some(value.session_id.to_string()),
             "tool_call_id" => value.tool_call_id.as_ref().map(ToString::to_string),
-            "kind" => Some(value.kind.clone()),
-            "name" => value.name.clone(),
-            "path" => value.path.clone(),
-            "media_type" => value.media_type.clone(),
-            "content" => value.content.clone(),
-            "content_json" => value.content_json.as_ref().map(ToString::to_string),
+            "kind" => Some(std::mem::take(&mut value.kind)),
+            "name" => value.name.take(),
+            "path" => value.path.take(),
+            "media_type" => value.media_type.take(),
+            "content" => value.content.take(),
+            "content_json" => value.content_json.take().map(|json| json.to_string()),
             _ => None,
         },
     }

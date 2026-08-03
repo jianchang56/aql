@@ -29,7 +29,7 @@ impl DeferredTable {
                 .columns
                 .iter()
                 .map(|column| {
-                    Field::new(
+                    let field = Field::new(
                         column.name,
                         match column.data_type {
                             QueryDataType::Text | QueryDataType::Json => DataType::Utf8,
@@ -40,7 +40,15 @@ impl DeferredTable {
                             }
                         },
                         column.nullable,
-                    )
+                    );
+                    if column.data_type == QueryDataType::Json {
+                        field.with_metadata(HashMap::from([(
+                            JSON_TYPE_METADATA_KEY.to_string(),
+                            JSON_TYPE_METADATA_VALUE.to_string(),
+                        )]))
+                    } else {
+                        field
+                    }
                 })
                 .collect::<Vec<_>>(),
         ));
@@ -53,7 +61,7 @@ impl DeferredTable {
 
     pub(super) fn bind(&self, binding: Binding) -> std::result::Result<(), QueryError> {
         let mut slot = self.binding.lock().map_err(|_| QueryError::SqlRejected {
-            stage: "bind",
+            stage: SqlStage::Bind,
             reason: "query provider state is unavailable",
         })?;
         *slot = Some(binding);
@@ -180,7 +188,7 @@ struct AdapterBatchState {
     session_records: Vec<CanonicalRecord>,
     pending_sessions: VecDeque<CanonicalRecord>,
     sessions_reconciled: bool,
-    seen: BTreeSet<String>,
+    seen: HashSet<Box<str>>,
     emitted: usize,
     agents_emitted: bool,
     metadata_emitted: bool,
@@ -219,7 +227,7 @@ impl AdapterBatchState {
             session_records: Vec::new(),
             pending_sessions: VecDeque::new(),
             sessions_reconciled: false,
-            seen: BTreeSet::new(),
+            seen: HashSet::new(),
             emitted: 0,
             agents_emitted: false,
             metadata_emitted: false,
@@ -264,22 +272,14 @@ impl AdapterBatchState {
         {
             return Some(Err(DataFusionError::External(Box::new(error))));
         }
-        let manifests = self
-            .binding
-            .sources
-            .iter()
-            .map(|source| source.manifest.clone())
-            .collect::<Vec<_>>();
-        let arrays = self
-            .projection
-            .iter()
-            .map(|index| agents_array(self.table.columns[*index].name, &manifests))
-            .collect::<Result<Vec<_>>>();
+        let row_count = self.binding.sources.len();
+        let sources = std::mem::take(&mut self.binding.sources);
+        let arrays = agents_arrays(self.table, &self.projection, sources);
         Some(arrays.and_then(|arrays| {
             RecordBatch::try_new_with_options(
                 self.schema.clone(),
                 arrays,
-                &RecordBatchOptions::new().with_row_count(Some(self.binding.sources.len())),
+                &RecordBatchOptions::new().with_row_count(Some(row_count)),
             )
             .map_err(Into::into)
         }))
@@ -332,11 +332,18 @@ impl AdapterBatchState {
 
             match self.current.as_mut().and_then(Iterator::next) {
                 Some(Ok(record)) => {
+                    if !record_matches_table(&record, table_name) {
+                        self.finished = true;
+                        return Some(Err(DataFusionError::Execution(
+                            "adapter produced a record that does not match the scanned table"
+                                .to_string(),
+                        )));
+                    }
                     if let Err(error) = validate_record_metrics(&record) {
                         self.finished = true;
                         return Some(Err(error));
                     }
-                    if !self.seen.insert(record_identity(&record)) {
+                    if !self.seen.insert(record_identity(&record).into_boxed_str()) {
                         self.finished = true;
                         return Some(Err(DataFusionError::Execution(
                             "adapter produced a duplicate canonical entity".to_string(),
@@ -371,19 +378,16 @@ impl AdapterBatchState {
             self.current = None;
             self.finished = true;
         }
-        let arrays = self
-            .projection
-            .iter()
-            .map(|index| record_array(self.table, self.table.columns[*index].name, &records))
-            .collect::<Result<Vec<_>>>();
-        Some(arrays.and_then(|arrays| {
+        let row_count = records.len();
+        let arrays = record_arrays(self.table, &self.projection, records);
+        Some(
             RecordBatch::try_new_with_options(
                 self.schema.clone(),
                 arrays,
-                &RecordBatchOptions::new().with_row_count(Some(records.len())),
+                &RecordBatchOptions::new().with_row_count(Some(row_count)),
             )
-            .map_err(Into::into)
-        }))
+            .map_err(Into::into),
+        )
     }
 
     fn open_next_source(&mut self, table_name: TableName, limit: Option<u64>) -> Result<bool> {
@@ -479,19 +483,16 @@ impl AdapterBatchState {
         if self.pending_sessions.is_empty() {
             self.finished = true;
         }
-        let arrays = self
-            .projection
-            .iter()
-            .map(|index| record_array(self.table, self.table.columns[*index].name, &records))
-            .collect::<Result<Vec<_>>>();
-        Some(arrays.and_then(|arrays| {
+        let row_count = records.len();
+        let arrays = record_arrays(self.table, &self.projection, records);
+        Some(
             RecordBatch::try_new_with_options(
                 self.schema.clone(),
                 arrays,
-                &RecordBatchOptions::new().with_row_count(Some(records.len())),
+                &RecordBatchOptions::new().with_row_count(Some(row_count)),
             )
-            .map_err(Into::into)
-        }))
+            .map_err(Into::into),
+        )
     }
 
     fn reconcile_sessions(&mut self) -> Result<()> {
@@ -689,6 +690,17 @@ fn table_capability(table: TableName) -> &'static str {
         TableName::Usage => "usage",
         TableName::SessionEdges => "session_edges",
         TableName::Artifacts => "artifacts",
+    }
+}
+
+fn record_matches_table(record: &CanonicalRecord, table: TableName) -> bool {
+    match table {
+        TableName::Sessions => matches!(record, CanonicalRecord::Session(_)),
+        TableName::Messages => matches!(record, CanonicalRecord::Message(_)),
+        TableName::ToolCalls => matches!(record, CanonicalRecord::ToolCall(_)),
+        TableName::Usage => matches!(record, CanonicalRecord::Usage(_)),
+        TableName::SessionEdges => matches!(record, CanonicalRecord::SessionEdge(_)),
+        TableName::Artifacts => matches!(record, CanonicalRecord::Artifact(_)),
     }
 }
 

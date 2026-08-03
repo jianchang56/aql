@@ -68,7 +68,7 @@ fn limit_offset_and_float_parameters_remain_explicit() {
 
 #[tokio::test]
 async fn ordering_warning_is_limited_to_unordered_pagination() {
-    let source = FederatedSource {
+    let source = || FederatedSource {
         adapter: Arc::new(CodexAdapter::new(b"synthetic-adapter".to_vec())),
         manifest: SourceManifest {
             source_id: SourceId::new("synthetic-source"),
@@ -81,28 +81,127 @@ async fn ordering_warning_is_limited_to_unordered_pagination() {
             warnings: Vec::new(),
         },
     };
-    let count = validate_read_only_sql("SELECT COUNT(*) FROM aql_tables")
-        .expect("aggregate query is valid");
-    let count_result = prepare_query(&count, QueryOptions::default())
-        .await
-        .expect("aggregate query prepares")
-        .execute(vec![source.clone()])
-        .await
-        .expect("aggregate query executes");
-    assert!(count_result.metadata.warnings.is_empty());
+    let warnings = async |sql: &str| {
+        let sql = validate_read_only_sql(sql).expect("query is valid");
+        prepare_query(&sql, QueryOptions::default())
+            .await
+            .expect("query prepares")
+            .execute(vec![source()])
+            .await
+            .expect("query executes")
+            .metadata
+            .warnings
+    };
+    const ORDERING_WARNING: &str =
+        "result ordering is unspecified; add ORDER BY for stable pagination";
 
-    let page = validate_read_only_sql("SELECT table_name FROM aql_tables LIMIT 1")
-        .expect("page query is valid");
-    let page_result = prepare_query(&page, QueryOptions::default())
-        .await
-        .expect("page query prepares")
-        .execute(vec![source])
-        .await
-        .expect("page query executes");
-    assert_eq!(
-        page_result.metadata.warnings,
-        vec!["result ordering is unspecified; add ORDER BY for stable pagination"]
+    assert!(warnings("SELECT COUNT(*) FROM aql_tables").await.is_empty());
+    // A single-row LIMIT 1 sample is not pagination and stays quiet.
+    assert!(
+        warnings("SELECT table_name FROM aql_tables LIMIT 1")
+            .await
+            .is_empty()
     );
+    assert_eq!(
+        warnings("SELECT table_name FROM aql_tables LIMIT 2").await,
+        vec![ORDERING_WARNING]
+    );
+    assert_eq!(
+        warnings("SELECT table_name FROM aql_tables LIMIT 1 OFFSET 1").await,
+        vec![ORDERING_WARNING]
+    );
+    assert!(
+        warnings("SELECT table_name FROM aql_tables ORDER BY table_name LIMIT 2")
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn reusable_session_prepares_independent_queries() {
+    let session = QuerySession::new(&QueryOptions::default()).expect("session builds");
+    let session_record = synthetic_session("source-reuse", "session-reuse");
+    let session_id = session_record.session_id.clone();
+    let source = || FederatedSource {
+        adapter: Arc::new(SyntheticUsageAdapter {
+            sessions: vec![session_record.clone()],
+            messages: vec![synthetic_message(
+                "source-reuse",
+                &session_id,
+                "known",
+                Some(10),
+                None,
+                None,
+                Some(false),
+            )],
+            tool_calls: Vec::new(),
+        }),
+        manifest: SourceManifest {
+            source_id: SourceId::new("source-reuse"),
+            agent_id: "synthetic".to_string(),
+            display_name: "Synthetic".to_string(),
+            data_root_token: "root:source-reuse".to_string(),
+            format_fingerprint: "synthetic-v1".to_string(),
+            capabilities: vec!["sessions".to_string(), "messages".to_string()],
+            snapshot: Some(SnapshotToken::new("synthetic-snapshot")),
+            warnings: Vec::new(),
+        },
+    };
+
+    let first_sql =
+        validate_read_only_sql("SELECT session_id FROM sessions").expect("valid sessions query");
+    let first = session
+        .prepare_query(&first_sql, QueryOptions::default())
+        .await
+        .expect("first query prepares")
+        .execute(vec![source()])
+        .await
+        .expect("first query executes");
+    assert_eq!(
+        first
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        1
+    );
+
+    // The usage view must resolve the second query's freshly bound providers,
+    // not the providers registered for the first query.
+    let second_sql =
+        validate_read_only_sql("SELECT SUM(total_tokens) FROM usage").expect("valid usage query");
+    let second = session
+        .prepare_query(&second_sql, QueryOptions::default())
+        .await
+        .expect("second query prepares")
+        .execute(vec![source()])
+        .await
+        .expect("second query executes");
+    let total = second.batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("aggregate is int64")
+        .value(0);
+    assert_eq!(total, 10);
+
+    let mismatch = session
+        .prepare_query(
+            &first_sql,
+            QueryOptions {
+                max_memory_bytes: 1024,
+                ..QueryOptions::default()
+            },
+        )
+        .await
+        .expect_err("memory budget is fixed for the session lifetime");
+    assert!(matches!(
+        mismatch,
+        QueryError::SqlRejected {
+            stage: SqlStage::Budget,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -405,7 +504,10 @@ async fn sensitive_identifiers_are_rejected_before_engine_execution() {
     let error = prepare_query(&sql, QueryOptions::default())
         .await
         .expect_err("title must require content access");
-    assert!(matches!(error, QueryError::AccessDenied("content")));
+    assert!(matches!(
+        error,
+        QueryError::AccessDenied(AccessClass::Content)
+    ));
 }
 
 #[tokio::test]
@@ -737,10 +839,7 @@ async fn streaming_metadata_requires_consuming_the_stream_to_eof() {
         .expect("stream starts");
     assert!(matches!(
         unfinished.metadata.finish(),
-        Err(QueryError::SqlRejected {
-            stage: "metadata",
-            ..
-        })
+        Err(QueryError::StreamLifecycle { .. })
     ));
 
     let StreamingQueryResult {
@@ -946,21 +1045,27 @@ async fn plan_access_covers_hidden_and_derived_references() {
     for (sql, grant) in [
         (
             "SELECT session_id FROM sessions WHERE title LIKE '%synthetic%'",
-            "content",
+            AccessClass::Content,
         ),
-        ("SELECT session_id FROM sessions ORDER BY cwd", "path"),
+        (
+            "SELECT session_id FROM sessions ORDER BY cwd",
+            AccessClass::Path,
+        ),
         (
             "WITH private AS (SELECT content AS x FROM messages) SELECT x FROM private",
-            "content",
+            AccessClass::Content,
         ),
-        ("SELECT COUNT(arguments) FROM tool_calls", "tool-input"),
+        (
+            "SELECT COUNT(arguments) FROM tool_calls",
+            AccessClass::ToolInput,
+        ),
         (
             "SELECT session_id FROM tool_calls WHERE output IS NOT NULL",
-            "tool-output",
+            AccessClass::ToolOutput,
         ),
         (
             "SELECT sessions.session_id FROM sessions JOIN messages ON sessions.session_id = messages.session_id AND messages.content IS NOT NULL",
-            "content",
+            AccessClass::Content,
         ),
     ] {
         let validated = validate_read_only_sql(sql).expect("valid SQL");
@@ -971,11 +1076,11 @@ async fn plan_access_covers_hidden_and_derived_references() {
     }
 
     for (sql, grant) in [
-        ("SELECT REDACT(content) FROM messages", "content"),
-        ("SELECT MASK_PATH(cwd, 2) FROM sessions", "path"),
+        ("SELECT REDACT(content) FROM messages", AccessClass::Content),
+        ("SELECT MASK_PATH(cwd, 2) FROM sessions", AccessClass::Path),
         (
             "SELECT session_id FROM messages WHERE REDACT(content) = '[REDACTED]'",
-            "content",
+            AccessClass::Content,
         ),
     ] {
         let validated = validate_read_only_sql(sql).expect("valid privacy function query");
@@ -1029,7 +1134,7 @@ async fn safe_wildcards_exclude_sensitive_columns() {
     let error = prepare_query(&artifacts, QueryOptions::default())
         .await
         .expect_err("artifact enumeration requires path access");
-    assert!(matches!(error, QueryError::AccessDenied("path")));
+    assert!(matches!(error, QueryError::AccessDenied(AccessClass::Path)));
     let prepared = prepare_query(
         &artifacts,
         QueryOptions {
@@ -1050,9 +1155,13 @@ async fn safe_wildcards_exclude_sensitive_columns() {
     );
 
     for (sql, grant, path_granted) in [
-        ("SELECT path FROM artifacts", "path", false),
-        ("SELECT name FROM artifacts", "content", true),
-        ("SELECT content_json FROM artifacts", "content", true),
+        ("SELECT path FROM artifacts", AccessClass::Path, false),
+        ("SELECT name FROM artifacts", AccessClass::Content, true),
+        (
+            "SELECT content_json FROM artifacts",
+            AccessClass::Content,
+            true,
+        ),
     ] {
         let sql = validate_read_only_sql(sql).expect("valid artifact query");
         let error = prepare_query(
@@ -1076,7 +1185,7 @@ fn wildcard_modifiers_are_rejected() {
     assert!(matches!(
         validate_read_only_sql("SELECT * EXCLUDE (title) FROM sessions"),
         Err(QueryError::SqlRejected {
-            stage: "wildcard",
+            stage: SqlStage::Wildcard,
             ..
         })
     ));
@@ -1176,7 +1285,7 @@ fn read_only_firewall_rejects_nested_recursive_ctes() {
             matches!(
                 validate_read_only_sql(sql),
                 Err(QueryError::SqlRejected {
-                    stage: "allowlist",
+                    stage: SqlStage::Allowlist,
                     ..
                 })
             ),
@@ -1199,7 +1308,7 @@ fn read_only_firewall_rejects_comma_join_fanout() {
     assert!(matches!(
         validate_read_only_sql(&beyond_limit),
         Err(QueryError::SqlRejected {
-            stage: "allowlist",
+            stage: SqlStage::Allowlist,
             ..
         })
     ));
@@ -1213,7 +1322,7 @@ fn read_only_firewall_rejects_wildcard_projection_fanout() {
     assert!(matches!(
         validate_read_only_sql(sql),
         Err(QueryError::SqlRejected {
-            stage: "allowlist",
+            stage: SqlStage::Allowlist,
             ..
         })
     ));
@@ -1248,7 +1357,7 @@ fn non_finite_float_parameters_are_rejected() {
                 &BTreeMap::from([("ratio".to_string(), SqlParameter::Float64(value))]),
             ),
             Err(QueryError::SqlRejected {
-                stage: "parameters",
+                stage: SqlStage::Parameters,
                 ..
             })
         ));
@@ -1403,4 +1512,425 @@ fn query_schemas_match_the_public_table_order() {
             AccessClass::Content
         );
     }
+}
+
+struct SyntheticStreamAdapter {
+    records: Vec<CanonicalRecord>,
+    fail_at: Option<usize>,
+}
+
+impl AgentAdapter for SyntheticStreamAdapter {
+    fn id(&self) -> &'static str {
+        "synthetic-stream"
+    }
+
+    fn probe(&self, _request: &ProbeRequest) -> std::result::Result<ProbeResult, AdapterError> {
+        unreachable!("federated engine tests bind manifests directly")
+    }
+
+    fn capabilities(&self, _manifest: &SourceManifest) -> Capabilities {
+        Capabilities {
+            tables: vec![
+                TableName::Sessions,
+                TableName::Messages,
+                TableName::ToolCalls,
+                TableName::Usage,
+                TableName::SessionEdges,
+                TableName::Artifacts,
+            ],
+            columns: Vec::new(),
+            snapshot_strength: SnapshotStrength::Weak,
+        }
+    }
+
+    fn schema(&self, _manifest: &SourceManifest) -> AdapterSchema {
+        AdapterSchema {
+            columns: Vec::new(),
+        }
+    }
+
+    fn scan(&self, request: ScanRequest) -> std::result::Result<ScanResult, AdapterError> {
+        let mut stream = self
+            .records
+            .iter()
+            .cloned()
+            .map(Ok)
+            .collect::<Vec<std::result::Result<CanonicalRecord, AdapterError>>>();
+        if let Some(fail_at) = self.fail_at.filter(|fail_at| *fail_at <= stream.len()) {
+            stream.insert(
+                fail_at,
+                Err(AdapterError::CorruptSource {
+                    stage: "synthetic".to_string(),
+                }),
+            );
+        }
+        Ok(ScanResult {
+            records: Box::new(stream.into_iter()),
+            pushdown: PushdownReport {
+                predicates: request
+                    .predicates
+                    .iter()
+                    .map(|_| PushdownState::Unsupported)
+                    .collect(),
+                limit: request.limit.map(|_| PushdownState::Unsupported),
+                ordering: request
+                    .order_hint
+                    .iter()
+                    .map(|_| PushdownState::Unsupported)
+                    .collect(),
+            },
+            diagnostics: ScanDiagnostics::default(),
+            snapshot: SnapshotReport {
+                token: request.snapshot,
+                strength: SnapshotStrength::Weak,
+                stale: false,
+            },
+        })
+    }
+}
+
+fn stream_manifest(source_id: &str, capabilities: &[&str]) -> SourceManifest {
+    SourceManifest {
+        source_id: SourceId::new(source_id),
+        agent_id: "synthetic".to_string(),
+        display_name: "Synthetic".to_string(),
+        data_root_token: format!("root:{source_id}"),
+        format_fingerprint: "synthetic-v1".to_string(),
+        capabilities: capabilities
+            .iter()
+            .map(|capability| (*capability).to_string())
+            .collect(),
+        snapshot: Some(SnapshotToken::new("synthetic-snapshot")),
+        warnings: Vec::new(),
+    }
+}
+
+#[test]
+fn json_columns_are_marked_with_arrow_field_metadata() {
+    let tool_calls = QUERY_SCHEMAS
+        .iter()
+        .find(|schema| schema.name == "tool_calls")
+        .expect("tool_calls schema exists");
+    let provider = DeferredTable::new(tool_calls);
+    let schema = provider.schema();
+    let arguments = schema
+        .field_with_name("arguments")
+        .expect("arguments field exists");
+    assert_eq!(
+        arguments
+            .metadata()
+            .get(JSON_TYPE_METADATA_KEY)
+            .map(String::as_str),
+        Some(JSON_TYPE_METADATA_VALUE)
+    );
+    let tool_name = schema
+        .field_with_name("tool_name")
+        .expect("tool_name field exists");
+    assert!(!tool_name.metadata().contains_key(JSON_TYPE_METADATA_KEY));
+
+    for schema in QUERY_SCHEMAS {
+        let provider = DeferredTable::new(schema);
+        let arrow_schema = provider.schema();
+        for column in schema.columns {
+            let field = arrow_schema
+                .field_with_name(column.name)
+                .expect("schema field exists");
+            assert_eq!(
+                field.metadata().get(JSON_TYPE_METADATA_KEY).is_some(),
+                column.data_type == QueryDataType::Json,
+                "metadata marker must match the logical type of {}.{}",
+                schema.name,
+                column.name,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn json_field_metadata_survives_projection_aliases() {
+    let session = synthetic_session("source-json", "session-json");
+    let session_id = session.session_id.clone();
+    let mut tool_call = synthetic_tool_call("source-json", &session_id);
+    tool_call.arguments = Some(serde_json::json!({"synthetic": true}));
+    let adapter = Arc::new(SyntheticUsageAdapter {
+        sessions: vec![session],
+        messages: Vec::new(),
+        tool_calls: vec![tool_call],
+    });
+    let manifest = SourceManifest {
+        source_id: SourceId::new("source-json"),
+        agent_id: "synthetic".to_string(),
+        display_name: "Synthetic".to_string(),
+        data_root_token: "root:json".to_string(),
+        format_fingerprint: "synthetic-v1".to_string(),
+        capabilities: vec!["sessions".to_string(), "tool_calls".to_string()],
+        snapshot: Some(SnapshotToken::new("synthetic-snapshot")),
+        warnings: Vec::new(),
+    };
+    let sql =
+        validate_read_only_sql("SELECT arguments AS args, tool_name AS arguments FROM tool_calls")
+            .expect("valid alias query");
+    let options = QueryOptions {
+        access: AccessGrant {
+            tool_input: true,
+            ..AccessGrant::default()
+        },
+        ..QueryOptions::default()
+    };
+    let StreamingQueryResult {
+        mut stream,
+        metadata,
+    } = prepare_query(&sql, options)
+        .await
+        .expect("query prepares")
+        .execute_stream(vec![FederatedSource { adapter, manifest }])
+        .await
+        .expect("stream starts");
+
+    let schema = stream.schema();
+    let args_field = schema.field(0);
+    assert_eq!(args_field.name(), "args");
+    assert_eq!(
+        args_field
+            .metadata()
+            .get(JSON_TYPE_METADATA_KEY)
+            .map(String::as_str),
+        Some(JSON_TYPE_METADATA_VALUE),
+        "an alias must keep the JSON metadata of the underlying column"
+    );
+    let renamed_text_field = schema.field(1);
+    assert_eq!(renamed_text_field.name(), "arguments");
+    assert!(
+        !renamed_text_field
+            .metadata()
+            .contains_key(JSON_TYPE_METADATA_KEY),
+        "a text column aliased to a JSON name must not be marked as JSON"
+    );
+
+    let mut rows = 0;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.expect("batch succeeds");
+        rows += batch.num_rows();
+        let args = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("args is text");
+        assert_eq!(args.value(0), "{\"synthetic\":true}");
+    }
+    assert_eq!(rows, 1);
+    metadata.finish().expect("stream completes");
+}
+
+#[tokio::test]
+async fn agents_record_budget_exhaustion_fails_without_partial_output() {
+    let source = |source_id: &str| FederatedSource {
+        adapter: Arc::new(SyntheticStreamAdapter {
+            records: Vec::new(),
+            fail_at: None,
+        }),
+        manifest: stream_manifest(source_id, &["sessions"]),
+    };
+    let sql = validate_read_only_sql("SELECT agent_id FROM agents").expect("valid agents query");
+    let options = QueryOptions {
+        budget: ResourceBudget {
+            max_records: 1,
+            ..ResourceBudget::default()
+        },
+        ..QueryOptions::default()
+    };
+    let result = prepare_query(&sql, options)
+        .await
+        .expect("query prepares")
+        .execute(vec![source("source-a"), source("source-b")])
+        .await;
+    let Err(error) = result else {
+        panic!("an exhausted record budget must fail the query without output");
+    };
+    assert!(
+        matches!(
+            error,
+            QueryError::Engine(DataFusionError::External(ref inner))
+                if matches!(
+                    inner.downcast_ref::<AdapterError>(),
+                    Some(AdapterError::BudgetExceeded { .. })
+                )
+        ),
+        "expected a budget-exceeded engine error, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_canonical_identity_fails_closed() {
+    let session = synthetic_session("source-duplicate", "session-duplicate");
+    let message = synthetic_message(
+        "source-duplicate",
+        &session.session_id,
+        "duplicate",
+        None,
+        None,
+        None,
+        None,
+    );
+    let adapter = Arc::new(SyntheticStreamAdapter {
+        records: vec![
+            CanonicalRecord::Message(message.clone()),
+            CanonicalRecord::Message(message),
+        ],
+        fail_at: None,
+    });
+    let sql = validate_read_only_sql("SELECT message_id FROM messages").expect("valid query");
+    let result = prepare_query(&sql, QueryOptions::default())
+        .await
+        .expect("query prepares")
+        .execute(vec![FederatedSource {
+            adapter,
+            manifest: stream_manifest("source-duplicate", &["messages"]),
+        }])
+        .await;
+    let Err(error) = result else {
+        panic!("duplicate canonical identity must fail closed");
+    };
+    assert!(
+        matches!(error, QueryError::Engine(DataFusionError::Execution(_))),
+        "expected an execution error, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn record_variant_mismatch_fails_closed() {
+    let session = synthetic_session("source-variant", "session-variant");
+    let tool_call = synthetic_tool_call("source-variant", &session.session_id);
+    let adapter = Arc::new(SyntheticStreamAdapter {
+        // A messages scan that leaks a tool-call record must be rejected.
+        records: vec![CanonicalRecord::ToolCall(tool_call)],
+        fail_at: None,
+    });
+    let sql = validate_read_only_sql("SELECT message_id FROM messages").expect("valid query");
+    let result = prepare_query(&sql, QueryOptions::default())
+        .await
+        .expect("query prepares")
+        .execute(vec![FederatedSource {
+            adapter,
+            manifest: stream_manifest("source-variant", &["messages"]),
+        }])
+        .await;
+    let Err(error) = result else {
+        panic!("a record that does not match the scanned table must fail closed");
+    };
+    assert!(
+        matches!(error, QueryError::Engine(DataFusionError::Execution(_))),
+        "expected an execution error, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn federated_stream_error_produces_no_partial_output() {
+    let healthy_session = synthetic_session("source-healthy", "session-healthy");
+    let failing_session = synthetic_session("source-failing", "session-failing");
+    let healthy = FederatedSource {
+        adapter: Arc::new(SyntheticStreamAdapter {
+            records: vec![CanonicalRecord::Message(synthetic_message(
+                "source-healthy",
+                &healthy_session.session_id,
+                "fine",
+                None,
+                None,
+                None,
+                None,
+            ))],
+            fail_at: None,
+        }),
+        manifest: stream_manifest("source-healthy", &["messages"]),
+    };
+    let failing = FederatedSource {
+        adapter: Arc::new(SyntheticStreamAdapter {
+            records: vec![CanonicalRecord::Message(synthetic_message(
+                "source-failing",
+                &failing_session.session_id,
+                "partial",
+                None,
+                None,
+                None,
+                None,
+            ))],
+            fail_at: Some(1),
+        }),
+        manifest: stream_manifest("source-failing", &["messages"]),
+    };
+    let sql = validate_read_only_sql("SELECT message_id FROM messages").expect("valid query");
+    let result = prepare_query(&sql, QueryOptions::default())
+        .await
+        .expect("query prepares")
+        .execute(vec![healthy, failing])
+        .await;
+    let Err(error) = result else {
+        panic!("a mid-stream source error must fail the query without partial output");
+    };
+    assert!(
+        matches!(
+            error,
+            QueryError::Engine(DataFusionError::External(ref inner))
+                if matches!(
+                    inner.downcast_ref::<AdapterError>(),
+                    Some(AdapterError::CorruptSource { .. })
+                )
+        ),
+        "expected the adapter error to surface, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_state_column_follows_declared_capabilities() {
+    let source = |source_id: &str, snapshot: Option<SnapshotToken>| FederatedSource {
+        adapter: Arc::new(SyntheticStreamAdapter {
+            records: Vec::new(),
+            fail_at: None,
+        }),
+        manifest: SourceManifest {
+            snapshot,
+            ..stream_manifest(source_id, &["sessions"])
+        },
+    };
+    let sql = validate_read_only_sql(
+        "SELECT source_id, snapshot_state FROM aql_sources ORDER BY source_id",
+    )
+    .expect("valid aql_sources query");
+    let result = prepare_query(&sql, QueryOptions::default())
+        .await
+        .expect("query prepares")
+        .execute(vec![
+            source(
+                "source-token",
+                Some(SnapshotToken::new("synthetic-snapshot")),
+            ),
+            source("source-no-token", None),
+        ])
+        .await
+        .expect("aql_sources query succeeds");
+    let batch = result.batches.first().expect("one metadata batch");
+    let states = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("snapshot_state is text");
+    // The synthetic adapter declares a weak snapshot guarantee; the presence of
+    // a probe token must not change the declared state.
+    assert_eq!(states.value(0), "weak");
+    assert_eq!(states.value(1), "weak");
+
+    let agents_sql =
+        validate_read_only_sql("SELECT snapshot_state FROM agents").expect("valid agents query");
+    let agents = prepare_query(&agents_sql, QueryOptions::default())
+        .await
+        .expect("query prepares")
+        .execute(vec![source("source-no-token", None)])
+        .await
+        .expect("agents query succeeds");
+    let agents_states = agents.batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("snapshot_state is text");
+    assert_eq!(agents_states.value(0), "weak");
 }

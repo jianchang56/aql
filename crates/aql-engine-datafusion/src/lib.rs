@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     ops::ControlFlow,
 };
 
@@ -37,10 +37,11 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::execution::{SessionStateBuilder, SessionStateDefaults};
+use datafusion::execution::{SessionState, SessionStateBuilder, SessionStateDefaults};
 use datafusion::logical_expr::{
     AggregateUDF, ColumnarValue, Expr, LogicalPlan, Operator, ScalarFunctionArgs, ScalarUDF,
     ScalarUDFImpl, Signature, TableProviderFilterPushDown, TableType, TypeSignature, Volatility,
+    logical_plan,
 };
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
@@ -60,34 +61,26 @@ mod execution;
 mod metadata;
 mod sql_firewall;
 
-use arrays::{agents_array, record_array};
+use arrays::{agents_arrays, record_arrays};
 #[cfg(test)]
 use execution::expr_to_predicate;
 use execution::{Binding, DeferredTable};
-use sql_firewall::sql_rejected;
 pub use sql_firewall::{
-    QueryError, SqlParameter, ValidatedSql, bind_sql_parameters, validate_read_only_sql,
+    QueryError, SqlParameter, SqlStage, ValidatedSql, bind_sql_parameters, validate_read_only_sql,
 };
+use sql_firewall::{required_grant, sql_rejected};
 
-const MAX_SQL_BYTES: usize = 64 * 1024;
+/// Maximum accepted SQL input size shared by the engine and the CLI.
+pub const MAX_SQL_BYTES: usize = 64 * 1024;
+/// Arrow field metadata key marking a canonical JSON column.
+pub const JSON_TYPE_METADATA_KEY: &str = "aql.type";
+/// Arrow field metadata value marking a canonical JSON column.
+pub const JSON_TYPE_METADATA_VALUE: &str = "json";
 const MAX_QUERY_DEPTH: usize = 64;
 const MAX_EXPRESSIONS: usize = 256;
 const MAX_CTES: usize = 32;
 const MAX_JOINS: usize = 16;
 const QUERY_MEMORY_BYTES: usize = 256 * 1024 * 1024;
-const QUERY_TABLE_NAMES: [&str; 11] = [
-    "aql_tables",
-    "aql_columns",
-    "aql_sources",
-    "aql_capabilities",
-    "agents",
-    "sessions",
-    "messages",
-    "tool_calls",
-    "usage",
-    "session_edges",
-    "artifacts",
-];
 
 const USAGE_VIEW_SQL: &str = r#"
 SELECT
@@ -1290,20 +1283,19 @@ pub struct QueryMetadataHandle {
 impl QueryMetadataHandle {
     /// Returns finalized metadata after the associated stream was fully consumed.
     ///
-    /// Returns [`QueryError::SqlRejected`] if a caller attempts to publish
+    /// Returns [`QueryError::StreamLifecycle`] if a caller attempts to publish
     /// metadata for a partial stream.
     pub fn finish(self) -> std::result::Result<QueryMetadata, QueryError> {
         if !self.stream_complete.load(Ordering::Acquire) {
-            return Err(sql_rejected(
-                "metadata",
-                "query stream must be consumed to completion before metadata is finalized",
-            ));
+            return Err(QueryError::StreamLifecycle {
+                reason: "query stream must be consumed to completion before metadata is finalized",
+            });
         }
         let mut metadata = self
             .metadata
             .lock()
             .map_err(|_| QueryError::SqlRejected {
-                stage: "metadata",
+                stage: SqlStage::Metadata,
                 reason: "query metadata is unavailable",
             })?
             .clone();
@@ -1364,11 +1356,14 @@ impl PreparedQuery {
         sources: Vec<FederatedSource>,
     ) -> std::result::Result<StreamingQueryResult, QueryError> {
         if sources.is_empty() {
-            return Err(sql_rejected("bind", "probe returned no compatible source"));
+            return Err(sql_rejected(
+                SqlStage::Bind,
+                "probe returned no compatible source",
+            ));
         }
         {
             let mut metadata = self.metadata.lock().map_err(|_| QueryError::SqlRejected {
-                stage: "metadata",
+                stage: SqlStage::Metadata,
                 reason: "query metadata is unavailable",
             })?;
             metadata.source_ids = sources
@@ -1444,26 +1439,90 @@ fn aql_aggregate_functions() -> Vec<Arc<AggregateUDF>> {
     ]
 }
 
-fn aql_session_context(options: &QueryOptions) -> Result<SessionContext> {
+fn aql_session_state(options: &QueryOptions) -> Result<SessionState> {
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(Arc::new(GreedyMemoryPool::new(options.max_memory_bytes)))
         .with_disk_manager_builder(
             DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
         )
         .build()?;
-    let state = SessionStateBuilder::new()
+    let mut scalar_functions = aql_scalar_functions();
+    scalar_functions.push(Arc::new(ScalarUDF::new_from_impl(RedactUdf::new(
+        options.redaction_salt.clone(),
+    ))));
+    scalar_functions.push(Arc::new(ScalarUDF::new_from_impl(MaskPathUdf::new())));
+    Ok(SessionStateBuilder::new()
         .with_config(SessionConfig::new())
         .with_runtime_env(Arc::new(runtime))
         .with_expr_planners(SessionStateDefaults::default_expr_planners())
-        .with_scalar_functions(aql_scalar_functions())
+        .with_scalar_functions(scalar_functions)
         .with_aggregate_functions(aql_aggregate_functions())
-        .build();
-    let context = SessionContext::new_with_state(state);
-    context.register_udf(ScalarUDF::new_from_impl(RedactUdf::new(
-        options.redaction_salt.clone(),
-    )));
-    context.register_udf(ScalarUDF::new_from_impl(MaskPathUdf::new()));
-    Ok(context)
+        .build())
+}
+
+fn aql_session_context(options: &QueryOptions) -> Result<SessionContext> {
+    Ok(SessionContext::new_with_state(aql_session_state(options)?))
+}
+
+/// Reusable engine session for interactive query loops.
+///
+/// The expensive DataFusion session state (function registry, optimizer
+/// configuration, runtime environment) is built once and shared by every
+/// query prepared through this handle. Each [`QuerySession::prepare_query`]
+/// call still creates a fresh `SessionContext` and fresh deferred table
+/// providers, so explicitly probed sources are rebound per query exactly as
+/// in the one-shot [`prepare_query`] path.
+///
+/// The memory pool is session-scoped: interactive shells execute statements
+/// serially and DataFusion releases every reservation when the query stream
+/// is dropped, so each query still starts with the full `max_memory_bytes`
+/// budget. The pool size and the redaction salt are baked into the shared
+/// state at construction; per-query options must repeat the same values.
+pub struct QuerySession {
+    state: SessionState,
+    max_memory_bytes: usize,
+    redaction_salt: Vec<u8>,
+}
+
+impl QuerySession {
+    /// Builds the shared session state reused by one interactive query loop.
+    pub fn new(options: &QueryOptions) -> std::result::Result<Self, QueryError> {
+        if options.max_memory_bytes == 0 {
+            return Err(sql_rejected(
+                SqlStage::Budget,
+                "query memory budget must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            state: aql_session_state(options)?,
+            max_memory_bytes: options.max_memory_bytes,
+            redaction_salt: options.redaction_salt.clone(),
+        })
+    }
+
+    /// Validates, authorizes, and plans one query on the shared session
+    /// state, with the same per-query source binding contract as
+    /// [`prepare_query`].
+    ///
+    /// `max_memory_bytes` and `redaction_salt` are baked into the shared
+    /// state, so per-query options must repeat the values the session was
+    /// built with.
+    pub async fn prepare_query(
+        &self,
+        sql: &ValidatedSql,
+        options: QueryOptions,
+    ) -> std::result::Result<PreparedQuery, QueryError> {
+        if options.max_memory_bytes != self.max_memory_bytes
+            || options.redaction_salt != self.redaction_salt
+        {
+            return Err(sql_rejected(
+                SqlStage::Budget,
+                "memory budget and redaction salt are fixed for the session lifetime",
+            ));
+        }
+        let context = SessionContext::new_with_state(self.state.clone());
+        prepare_query_with_context(context, sql, options).await
+    }
 }
 
 /// Validates, authorizes, and plans one query without opening Agent sources.
@@ -1476,15 +1535,23 @@ pub async fn prepare_query(
 ) -> std::result::Result<PreparedQuery, QueryError> {
     if options.max_memory_bytes == 0 {
         return Err(sql_rejected(
-            "budget",
+            SqlStage::Budget,
             "query memory budget must be greater than zero",
         ));
     }
     let context = aql_session_context(&options)?;
+    prepare_query_with_context(context, sql, options).await
+}
+
+async fn prepare_query_with_context(
+    context: SessionContext,
+    sql: &ValidatedSql,
+    options: QueryOptions,
+) -> std::result::Result<PreparedQuery, QueryError> {
     let mut providers = Vec::new();
     for query_schema in QUERY_SCHEMAS.iter().filter(|schema| schema.name != "usage") {
         let provider = Arc::new(DeferredTable::new(query_schema));
-        context.register_table(query_schema.name, provider.clone())?;
+        register_query_table(&context, query_schema.name, provider.clone())?;
         providers.push(provider);
     }
     let usage_schema = QUERY_SCHEMAS
@@ -1492,10 +1559,17 @@ pub async fn prepare_query(
         .find(|schema| schema.name == "usage")
         .ok_or_else(|| DataFusionError::Plan("usage schema is unavailable".to_string()))?;
     let usage_provider = Arc::new(DeferredTable::new(usage_schema));
-    context.register_table("_aql_usage_records", usage_provider.clone())?;
+    register_query_table(&context, "_aql_usage_records", usage_provider.clone())?;
     providers.push(usage_provider);
+    // The usage view plan resolves its table providers at creation time, so
+    // it captures this query's providers and must be rebuilt per query; it
+    // cannot be cached on a shared session state.
     let usage_plan = context.state().create_logical_plan(USAGE_VIEW_SQL).await?;
-    context.register_table("usage", Arc::new(ViewTable::new(usage_plan, None)))?;
+    register_query_table(
+        &context,
+        "usage",
+        Arc::new(ViewTable::new(usage_plan, None)),
+    )?;
     let plan = context
         .state()
         .create_logical_plan(&sql.normalized_sql())
@@ -1521,17 +1595,54 @@ pub async fn prepare_query(
     })
 }
 
+/// Registers one per-query provider, replacing any provider a reused session
+/// catalog still holds under the same name from a previous query.
+fn register_query_table(
+    context: &SessionContext,
+    name: &str,
+    provider: Arc<dyn TableProvider>,
+) -> Result<()> {
+    context.deregister_table(name)?;
+    context.register_table(name, provider)?;
+    Ok(())
+}
+
 fn plan_contains_pagination(plan: &LogicalPlan) -> Result<bool> {
     let mut found = false;
     plan.apply(|node| {
-        if matches!(node, LogicalPlan::Limit(_)) {
+        if let LogicalPlan::Limit(limit) = node
+            && limit_requires_stable_ordering(limit)
+        {
             found = true;
-            Ok(TreeNodeRecursion::Stop)
-        } else {
-            Ok(TreeNodeRecursion::Continue)
+            return Ok(TreeNodeRecursion::Stop);
         }
+        Ok(TreeNodeRecursion::Continue)
     })?;
     Ok(found)
+}
+
+/// A single-row `LIMIT 1` sample is not pagination and needs no stable
+/// ordering; pagination starts at a positive `OFFSET` or a larger fetch. The
+/// optimizer normalizes a missing offset to the literal `0`, which is not an
+/// offset.
+fn limit_requires_stable_ordering(limit: &logical_plan::Limit) -> bool {
+    let has_offset = match limit.skip.as_deref() {
+        Some(Expr::Literal(ScalarValue::Int64(Some(skip)), _)) => *skip > 0,
+        Some(Expr::Literal(ScalarValue::UInt64(Some(skip)), _)) => *skip > 0,
+        // Any other skip cannot be proven to be no offset.
+        Some(_) => true,
+        None => false,
+    };
+    if has_offset {
+        return true;
+    }
+    match limit.fetch.as_deref() {
+        Some(Expr::Literal(ScalarValue::Int64(Some(fetch)), _)) => *fetch > 1,
+        Some(Expr::Literal(ScalarValue::UInt64(Some(fetch)), _)) => *fetch > 1,
+        // Any other fetch cannot be proven to be a single-row sample.
+        Some(_) => true,
+        None => false,
+    }
 }
 
 fn plan_contains_ordering(plan: &LogicalPlan) -> Result<bool> {
@@ -1596,11 +1707,11 @@ fn summarize_plan(plan: &LogicalPlan, options: &QueryOptions) -> Result<PlanSumm
                         .find(|column| column.name == field.name())
                         && column.access != AccessClass::Safe
                     {
-                        required_access.insert(required_grant(column.access).to_string());
+                        required_access.insert(required_grant(&column.access).to_string());
                         access_reasons.insert(format!(
                             "{table_name}.{}:{}",
                             field.name(),
-                            required_grant(column.access)
+                            required_grant(&column.access)
                         ));
                     }
                 }
@@ -1644,7 +1755,7 @@ fn validate_plan_access(
                 ));
             };
             if query_schema.name == "artifacts" && !access.path {
-                denied = Some("path");
+                denied = Some(AccessClass::Path);
                 return Ok(TreeNodeRecursion::Stop);
             }
             for field in scan.projected_schema.fields() {
@@ -1654,7 +1765,7 @@ fn validate_plan_access(
                     .find(|column| column.name.eq_ignore_ascii_case(field.name()))
                     && !access.allows(column.access)
                 {
-                    denied = Some(required_grant(column.access));
+                    denied = Some(column.access);
                     return Ok(TreeNodeRecursion::Stop);
                 }
             }
@@ -1668,14 +1779,14 @@ fn validate_plan_access(
     }
 }
 
-fn required_grant(access: AccessClass) -> &'static str {
-    match access {
-        AccessClass::Safe => "safe",
-        AccessClass::Path => "path",
-        AccessClass::Content => "content",
-        AccessClass::ToolInput => "tool-input",
-        AccessClass::ToolOutput => "tool-output",
-        AccessClass::Secret => "secret-denied",
+/// Maps the adapter-declared snapshot strength to the public `snapshot_state`
+/// column value. The mapping stays conservative: a source that declares no
+/// snapshot guarantee is reported as `unavailable`, never as `weak`/`strong`.
+fn declared_snapshot_state(strength: aql_adapter_api::SnapshotStrength) -> &'static str {
+    match strength {
+        aql_adapter_api::SnapshotStrength::None => "unavailable",
+        aql_adapter_api::SnapshotStrength::Weak => "weak",
+        aql_adapter_api::SnapshotStrength::Strong => "strong",
     }
 }
 

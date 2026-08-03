@@ -53,11 +53,12 @@ pub(super) fn metadata_rows(table: &str, sources: &[FederatedSource]) -> Vec<Vec
                     MetadataCell::Text(source.manifest.display_name.clone()),
                     MetadataCell::Text(source.manifest.format_fingerprint.clone()),
                     MetadataCell::Text(
-                        if source.manifest.snapshot.is_some() {
-                            "weak"
-                        } else {
-                            "unavailable"
-                        }
+                        declared_snapshot_state(
+                            source
+                                .adapter
+                                .capabilities(&source.manifest)
+                                .snapshot_strength,
+                        )
                         .to_string(),
                     ),
                 ]

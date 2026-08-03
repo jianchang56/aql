@@ -40,9 +40,15 @@ pub fn bind_sql_parameters(
 
     if sql.len() > MAX_SQL_BYTES {
         return Err(sql_rejected(
-            "parse",
+            SqlStage::Parse,
             "query exceeds the fixed length limit",
         ));
+    }
+    // Without parameters and without any placeholder-shaped token there is
+    // nothing to bind, so skip the full parse. SQL that may contain a
+    // `:placeholder` still goes through the binder and fails unbound names.
+    if parameters.is_empty() && !sql.contains(':') {
+        return Ok(sql.to_string());
     }
 
     struct Binder<'a> {
@@ -59,13 +65,13 @@ pub fn bind_sql_parameters(
             };
             let Some(name) = placeholder.strip_prefix(':').map(str::to_string) else {
                 return ControlFlow::Break(Box::new(sql_rejected(
-                    "parameters",
+                    SqlStage::Parameters,
                     "only named :parameter placeholders are supported",
                 )));
             };
             let Some(parameter) = self.parameters.get(&name) else {
                 return ControlFlow::Break(Box::new(sql_rejected(
-                    "parameters",
+                    SqlStage::Parameters,
                     "query contains an unbound parameter",
                 )));
             };
@@ -76,7 +82,7 @@ pub fn bind_sql_parameters(
                 SqlParameter::Float64(value) => {
                     if !value.is_finite() {
                         return ControlFlow::Break(Box::new(sql_rejected(
-                            "parameters",
+                            SqlStage::Parameters,
                             "float parameters must be finite",
                         )));
                     }
@@ -90,16 +96,16 @@ pub fn bind_sql_parameters(
     }
 
     let mut statements = Parser::parse_sql(&GenericDialect, sql)
-        .map_err(|_| sql_rejected("parse", "query is not valid SQL"))?;
+        .map_err(|_| sql_rejected(SqlStage::Parse, "query is not valid SQL"))?;
     if statements.len() != 1 {
         return Err(sql_rejected(
-            "parse",
+            SqlStage::Parse,
             "exactly one read-only query is required",
         ));
     }
     let mut statement = statements
         .pop()
-        .ok_or_else(|| sql_rejected("parse", "exactly one read-only query is required"))?;
+        .ok_or_else(|| sql_rejected(SqlStage::Parse, "exactly one read-only query is required"))?;
     let mut binder = Binder {
         parameters,
         used: BTreeSet::new(),
@@ -109,27 +115,77 @@ pub fn bind_sql_parameters(
     }
     if binder.used.len() != parameters.len() {
         return Err(sql_rejected(
-            "parameters",
+            SqlStage::Parameters,
             "one or more supplied parameters are unused",
         ));
     }
     Ok(statement.to_string())
 }
 
+/// Stable stage of the fixed SQL pipeline at which a query was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlStage {
+    /// SQL text did not parse into exactly one statement.
+    Parse,
+    /// Named parameter binding failed.
+    Parameters,
+    /// The statement violated the read-only allowlist.
+    Allowlist,
+    /// A wildcard could not be expanded safely.
+    Wildcard,
+    /// The query exceeded a fixed complexity limit.
+    Complexity,
+    /// Binding probed sources to the authorized plan failed.
+    Bind,
+    /// The supplied query budget is invalid.
+    Budget,
+    /// Final query metadata was unavailable.
+    Metadata,
+}
+
+impl SqlStage {
+    /// Returns the stable user-visible stage name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Parse => "parse",
+            Self::Parameters => "parameters",
+            Self::Allowlist => "allowlist",
+            Self::Wildcard => "wildcard",
+            Self::Complexity => "complexity",
+            Self::Bind => "bind",
+            Self::Budget => "budget",
+            Self::Metadata => "metadata",
+        }
+    }
+}
+
+impl std::fmt::Display for SqlStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Sanitized query validation, authorization, and execution failures.
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
-    /// The query violated a fixed validation or lifecycle contract.
+    /// The query violated a fixed validation contract.
     #[error("SQL rejected at stage {stage}: {reason}")]
     SqlRejected {
         /// Stable validation stage.
-        stage: &'static str,
+        stage: SqlStage,
         /// Stable, non-sensitive rejection reason.
         reason: &'static str,
     },
+    /// The caller violated the streaming result lifecycle contract.
+    #[error("SQL rejected at stage metadata: {reason}")]
+    StreamLifecycle {
+        /// Stable, non-sensitive lifecycle violation reason.
+        reason: &'static str,
+    },
     /// The query references a canonical field without its required grant.
-    #[error("query references a field that requires --access {0}")]
-    AccessDenied(&'static str),
+    #[error("query references a field that requires --access {}", required_grant(.0))]
+    AccessDenied(AccessClass),
     /// DataFusion failed after AQL validation and authorization.
     #[error("query engine execution failed")]
     Engine(
@@ -137,6 +193,18 @@ pub enum QueryError {
         #[source]
         DataFusionError,
     ),
+}
+
+/// Maps a denied access class to its stable `--access` grant name.
+pub(crate) fn required_grant(access: &AccessClass) -> &'static str {
+    match access {
+        AccessClass::Safe => "safe",
+        AccessClass::Path => "path",
+        AccessClass::Content => "content",
+        AccessClass::ToolInput => "tool-input",
+        AccessClass::ToolOutput => "tool-output",
+        AccessClass::Secret => "secret-denied",
+    }
 }
 
 /// Parsed, single-statement SQL that passed AQL's read-only firewall.
@@ -170,23 +238,26 @@ impl ValidatedSql {
 pub fn validate_read_only_sql(sql: &str) -> std::result::Result<ValidatedSql, QueryError> {
     if sql.len() > MAX_SQL_BYTES {
         return Err(sql_rejected(
-            "parse",
+            SqlStage::Parse,
             "query exceeds the fixed length limit",
         ));
     }
     let mut statements = Parser::parse_sql(&GenericDialect, sql)
-        .map_err(|_| sql_rejected("parse", "query is not valid SQL"))?;
+        .map_err(|_| sql_rejected(SqlStage::Parse, "query is not valid SQL"))?;
     if statements.len() != 1 {
         return Err(sql_rejected(
-            "parse",
+            SqlStage::Parse,
             "exactly one read-only query is required",
         ));
     }
     let mut statement = statements
         .pop()
-        .ok_or_else(|| sql_rejected("parse", "exactly one read-only query is required"))?;
+        .ok_or_else(|| sql_rejected(SqlStage::Parse, "exactly one read-only query is required"))?;
     let Statement::Query(query) = &statement else {
-        return Err(sql_rejected("allowlist", "only SELECT queries are allowed"));
+        return Err(sql_rejected(
+            SqlStage::Allowlist,
+            "only SELECT queries are allowed",
+        ));
     };
 
     let mut ctes = BTreeSet::new();
@@ -196,7 +267,10 @@ pub fn validate_read_only_sql(sql: &str) -> std::result::Result<ValidatedSql, Qu
         return Err(*error);
     }
     let Statement::Query(query) = &mut statement else {
-        return Err(sql_rejected("allowlist", "only SELECT queries are allowed"));
+        return Err(sql_rejected(
+            SqlStage::Allowlist,
+            "only SELECT queries are allowed",
+        ));
     };
     rewrite_safe_wildcards(query)?;
     let mut remaining_wildcard = RemainingWildcardVisitor;
@@ -219,7 +293,7 @@ impl Visitor for RemainingWildcardVisitor {
             )
         }) {
             ControlFlow::Break(Box::new(sql_rejected(
-                "wildcard",
+                SqlStage::Wildcard,
                 "wildcard scope could not be safely resolved",
             )))
         } else {
@@ -255,7 +329,7 @@ fn rewrite_query_with_ctes(
             if !cte.alias.columns.is_empty() {
                 if cte.alias.columns.len() != columns.len() {
                     return Err(sql_rejected(
-                        "wildcard",
+                        SqlStage::Wildcard,
                         "CTE column aliases do not match the query output",
                     ));
                 }
@@ -281,7 +355,7 @@ fn rewrite_set_expr(
             let right_columns = rewrite_set_expr(right, ctes)?;
             if left_columns.len() != right_columns.len() {
                 return Err(sql_rejected(
-                    "wildcard",
+                    SqlStage::Wildcard,
                     "set operation outputs have different widths",
                 ));
             }
@@ -295,7 +369,7 @@ fn rewrite_set_expr(
                 .collect())
         }
         _ => Err(sql_rejected(
-            "allowlist",
+            SqlStage::Allowlist,
             "query bodies must be SELECT expressions",
         )),
     }
@@ -320,7 +394,7 @@ fn rewrite_select(
             SelectItem::Wildcard(options) => {
                 if !wildcard_options_empty(&options) {
                     return Err(sql_rejected(
-                        "wildcard",
+                        SqlStage::Wildcard,
                         "wildcard modifiers are not supported",
                     ));
                 }
@@ -331,13 +405,13 @@ fn rewrite_select(
             SelectItem::QualifiedWildcard(kind, options) => {
                 if !wildcard_options_empty(&options) {
                     return Err(sql_rejected(
-                        "wildcard",
+                        SqlStage::Wildcard,
                         "wildcard modifiers are not supported",
                     ));
                 }
                 let SelectItemQualifiedWildcardKind::ObjectName(name) = kind else {
                     return Err(sql_rejected(
-                        "wildcard",
+                        SqlStage::Wildcard,
                         "expression wildcards are not supported",
                     ));
                 };
@@ -345,12 +419,14 @@ fn rewrite_select(
                 let relation = relations
                     .iter()
                     .find(|relation| relation.qualifier.eq_ignore_ascii_case(&qualifier))
-                    .ok_or_else(|| sql_rejected("wildcard", "wildcard qualifier is unknown"))?;
+                    .ok_or_else(|| {
+                        sql_rejected(SqlStage::Wildcard, "wildcard qualifier is unknown")
+                    })?;
                 expand_safe_relation(relation, &mut rewritten, &mut outputs);
             }
             SelectItem::ExprWithAliases { .. } => {
                 return Err(sql_rejected(
-                    "allowlist",
+                    SqlStage::Allowlist,
                     "multi-alias projection expressions are not supported",
                 ));
             }
@@ -374,7 +450,7 @@ fn rewrite_select(
     }
     if rewritten.len() > MAX_EXPRESSIONS {
         return Err(sql_rejected(
-            "allowlist",
+            SqlStage::Allowlist,
             "query has too many projection expressions",
         ));
     }
@@ -403,7 +479,9 @@ fn relation_columns(
                         .collect()
                 })
                 .or_else(|| ctes.get(&table_name.to_ascii_lowercase()).cloned())
-                .ok_or_else(|| sql_rejected("wildcard", "relation schema is unavailable"))?;
+                .ok_or_else(|| {
+                    sql_rejected(SqlStage::Wildcard, "relation schema is unavailable")
+                })?;
             Ok(RelationColumns {
                 qualifier: alias
                     .as_ref()
@@ -417,14 +495,14 @@ fn relation_columns(
             let columns = rewrite_query_with_ctes(subquery, ctes)?;
             let qualifier = alias
                 .as_ref()
-                .ok_or_else(|| sql_rejected("wildcard", "derived tables require an alias"))?
+                .ok_or_else(|| sql_rejected(SqlStage::Wildcard, "derived tables require an alias"))?
                 .name
                 .value
                 .clone();
             Ok(RelationColumns { qualifier, columns })
         }
         _ => Err(sql_rejected(
-            "wildcard",
+            SqlStage::Wildcard,
             "unsupported relation in wildcard scope",
         )),
     }
@@ -460,14 +538,14 @@ fn wildcard_options_empty(options: &sqlparser::ast::WildcardAdditionalOptions) -
 fn single_name(name: &ObjectName) -> std::result::Result<String, QueryError> {
     if name.0.len() != 1 {
         return Err(sql_rejected(
-            "allowlist",
+            SqlStage::Allowlist,
             "qualified object names are not allowed",
         ));
     }
     name.0[0]
         .as_ident()
         .map(|ident| ident.value.clone())
-        .ok_or_else(|| sql_rejected("allowlist", "dynamic object names are not allowed"))
+        .ok_or_else(|| sql_rejected(SqlStage::Allowlist, "dynamic object names are not allowed"))
 }
 
 fn expression_name(expr: &SqlExpr) -> String {
@@ -549,7 +627,7 @@ const fn access_rank(access: AccessClass) -> u8 {
     }
 }
 
-pub(super) fn sql_rejected(stage: &'static str, reason: &'static str) -> QueryError {
+pub(super) fn sql_rejected(stage: SqlStage, reason: &'static str) -> QueryError {
     QueryError::SqlRejected { stage, reason }
 }
 
@@ -560,12 +638,15 @@ fn collect_ctes(
     if let Some(with) = &query.with {
         if with.recursive {
             return Err(sql_rejected(
-                "allowlist",
+                SqlStage::Allowlist,
                 "recursive CTEs are not supported",
             ));
         }
         if names.len().saturating_add(with.cte_tables.len()) > MAX_CTES {
-            return Err(sql_rejected("complexity", "query has too many CTEs"));
+            return Err(sql_rejected(
+                SqlStage::Complexity,
+                "query has too many CTEs",
+            ));
         }
         for cte in &with.cte_tables {
             names.insert(cte.alias.name.value.to_ascii_lowercase());
@@ -595,7 +676,7 @@ impl ReadOnlyVisitor {
     }
 
     fn reject(reason: &'static str) -> ControlFlow<Box<QueryError>> {
-        ControlFlow::Break(Box::new(sql_rejected("allowlist", reason)))
+        ControlFlow::Break(Box::new(sql_rejected(SqlStage::Allowlist, reason)))
     }
 }
 
@@ -693,7 +774,11 @@ impl Visitor for ReadOnlyVisitor {
             return Self::reject("dynamic table names are not allowed");
         };
         let normalized = name.value.to_ascii_lowercase();
-        if QUERY_TABLE_NAMES.contains(&normalized.as_str()) || self.ctes.contains(&normalized) {
+        if QUERY_SCHEMAS
+            .iter()
+            .any(|schema| schema.name == normalized.as_str())
+            || self.ctes.contains(&normalized)
+        {
             ControlFlow::Continue(())
         } else {
             Self::reject("only canonical AQL tables and query CTEs are allowed")
