@@ -1,5 +1,7 @@
-use std::io::{BufRead, BufReader, Read};
+use std::cell::Cell;
+use std::io::{BufReader, Read};
 
+use aql_adapter_api::util::read_limited_line;
 use aql_adapter_api::{AdapterError, AdapterWarningKind};
 use chrono::{DateTime, Utc};
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -55,58 +57,19 @@ pub(crate) struct NextEvent {
     pub bytes_read: u64,
 }
 
-/// Reads one newline-terminated record without materializing more than
-/// `maximum` payload bytes, mirroring the bounded readers used by the Claude
-/// Code and Kimi Code adapters. Returns the payload without the newline,
-/// whether the record was newline-terminated, and the consumed byte count.
-pub(crate) fn read_limited_line<R: Read>(
-    reader: &mut BufReader<R>,
-    maximum: usize,
-    resource: &str,
-) -> Result<Option<(Vec<u8>, bool, usize)>, AdapterError> {
-    let mut output = Vec::new();
-    let mut consumed = 0;
-    loop {
-        let buffer = reader
-            .fill_buf()
-            .map_err(|_| AdapterError::PermissionDenied {
-                stage: "codex_record_read".to_string(),
-            })?;
-        if buffer.is_empty() {
-            return if output.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some((output, false, consumed)))
-            };
-        }
-        let newline = buffer.iter().position(|byte| *byte == b'\n');
-        let take = newline.map_or(buffer.len(), |index| index + 1);
-        let payload = if newline.is_some() { take - 1 } else { take };
-        if output.len() + payload > maximum {
-            return Err(AdapterError::BudgetExceeded {
-                resource: resource.to_string(),
-                actual: (output.len() + payload) as u64,
-            });
-        }
-        output.extend_from_slice(&buffer[..payload]);
-        reader.consume(take);
-        consumed += take;
-        if newline.is_some() {
-            return Ok(Some((output, true, consumed)));
-        }
-    }
-}
-
 pub(crate) fn parse_next<R: Read>(
     reader: &mut BufReader<R>,
     fields: &ReadFields,
+    buffer: &mut Vec<u8>,
 ) -> Result<NextEvent, AdapterError> {
     let mut bytes_read = 0_u64;
     loop {
-        let Some((line, complete, consumed)) = read_limited_line(
+        let Some((complete, consumed)) = read_limited_line(
             reader,
+            buffer,
             MAX_ROLLOUT_RECORD_BYTES,
             "codex_rollout_record_bytes",
+            "codex_record_read",
         )?
         else {
             return Ok(NextEvent {
@@ -116,7 +79,7 @@ pub(crate) fn parse_next<R: Read>(
             });
         };
         bytes_read += consumed as u64;
-        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+        if buffer.iter().all(|byte| byte.is_ascii_whitespace()) {
             if complete {
                 continue;
             }
@@ -126,10 +89,14 @@ pub(crate) fn parse_next<R: Read>(
                 bytes_read,
             });
         }
-        let mut deserializer = serde_json::Deserializer::from_slice(&line);
-        let parsed = (EventSeed { fields })
-            .deserialize(&mut deserializer)
-            .and_then(|event| deserializer.end().map(|()| event));
+        let failure: Cell<Option<&'static str>> = Cell::new(None);
+        let mut deserializer = serde_json::Deserializer::from_slice(buffer);
+        let parsed = (EventSeed {
+            fields,
+            failure: &failure,
+        })
+        .deserialize(&mut deserializer)
+        .and_then(|event| deserializer.end().map(|()| event));
         return match parsed {
             Ok(event) => {
                 let warnings = if event.event_type.as_deref().is_some_and(|kind| {
@@ -158,7 +125,7 @@ pub(crate) fn parse_next<R: Read>(
                 bytes_read,
             }),
             Err(_) => Err(AdapterError::CorruptSource {
-                stage: "parse_rollout".to_string(),
+                stage: failure.get().unwrap_or("parse_rollout").to_string(),
             }),
         };
     }
@@ -174,8 +141,9 @@ where
     F: FnMut(ParsedEvent) -> bool,
 {
     let mut warnings = Vec::new();
+    let mut buffer = Vec::new();
     loop {
-        let next = parse_next(&mut reader, &fields)?;
+        let next = parse_next(&mut reader, &fields, &mut buffer)?;
         warnings.extend(next.warnings);
         match next.event {
             Some(event) => {
@@ -190,6 +158,7 @@ where
 
 struct EventSeed<'a> {
     fields: &'a ReadFields,
+    failure: &'a Cell<Option<&'static str>>,
 }
 
 impl<'de> DeserializeSeed<'de> for EventSeed<'_> {
@@ -201,12 +170,14 @@ impl<'de> DeserializeSeed<'de> for EventSeed<'_> {
     {
         deserializer.deserialize_map(EventVisitor {
             fields: self.fields,
+            failure: self.failure,
         })
     }
 }
 
 struct EventVisitor<'a> {
     fields: &'a ReadFields,
+    failure: &'a Cell<Option<&'static str>>,
 }
 
 impl<'de> Visitor<'de> for EventVisitor<'_> {
@@ -226,13 +197,18 @@ impl<'de> Visitor<'de> for EventVisitor<'_> {
                 "type" => event.event_type = Some(map.next_value()?),
                 "timestamp" => {
                     let value: String = map.next_value()?;
-                    event.timestamp = DateTime::parse_from_rfc3339(&value)
-                        .ok()
-                        .map(|value| value.with_timezone(&Utc));
+                    match DateTime::parse_from_rfc3339(&value) {
+                        Ok(parsed) => event.timestamp = Some(parsed.with_timezone(&Utc)),
+                        Err(_) => {
+                            self.failure.set(Some("codex_timestamp"));
+                            return Err(serde::de::Error::custom("invalid codex timestamp"));
+                        }
+                    }
                 }
                 "payload" => {
                     event.payload = map.next_value_seed(PayloadSeed {
                         fields: self.fields,
+                        failure: self.failure,
                     })?;
                 }
                 _ => {
@@ -246,6 +222,7 @@ impl<'de> Visitor<'de> for EventVisitor<'_> {
 
 struct PayloadSeed<'a> {
     fields: &'a ReadFields,
+    failure: &'a Cell<Option<&'static str>>,
 }
 
 impl<'de> DeserializeSeed<'de> for PayloadSeed<'_> {
@@ -257,12 +234,14 @@ impl<'de> DeserializeSeed<'de> for PayloadSeed<'_> {
     {
         deserializer.deserialize_map(PayloadVisitor {
             fields: self.fields,
+            failure: self.failure,
         })
     }
 }
 
 struct PayloadVisitor<'a> {
     fields: &'a ReadFields,
+    failure: &'a Cell<Option<&'static str>>,
 }
 
 impl<'de> Visitor<'de> for PayloadVisitor<'_> {
@@ -288,7 +267,13 @@ impl<'de> Visitor<'de> for PayloadVisitor<'_> {
                 }
                 "arguments" if self.fields.arguments => {
                     let value: String = map.next_value()?;
-                    payload.arguments = serde_json::from_str(&value).ok();
+                    match serde_json::from_str(&value) {
+                        Ok(parsed) => payload.arguments = Some(parsed),
+                        Err(_) => {
+                            self.failure.set(Some("codex_arguments"));
+                            return Err(serde::de::Error::custom("invalid codex arguments"));
+                        }
+                    }
                 }
                 "output" if self.fields.output => payload.output = Some(map.next_value()?),
                 "changes" if self.fields.artifacts => {
@@ -504,20 +489,22 @@ mod tests {
         let bytes = b"{\"type\":\"session_meta\",\"payload\":{}}\n{\"type\":\"turn_context\",\"payload\":{}}\n";
         let mut reader = BufReader::new(Cursor::new(bytes));
         let fields = ReadFields::default();
+        let mut buffer = Vec::new();
 
-        let first = parse_next(&mut reader, &fields).expect("first event must parse");
+        let first = parse_next(&mut reader, &fields, &mut buffer).expect("first event must parse");
         assert_eq!(
             first.event.and_then(|event| event.event_type).as_deref(),
             Some("session_meta")
         );
 
-        let second = parse_next(&mut reader, &fields).expect("second event must parse");
+        let second =
+            parse_next(&mut reader, &fields, &mut buffer).expect("second event must parse");
         assert_eq!(
             second.event.and_then(|event| event.event_type).as_deref(),
             Some("turn_context")
         );
 
-        let end = parse_next(&mut reader, &fields).expect("end of stream is valid");
+        let end = parse_next(&mut reader, &fields, &mut buffer).expect("end of stream is valid");
         assert!(end.event.is_none());
         assert!(end.warnings.is_empty());
     }
@@ -540,6 +527,39 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_arguments_fail_closed_with_a_stable_stage() {
+        let bytes = b"{\"timestamp\":\"2026-01-01T00:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"example_tool\",\"call_id\":\"call-fixture-1\",\"arguments\":\"{unclosed\"}}\n";
+        let mut reader = BufReader::new(Cursor::new(&bytes[..]));
+        let fields = ReadFields {
+            arguments: true,
+            ..ReadFields::default()
+        };
+        let error = match parse_next(&mut reader, &fields, &mut Vec::new()) {
+            Ok(_) => panic!("corrupt arguments must fail the record"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            AdapterError::CorruptSource { stage } if stage == "codex_arguments"
+        ));
+    }
+
+    #[test]
+    fn corrupt_timestamp_fails_closed_with_a_stable_stage() {
+        let bytes =
+            b"{\"timestamp\":\"not-a-timestamp\",\"type\":\"session_meta\",\"payload\":{}}\n";
+        let mut reader = BufReader::new(Cursor::new(&bytes[..]));
+        let error = match parse_next(&mut reader, &ReadFields::default(), &mut Vec::new()) {
+            Ok(_) => panic!("corrupt timestamp must fail the record"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            AdapterError::CorruptSource { stage } if stage == "codex_timestamp"
+        ));
+    }
+
+    #[test]
     fn oversized_record_fails_before_materialization() {
         let mut bytes = b"{\"type\":\"".to_vec();
         bytes.extend(std::iter::repeat_n(b'x', MAX_ROLLOUT_RECORD_BYTES));
@@ -547,6 +567,7 @@ mod tests {
         let error = match parse_next(
             &mut BufReader::new(Cursor::new(bytes)),
             &ReadFields::default(),
+            &mut Vec::new(),
         ) {
             Ok(_) => panic!("oversized record must fail the bounded read"),
             Err(error) => error,

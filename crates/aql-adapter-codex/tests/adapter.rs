@@ -1342,3 +1342,289 @@ fn oversized_session_index_record_fails_the_bounded_read() {
     drop(result);
     fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
 }
+
+#[test]
+fn hostile_view_and_trigger_definitions_do_not_affect_scans() {
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    let database = root.join("sqlite/state_5.sqlite");
+    Connection::open(&database)
+        .expect("fixture database must open")
+        .execute_batch(
+            "CREATE VIEW synthetic_hostile_view AS
+               SELECT id, title FROM threads WHERE archived = 0;
+             CREATE TRIGGER synthetic_hostile_trigger AFTER INSERT ON threads BEGIN
+               SELECT RAISE(ABORT, 'synthetic hostile trigger');
+             END;",
+        )
+        .expect("hostile fixture definitions must install");
+    let entries_before = directory_entries(database.parent().expect("database has a parent"));
+
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let mut scan = request(
+        source.clone(),
+        TableName::Sessions,
+        &["session_id", "title"],
+    );
+    scan.access.content = true;
+    let records = adapter
+        .scan(scan)
+        .expect("hostile definitions must not block the session scan")
+        .records
+        .collect::<Result<Vec<_>, _>>()
+        .expect("hostile definitions must not change session records");
+    assert_eq!(records.len(), 1);
+    let CanonicalRecord::Session(session) = &records[0] else {
+        panic!("expected a session record");
+    };
+    assert_eq!(session.title.as_deref(), Some("Synthetic minimal session"));
+
+    let messages = adapter
+        .scan(request(
+            source,
+            TableName::Messages,
+            &["message_id", "role"],
+        ))
+        .expect("hostile definitions must not block the rollout scan")
+        .records
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rollout records must stay valid");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(
+        entries_before,
+        directory_entries(database.parent().expect("database has a parent")),
+        "hardened reads must not create sidecars"
+    );
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn sqlite_session_scan_charges_bytes_read() {
+    let fixtures = fixture_root();
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &fixtures.join("minimal"));
+    let mut scan = request(source, TableName::Sessions, &["session_id"]);
+    scan.budget.max_bytes_read = 1;
+    let mut result = adapter
+        .scan(scan)
+        .expect("creating a session stream must not read the source");
+    assert!(matches!(
+        result.records.next(),
+        Some(Err(AdapterError::BudgetExceeded { resource, .. })) if resource == "bytes_read"
+    ));
+    drop(result);
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn drifting_column_type_fails_closed_instead_of_silent_null() {
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    Connection::open(root.join("sqlite/state_5.sqlite"))
+        .expect("fixture database must open")
+        .execute("UPDATE threads SET title = x'0102'", [])
+        .expect("fixture type drift must install");
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let mut scan = request(source, TableName::Sessions, &["session_id", "title"]);
+    scan.access.content = true;
+    let mut result = adapter
+        .scan(scan)
+        .expect("creating a session stream must not read the source");
+    let actual = result.records.next();
+    let actual_stage = match &actual {
+        Some(Err(error)) => error.to_string(),
+        Some(Ok(_)) => "unexpected record".to_string(),
+        None => "end-of-stream".to_string(),
+    };
+    assert!(
+        matches!(actual, Some(Err(AdapterError::CorruptSource { .. }))),
+        "BLOB in a TEXT column must fail closed, got: {actual_stage}"
+    );
+    drop(result);
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn corrupt_arguments_and_timestamps_fail_closed() {
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    let rollout = root.join("sessions/2026/01/01/rollout-minimal.jsonl");
+    let original = std::fs::read_to_string(&rollout).expect("fixture rollout must be readable");
+
+    let corrupt_arguments = original.replacen(
+        r#""arguments":"{\"value\":\"synthetic\"}""#,
+        r#""arguments":"{unclosed""#,
+        1,
+    );
+    assert_ne!(corrupt_arguments, original);
+    std::fs::write(&rollout, &corrupt_arguments).expect("fixture rollout must be writable");
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let mut tools = request(source, TableName::ToolCalls, &["arguments"]);
+    tools.access.tool_input = true;
+    let mut result = adapter
+        .scan(tools)
+        .expect("creating a tool stream must not read the source");
+    let actual = result.records.next();
+    let actual_stage = match &actual {
+        Some(Err(error)) => error.to_string(),
+        Some(Ok(_)) => "unexpected record".to_string(),
+        None => "end-of-stream".to_string(),
+    };
+    assert!(
+        matches!(actual, Some(Err(AdapterError::CorruptSource { stage })) if stage == "codex_arguments"),
+        "corrupt arguments must fail closed at codex_arguments, got: {actual_stage}"
+    );
+    drop(result);
+
+    let corrupt_timestamp = original.replacen(
+        r#""timestamp":"2026-01-01T00:00:01Z""#,
+        r#""timestamp":"not-a-timestamp""#,
+        1,
+    );
+    assert_ne!(corrupt_timestamp, original);
+    std::fs::write(&rollout, &corrupt_timestamp).expect("fixture rollout must be writable");
+    let source = manifest(&adapter, &root);
+    let mut result = adapter
+        .scan(request(source, TableName::Messages, &["message_id"]))
+        .expect("creating a message stream must not read the source");
+    assert!(matches!(
+        result.records.next(),
+        Some(Err(AdapterError::CorruptSource { stage })) if stage == "codex_timestamp"
+    ));
+    drop(result);
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn unpaired_tool_output_warns_instead_of_silent_drop() {
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    let rollout = root.join("sessions/2026/01/01/rollout-minimal.jsonl");
+    let original = std::fs::read_to_string(&rollout).expect("fixture rollout must be readable");
+    let modified = original.replacen(
+        r#""type":"function_call_output","call_id":"call-fixture-1""#,
+        r#""type":"function_call_output","call_id":"call-fixture-unpaired""#,
+        1,
+    );
+    assert_ne!(modified, original);
+    std::fs::write(&rollout, modified).expect("fixture rollout must be writable");
+
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let result = adapter
+        .scan(request(source, TableName::ToolCalls, &["tool_call_id"]))
+        .expect("unpaired output must not fail the scan");
+    let diagnostics = result.diagnostics.clone();
+    let records = result
+        .records
+        .collect::<Result<Vec<_>, _>>()
+        .expect("records must remain valid");
+    assert_eq!(records.len(), 1);
+    let CanonicalRecord::ToolCall(call) = &records[0] else {
+        panic!("expected a tool call");
+    };
+    assert_eq!(call.status.as_deref(), Some("pending"));
+    assert!(call.output.is_none());
+    assert!(
+        diagnostics
+            .snapshot()
+            .expect("diagnostics must remain readable")
+            .iter()
+            .any(
+                |warning| warning.kind == AdapterWarningKind::IncompleteCapability
+                    && warning.stage == "unpaired_tool_output"
+            )
+    );
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn out_of_range_session_timestamp_fails_closed() {
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    Connection::open(root.join("sqlite/state_5.sqlite"))
+        .expect("fixture database must open")
+        .execute("UPDATE threads SET created_at_ms = 9223372036854775807", [])
+        .expect("fixture timestamp drift must install");
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let mut result = adapter
+        .scan(request(
+            source,
+            TableName::Sessions,
+            &["session_id", "created_at"],
+        ))
+        .expect("creating a session stream must not read the source");
+    let actual = result.records.next();
+    let actual_stage = match &actual {
+        Some(Err(error)) => error.to_string(),
+        Some(Ok(_)) => "unexpected record".to_string(),
+        None => "end-of-stream".to_string(),
+    };
+    assert!(
+        matches!(actual, Some(Err(AdapterError::CorruptSource { stage })) if stage == "codex_session_created"),
+        "out-of-range epoch millis must fail closed at codex_session_created, got: {actual_stage}"
+    );
+    drop(result);
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}
+
+#[test]
+fn tool_calls_without_call_id_get_unique_deterministic_ids() {
+    let fixtures = fixture_root();
+    let root = fixtures.join("minimal");
+    let rollout = root.join("sessions/2026/01/01/rollout-minimal.jsonl");
+    std::fs::write(
+        &rollout,
+        concat!(
+            "{\"timestamp\":\"2026-01-01T00:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"example_tool\",\"arguments\":\"{\\\"value\\\":\\\"synthetic\\\"}\"}}\n",
+            "{\"timestamp\":\"2026-01-01T00:00:04Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"example_tool\",\"arguments\":\"{\\\"value\\\":\\\"synthetic\\\"}\"}}\n",
+        ),
+    )
+    .expect("fixture rollout must be writable");
+
+    let adapter = CodexAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let collect_ids = |source: &SourceManifest| {
+        adapter
+            .scan(request(
+                source.clone(),
+                TableName::ToolCalls,
+                &["tool_call_id", "status"],
+            ))
+            .expect("id-less tool calls must not fail the scan")
+            .records
+            .map(|record| {
+                record.map(|record| match record {
+                    CanonicalRecord::ToolCall(call) => {
+                        (call.tool_call_id.as_str().to_string(), call.status)
+                    }
+                    _ => panic!("expected a tool call"),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("records must remain valid")
+    };
+    let first = collect_ids(&source);
+    assert_eq!(first.len(), 2, "both id-less tool calls must appear");
+    assert_ne!(
+        first[0].0, first[1].0,
+        "id-less tool calls must not share one canonical identity"
+    );
+    assert!(
+        first
+            .iter()
+            .all(|(id, status)| id.contains("missing-call-id")
+                && status.as_deref() == Some("pending")),
+        "id-less tool calls keep the missing-call-id marker and pending status: {first:?}"
+    );
+    assert_eq!(
+        collect_ids(&source),
+        first,
+        "derived identities must be deterministic across scans"
+    );
+    fs::remove_dir_all(fixtures).expect("fixture tree must be removable");
+}

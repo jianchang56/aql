@@ -14,26 +14,37 @@ use aql_adapter_api::{
     ColumnCapability, ColumnName, FileAccessObserver, Literal, ProbeRequest, ProbeResult,
     PushdownReport, PushdownState, ResourceBudget, ScanDiagnostics, ScanRequest, ScanResult,
     SnapshotReport, SnapshotStrength, SourceKind, TableName, check_scan_state,
+    util::{column_capability, immutable_uri, limit_pushdown, projected, read_limited_line},
     validate_projection_access,
 };
 use aql_model::{
-    AccessClass, ArtifactRecord, CanonicalRecord, EntityId, IdentityConfidence, MessageRecord,
-    NativeId, Provenance, SessionEdgeRecord, SessionRecord, SnapshotState, SnapshotToken, SourceId,
+    ArtifactRecord, CanonicalRecord, EntityId, IdentityConfidence, MessageRecord, NativeId,
+    Provenance, SessionEdgeRecord, SessionRecord, SnapshotState, SnapshotToken, SourceId,
     SourceManifest, ToolCallRecord, installation_scoped_hmac,
 };
 use chrono::{DateTime, Utc};
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
+mod cache;
 mod rollout;
 
-use rollout::{ParsedArtifactChange, ParsedPayload, ReadFields, parse_next, read_limited_line};
+use cache::{
+    CacheLookup, FileCacheKey, ParseCacheHandle, ParsedRolloutFile, SensitiveClasses,
+    required_classes,
+};
+use rollout::{ParsedArtifactChange, ParsedEvent, ParsedPayload, ReadFields, parse_next};
 
 pub use aql_adapter_api as adapter_api;
 pub use aql_model as model;
 
 const MAX_INDEX_RECORD_BYTES: usize = 1024 * 1024;
+
+/// Number of raw `threads` rows fetched per prepared-statement execution in
+/// the paged session stream.
+const SESSION_BATCH_SIZE: usize = 256;
 
 type FileIdentity = aql_fs::FileIdentity;
 
@@ -53,28 +64,42 @@ struct RootBinding {
 }
 
 /// Read-only adapter for Codex session metadata, rollout streams, and artifacts.
+///
+/// One adapter instance serves one query (callers rebind sources per query);
+/// `parse_cache` holds the single-pass parse of each rollout file for that
+/// lifetime only, bounded by an in-memory byte cap.
 pub struct CodexAdapter {
     installation_salt: Vec<u8>,
     observer: Option<Arc<dyn FileAccessObserver>>,
     roots: Mutex<BTreeMap<SourceId, RootBinding>>,
+    parse_cache: ParseCacheHandle,
 }
 
-struct RolloutFileState {
-    reader: BufReader<std::io::Take<File>>,
-    session_id: EntityId,
-    sequence: i64,
-    pending_tools: VecDeque<ToolCallRecord>,
-    pending_artifacts: VecDeque<ArtifactRecord>,
+/// Projection-masked records of one rollout file being replayed, plus the
+/// end-of-file identity re-check owed when the parse came from the cache.
+struct ReplayFile {
+    locator: PathBuf,
+    identity: FileIdentity,
+    len: u64,
+    records: VecDeque<CanonicalRecord>,
+    recheck: bool,
+    since_check: u64,
 }
 
+/// Cancellation/deadline polling cadence while replaying a cached parse.
+const REPLAY_CHECK_RECORDS: u64 = 1024;
+
+/// Streams one canonical rollout table, parsing each rollout file once per
+/// adapter (query) lifetime and replaying cached parses afterwards.
 struct RolloutRecordStream {
     root: RootBinding,
     observer: Option<Arc<dyn FileAccessObserver>>,
     connection: Option<Connection>,
     request: ScanRequest,
     diagnostics: ScanDiagnostics,
+    cache: ParseCacheHandle,
     after_id: Option<String>,
-    current: Option<RolloutFileState>,
+    current: Option<ReplayFile>,
     emitted: u64,
     finished: bool,
     installation_salt: Vec<u8>,
@@ -84,11 +109,14 @@ struct SessionRecordStream {
     root: RootBinding,
     observer: Option<Arc<dyn FileAccessObserver>>,
     connection: Option<Connection>,
+    query: Option<SessionQuery>,
+    buffered: VecDeque<CanonicalRecord>,
     index_titles: Option<BTreeMap<String, String>>,
     request: ScanRequest,
     diagnostics: ScanDiagnostics,
     after_id: Option<String>,
     emitted: u64,
+    exhausted: bool,
     finished: bool,
 }
 
@@ -99,13 +127,10 @@ impl RolloutRecordStream {
         }
     }
 
-    fn bytes_read(&self, kind: SourceKind, count: u64) {
-        if let Some(observer) = &self.observer {
-            observer.bytes_read(kind, count);
-        }
-    }
-
-    fn open_next_file(&mut self) -> Result<bool, AdapterError> {
+    /// Advances to the next located rollout file, serving its parse from the
+    /// per-query cache when identity, pinned length, grant, and needed
+    /// classes all match, and parsing it once otherwise.
+    fn load_next_file(&mut self) -> Result<Option<ReplayFile>, AdapterError> {
         loop {
             if self.connection.is_none() {
                 self.connection = Some(open_state_database(&self.root, &self.observer)?);
@@ -115,21 +140,29 @@ impl RolloutRecordStream {
                     stage: "rollout_connection".to_string(),
                 });
             };
+            // Both locator statements are prepared once per connection and
+            // reused for every rollout file, matching the session/edge scans.
             let row = match &self.after_id {
-                Some(after_id) => connection.query_row(
-                    "SELECT id, rollout_path FROM threads WHERE id > ?1 ORDER BY id LIMIT 1",
-                    [after_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                ),
-                None => connection.query_row(
-                    "SELECT id, rollout_path FROM threads ORDER BY id LIMIT 1",
-                    [],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                ),
+                Some(after_id) => connection
+                    .prepare_cached(
+                        "SELECT id, rollout_path FROM threads WHERE id > ?1 ORDER BY id LIMIT 1",
+                    )
+                    .and_then(|mut statement| {
+                        statement.query_row([after_id], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                    }),
+                None => connection
+                    .prepare_cached("SELECT id, rollout_path FROM threads ORDER BY id LIMIT 1")
+                    .and_then(|mut statement| {
+                        statement.query_row([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                    }),
             };
             let (native_id, relative_path) = match row {
                 Ok(row) => row,
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
                 Err(_) => {
                     return Err(AdapterError::CorruptSource {
                         stage: "read_rollout_locator".to_string(),
@@ -139,7 +172,7 @@ impl RolloutRecordStream {
             self.after_id = Some(native_id.clone());
             let locator = validate_rollout_locator(&relative_path)?;
             self.opened(SourceKind::Rollout);
-            let (file, file_size) = match open_rollout_file(&self.root, &locator) {
+            let (file, file_size, identity) = match open_rollout_file(&self.root, &locator) {
                 Ok(opened) => opened,
                 Err(AdapterError::NotFound { .. }) => {
                     self.diagnostics.push(AdapterWarning {
@@ -151,23 +184,58 @@ impl RolloutRecordStream {
                 }
                 Err(error) => return Err(error),
             };
+            let needed = required_classes(self.request.table, &self.request.projection);
+            let key = FileCacheKey::new(
+                &self.request.source.source_id,
+                &native_id,
+                identity,
+                file_size,
+                self.request.access,
+            );
+            let lookup = self
+                .cache
+                .lock()
+                .map_err(|_| AdapterError::Internal {
+                    stage: "codex_parse_cache".to_string(),
+                })?
+                .lookup(&key, needed);
             let native = NativeId::new(native_id);
-            self.current = Some(RolloutFileState {
-                reader: BufReader::new(file.take(file_size)),
-                session_id: EntityId::from_parts("codex", &self.request.source.source_id, &native),
-                sequence: 0,
-                pending_tools: VecDeque::new(),
-                pending_artifacts: VecDeque::new(),
-            });
-            return Ok(true);
+            let session_id = EntityId::from_parts("codex", &self.request.source.source_id, &native);
+            let (parsed, from_cache) = match lookup {
+                CacheLookup::Hit(parsed) => (parsed, true),
+                CacheLookup::Miss(widened) => {
+                    let extract = needed.union(widened).granted(self.request.access);
+                    let (parsed, complete) = parse_file(
+                        file,
+                        file_size,
+                        &session_id,
+                        &self.request,
+                        extract,
+                        &self.diagnostics,
+                        &self.installation_salt,
+                        &self.observer,
+                    )?;
+                    let parsed = Arc::new(parsed);
+                    if complete {
+                        self.cache
+                            .lock()
+                            .map_err(|_| AdapterError::Internal {
+                                stage: "codex_parse_cache".to_string(),
+                            })?
+                            .insert(key, Arc::clone(&parsed));
+                    }
+                    (parsed, false)
+                }
+            };
+            return Ok(Some(ReplayFile {
+                locator,
+                identity,
+                len: file_size,
+                records: replay_records(&parsed, self.request.table, &self.request.projection),
+                recheck: from_cache,
+                since_check: 0,
+            }));
         }
-    }
-
-    fn finish_record(&mut self, record: CanonicalRecord) -> Result<CanonicalRecord, AdapterError> {
-        check_record_value_size(&record, &self.request.budget)?;
-        self.request.budget.charge_records(1)?;
-        self.emitted += 1;
-        Ok(record)
     }
 
     /// Releases the shared connection and any open rollout file so a terminal
@@ -175,6 +243,182 @@ impl RolloutRecordStream {
     fn release(&mut self) {
         self.current = None;
         self.connection = None;
+    }
+}
+
+impl SessionRecordStream {
+    /// Fetches the next batch of session rows through the stream's fixed
+    /// prepared statement, charging the shared budget for every row read.
+    /// Returns `false` once the underlying query is exhausted.
+    fn refill(&mut self) -> Result<bool, AdapterError> {
+        if self.connection.is_none() {
+            self.connection = Some(open_state_database(&self.root, &self.observer)?);
+        }
+        if self.query.is_none() {
+            let Some(connection) = self.connection.as_ref() else {
+                return Err(AdapterError::Internal {
+                    stage: "session_connection".to_string(),
+                });
+            };
+            self.query = Some(SessionQuery::prepare(&self.request, connection)?);
+        }
+        let (Some(connection), Some(query)) = (self.connection.as_ref(), self.query.as_ref())
+        else {
+            return Err(AdapterError::Internal {
+                stage: "session_connection".to_string(),
+            });
+        };
+        let mut statement =
+            connection
+                .prepare_cached(&query.sql)
+                .map_err(|_| AdapterError::UnsupportedFormat {
+                    stage: "prepare_threads".to_string(),
+                })?;
+        let mut rows = statement.query([self.after_id.as_deref()]).map_err(|_| {
+            AdapterError::CorruptSource {
+                stage: "query_threads".to_string(),
+            }
+        })?;
+        let mut read_any = false;
+        while let Some(row) = rows.next().map_err(|_| AdapterError::CorruptSource {
+            stage: "read_threads".to_string(),
+        })? {
+            read_any = true;
+            check_scan_state(
+                &self.request.cancellation,
+                &self.request.budget,
+                self.emitted + self.buffered.len() as u64 + 1,
+                self.request.budget.bytes_read_used(),
+            )?;
+            let native_id: String = row.get("id").map_err(db_read_error)?;
+            let title = query
+                .title
+                .then(|| row.get::<_, Option<String>>("title"))
+                .transpose()
+                .map_err(db_read_error)?
+                .flatten();
+            let preview = query
+                .preview
+                .then(|| row.get::<_, Option<String>>("preview"))
+                .transpose()
+                .map_err(db_read_error)?
+                .flatten();
+            let cwd = query
+                .cwd
+                .then(|| row.get::<_, Option<String>>("cwd"))
+                .transpose()
+                .map_err(db_read_error)?
+                .flatten();
+            let model = query
+                .model
+                .then(|| row.get::<_, Option<String>>("model"))
+                .transpose()
+                .map_err(db_read_error)?
+                .flatten();
+            let provider = query
+                .provider
+                .then(|| row.get::<_, Option<String>>("model_provider"))
+                .transpose()
+                .map_err(db_read_error)?
+                .flatten();
+            let created_at_ms = query
+                .created_at
+                .then(|| row.get::<_, Option<i64>>("created_at_ms"))
+                .transpose()
+                .map_err(db_read_error)?
+                .flatten();
+            let updated_at_ms = query
+                .updated_at_ms
+                .then(|| row.get::<_, Option<i64>>("updated_at_ms"))
+                .transpose()
+                .map_err(db_read_error)?
+                .flatten();
+            let archived = query
+                .archived
+                .then(|| row.get::<_, Option<i64>>("archived"))
+                .transpose()
+                .map_err(db_read_error)?
+                .flatten()
+                .map(|value| value != 0);
+            let tokens_used = query
+                .tokens_used
+                .then(|| row.get::<_, Option<i64>>("tokens_used"))
+                .transpose()
+                .map_err(db_read_error)?
+                .flatten();
+            // Charge an estimate of the raw row payload selected from SQLite,
+            // mirroring the per-row accounting of the other adapters.
+            let mut row_bytes = native_id.len() as u64;
+            for value in [&title, &preview, &cwd, &model, &provider]
+                .into_iter()
+                .flatten()
+            {
+                row_bytes = row_bytes.saturating_add(value.len() as u64);
+            }
+            for value in [created_at_ms, updated_at_ms, tokens_used] {
+                if value.is_some() {
+                    row_bytes = row_bytes.saturating_add(8);
+                }
+            }
+            if archived.is_some() {
+                row_bytes = row_bytes.saturating_add(1);
+            }
+            self.request.budget.charge_bytes_read(row_bytes)?;
+            // The keyset cursor tracks every raw row read, including rows the
+            // predicate filter drops, so later batches never rescan them.
+            self.after_id = Some(native_id.clone());
+            let native = NativeId::new(native_id);
+            if !matches_session_predicates(&native, updated_at_ms, &self.request.predicates) {
+                continue;
+            }
+            self.request.budget.charge_records(1)?;
+            let entity = EntityId::from_parts("codex", &self.request.source.source_id, &native);
+            let mut record = SessionRecord {
+                session_id: entity,
+                native_id: native,
+                source_id: self.request.source.source_id.clone(),
+                agent_id: "codex".to_string(),
+                title,
+                preview,
+                cwd,
+                project: None,
+                model,
+                provider,
+                created_at: timestamp_millis(created_at_ms, "codex_session_created")?,
+                updated_at: query
+                    .updated_at
+                    .then(|| timestamp_millis(updated_at_ms, "codex_session_updated"))
+                    .transpose()?
+                    .flatten(),
+                status: None,
+                archived,
+                message_count: None,
+                tool_call_count: None,
+                tokens_used,
+                identity_confidence: IdentityConfidence::Exact,
+                snapshot_state: SnapshotState::Weak,
+                provenance: BTreeMap::new(),
+                extensions: BTreeMap::new(),
+            };
+            let provenance_fields = session_provenance_fields(&record, &self.request.projection);
+            record.provenance = provenance_map_for_source(
+                &self.request.source.source_id,
+                Some(&self.request.source.format_fingerprint),
+                "state_database",
+                &provenance_fields,
+            );
+            let record = CanonicalRecord::Session(record);
+            check_record_value_size(&record, &self.request.budget)?;
+            self.buffered.push_back(record);
+            if self
+                .request
+                .limit
+                .is_some_and(|limit| self.emitted + self.buffered.len() as u64 >= limit)
+            {
+                break;
+            }
+        }
+        Ok(read_any)
     }
 }
 
@@ -202,44 +446,29 @@ impl Iterator for SessionRecordStream {
             self.connection = None;
             return Some(Err(error));
         }
-        if self.connection.is_none() {
-            self.connection = Some(match open_state_database(&self.root, &self.observer) {
-                Ok(connection) => connection,
+        while self.buffered.is_empty() && !self.exhausted {
+            match self.refill() {
+                Ok(true) => {}
+                Ok(false) => self.exhausted = true,
                 Err(error) => {
                     self.finished = true;
+                    self.connection = None;
                     return Some(Err(error));
                 }
-            });
-        }
-        let Some(connection) = self.connection.as_ref() else {
-            return Some(Err(AdapterError::Internal {
-                stage: "session_connection".to_string(),
-            }));
-        };
-        let mut page_request = self.request.clone();
-        page_request.limit = Some(1);
-        let loaded = scan_sessions(&page_request, connection, self.after_id.as_deref());
-        let loaded = match loaded {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                self.finished = true;
-                self.connection = None;
-                return Some(Err(error));
             }
-        };
-        let Some(record) = loaded.into_iter().next() else {
+        }
+        let Some(mut record) = self.buffered.pop_front() else {
             self.finished = true;
             self.connection = None;
             return None;
         };
-        let CanonicalRecord::Session(session) = &record else {
+        let CanonicalRecord::Session(session) = &mut record else {
             self.finished = true;
             self.connection = None;
             return Some(Err(AdapterError::Internal {
                 stage: "session_record".to_string(),
             }));
         };
-        self.after_id = Some(session.native_id.as_str().to_string());
         if projected(&self.request.projection, "title") {
             if self.index_titles.is_none() {
                 self.index_titles = Some(
@@ -255,16 +484,32 @@ impl Iterator for SessionRecordStream {
             }
             if let (Some(index_titles), Some(database_title)) =
                 (&self.index_titles, session.title.as_ref())
-                && index_titles
-                    .get(session.native_id.as_str())
-                    .is_some_and(|index_title| index_title != database_title)
-                && let Err(error) = self
+                && let Some(index_title) = index_titles.get(session.native_id.as_str())
+                && index_title != database_title
+            {
+                // Both sides of a title conflict stay in the record's
+                // provenance; the database value remains canonical.
+                session
+                    .provenance
+                    .entry("title".to_string())
+                    .or_default()
+                    .push(Provenance {
+                        source_id: self.request.source.source_id.clone(),
+                        source_kind: "session_index".to_string(),
+                        source_locator: "session_index".to_string(),
+                        source_version: None,
+                        observed_at: Utc::now(),
+                        watermark: None,
+                        derived: false,
+                    });
+                if let Err(error) = self
                     .diagnostics
                     .push(warning(AdapterWarningKind::FieldConflict))
-            {
-                self.finished = true;
-                self.connection = None;
-                return Some(Err(error));
+                {
+                    self.finished = true;
+                    self.connection = None;
+                    return Some(Err(error));
+                }
             }
         }
         self.emitted += 1;
@@ -287,20 +532,23 @@ impl Iterator for RolloutRecordStream {
             return None;
         }
         loop {
-            if let Err(error) = check_scan_state(
-                &self.request.cancellation,
-                &self.request.budget,
-                self.emitted,
-                self.request.budget.bytes_read_used(),
-            ) {
-                self.finished = true;
-                self.release();
-                return Some(Err(error));
-            }
-            if self.current.is_none() {
-                match self.open_next_file() {
-                    Ok(true) => {}
-                    Ok(false) => {
+            let Some(current) = self.current.as_mut() else {
+                if let Err(error) = check_scan_state(
+                    &self.request.cancellation,
+                    &self.request.budget,
+                    self.emitted,
+                    self.request.budget.bytes_read_used(),
+                ) {
+                    self.finished = true;
+                    self.release();
+                    return Some(Err(error));
+                }
+                match self.load_next_file() {
+                    Ok(Some(file)) => {
+                        self.current = Some(file);
+                        continue;
+                    }
+                    Ok(None) => {
                         self.finished = true;
                         self.release();
                         return None;
@@ -311,132 +559,329 @@ impl Iterator for RolloutRecordStream {
                         return Some(Err(error));
                     }
                 }
-            }
-            let mut current = self.current.take()?;
-            if self.request.table == TableName::Artifacts
-                && let Some(artifact) = current.pending_artifacts.pop_front()
-            {
-                self.current = Some(current);
-                return Some(self.finish_record(CanonicalRecord::Artifact(artifact)));
-            }
-            let fields = ReadFields {
-                content: projected(&self.request.projection, "content"),
-                arguments: projected(&self.request.projection, "arguments"),
-                output: projected(&self.request.projection, "output"),
-                artifacts: self.request.table == TableName::Artifacts,
-                artifact_content: projected(&self.request.projection, "content")
-                    || projected(&self.request.projection, "content_json"),
             };
-            let parsed = match parse_next(&mut current.reader, &fields) {
-                Ok(parsed) => parsed,
-                Err(error) => {
+            if current.since_check >= REPLAY_CHECK_RECORDS {
+                if let Err(error) = check_scan_state(
+                    &self.request.cancellation,
+                    &self.request.budget,
+                    self.emitted,
+                    self.request.budget.bytes_read_used(),
+                ) {
                     self.finished = true;
                     self.release();
                     return Some(Err(error));
                 }
-            };
-            if let Err(error) = self.request.budget.charge_bytes_read(parsed.bytes_read) {
+                current.since_check = 0;
+            }
+            if let Some(record) = current.records.pop_front() {
+                if let Err(error) = check_record_value_size(&record, &self.request.budget) {
+                    self.finished = true;
+                    self.release();
+                    return Some(Err(error));
+                }
+                if let Err(error) = self.request.budget.charge_records(1) {
+                    self.finished = true;
+                    self.release();
+                    return Some(Err(error));
+                }
+                current.since_check += 1;
+                self.emitted += 1;
+                return Some(Ok(record));
+            }
+            // The current file's records are drained; a cache-sourced parse
+            // still owes the §9 end-of-scan identity re-check.
+            let current = self.current.take()?;
+            if current.recheck
+                && let Err(error) = revalidate_rollout_path(
+                    &self.root,
+                    &current.locator,
+                    current.identity,
+                    current.len,
+                )
+            {
                 self.finished = true;
                 self.release();
                 return Some(Err(error));
             }
-            self.bytes_read(SourceKind::Rollout, parsed.bytes_read);
-            for kind in parsed.warnings {
-                if let Err(error) = self.diagnostics.push(warning(kind)) {
-                    self.finished = true;
-                    self.release();
-                    return Some(Err(error));
-                }
-            }
-            let Some(event) = parsed.event else {
-                if self.request.table == TableName::ToolCalls
-                    && let Some(call) = current.pending_tools.pop_front()
-                {
-                    self.current = Some(current);
-                    return Some(self.finish_record(CanonicalRecord::ToolCall(call)));
-                }
-                self.current = None;
-                continue;
-            };
-            let is_response_item = event.event_type.as_deref() == Some("response_item");
-            let is_patch_event = self.request.table == TableName::Artifacts
-                && event.event_type.as_deref() == Some("event_msg")
-                && event.payload.item_type.as_deref() == Some("patch_apply_end");
-            if !is_response_item && !is_patch_event {
-                self.current = Some(current);
-                continue;
-            }
-            match (self.request.table, event.payload.item_type.as_deref()) {
-                (TableName::Messages, Some("message")) => {
-                    current.sequence += 1;
-                    let record = CanonicalRecord::Message(message_from_event(
-                        &self.request.source.source_id,
-                        current.session_id.clone(),
-                        current.sequence,
+        }
+    }
+}
+
+/// Per-file parse state shared by the three rollout table builders.
+#[derive(Default)]
+struct RolloutBuilders {
+    message_sequence: i64,
+    tool_sequence: i64,
+    artifact_sequence: i64,
+    /// Pending tool calls paired with their raw store-supplied call IDs so
+    /// `function_call_output` events match exactly instead of by suffix.
+    pending_tools: VecDeque<(Option<String>, ToolCallRecord)>,
+    messages: Vec<MessageRecord>,
+    tool_calls: Vec<ToolCallRecord>,
+    artifacts: Vec<ArtifactRecord>,
+}
+
+impl RolloutBuilders {
+    /// Feeds one parsed event to every table builder; the per-kind sequence
+    /// counters keep canonical IDs identical to the pre-cache per-table scans.
+    fn feed(
+        &mut self,
+        event: ParsedEvent,
+        session_id: &EntityId,
+        request: &ScanRequest,
+        installation_salt: &[u8],
+        diagnostics: &ScanDiagnostics,
+    ) -> Result<(), AdapterError> {
+        let is_response_item = event.event_type.as_deref() == Some("response_item");
+        let is_patch_event = event.event_type.as_deref() == Some("event_msg")
+            && event.payload.item_type.as_deref() == Some("patch_apply_end");
+        if is_response_item {
+            match event.payload.item_type.as_deref() {
+                Some("message") => {
+                    self.message_sequence += 1;
+                    self.messages.push(message_from_event(
+                        &request.source.source_id,
+                        session_id.clone(),
+                        self.message_sequence,
                         event.payload,
                         event.timestamp,
                     ));
-                    self.current = Some(current);
-                    return Some(self.finish_record(record));
                 }
-                (TableName::ToolCalls, Some("function_call")) => {
-                    current.sequence += 1;
-                    current.pending_tools.push_back(tool_from_event(
-                        &self.request.source.source_id,
-                        current.session_id.clone(),
-                        current.sequence,
-                        event.payload,
+                Some("function_call") => {
+                    self.tool_sequence += 1;
+                    let raw_call_id = event.payload.call_id.clone();
+                    self.pending_tools.push_back((
+                        raw_call_id,
+                        tool_from_event(
+                            &request.source.source_id,
+                            session_id.clone(),
+                            self.tool_sequence,
+                            event.payload,
+                        ),
                     ));
-                    self.current = Some(current);
                 }
-                (TableName::ToolCalls, Some("function_call_output")) => {
-                    let call_id = event.payload.call_id.as_deref().unwrap_or("<missing>");
-                    if let Some(index) = current
-                        .pending_tools
-                        .iter()
-                        .position(|call| call.tool_call_id.as_str().ends_with(call_id))
-                    {
-                        let mut call = current.pending_tools.remove(index)?;
+                Some("function_call_output") => {
+                    let call_id = event.payload.call_id.as_deref();
+                    let paired = call_id.and_then(|call_id| {
+                        self.pending_tools
+                            .iter()
+                            .position(|(pending_id, _)| pending_id.as_deref() == Some(call_id))
+                    });
+                    if let Some(index) = paired {
+                        let Some((_, mut call)) = self.pending_tools.remove(index) else {
+                            return Err(AdapterError::Internal {
+                                stage: "tool_call_pairing".to_string(),
+                            });
+                        };
                         call.output = event.payload.output;
                         call.status = Some("success".to_string());
                         if call.output.is_some() {
                             call.provenance.extend(provenance_map_for_source(
-                                &self.request.source.source_id,
+                                &request.source.source_id,
                                 None,
                                 "rollout",
                                 &["output", "status"],
                             ));
                         }
-                        self.current = Some(current);
-                        return Some(self.finish_record(CanonicalRecord::ToolCall(call)));
+                        self.tool_calls.push(call);
+                    } else {
+                        // An output without an exactly matching call ID is
+                        // reported instead of silently dropped, mirroring the
+                        // other adapters' unpaired-result warnings.
+                        diagnostics.push(AdapterWarning {
+                            kind: AdapterWarningKind::IncompleteCapability,
+                            source_kind: "rollout".to_string(),
+                            stage: "unpaired_tool_output".to_string(),
+                        })?;
                     }
-                    self.current = Some(current);
                 }
-                (TableName::Artifacts, Some("patch_apply_end")) => {
-                    let call_id = event.payload.call_id.clone();
-                    for change in event.payload.changes {
-                        current.sequence += 1;
-                        current.pending_artifacts.push_back(artifact_from_change(
-                            &self.request.source.source_id,
-                            current.session_id.clone(),
-                            current.sequence,
-                            call_id.as_deref(),
-                            change,
-                            event.timestamp,
-                            &self.request.projection,
-                            &self.installation_salt,
-                        ));
-                    }
-                    if let Some(artifact) = current.pending_artifacts.pop_front() {
-                        self.current = Some(current);
-                        return Some(self.finish_record(CanonicalRecord::Artifact(artifact)));
-                    }
-                    self.current = Some(current);
-                }
-                _ => self.current = Some(current),
+                _ => {}
+            }
+        } else if is_patch_event {
+            let call_id = event.payload.call_id.clone();
+            for change in event.payload.changes {
+                self.artifact_sequence += 1;
+                self.artifacts.push(artifact_from_change(
+                    &request.source.source_id,
+                    session_id.clone(),
+                    self.artifact_sequence,
+                    call_id.as_deref(),
+                    change,
+                    event.timestamp,
+                    installation_salt,
+                ));
             }
         }
+        Ok(())
     }
+
+    fn finish(self, extract: SensitiveClasses) -> ParsedRolloutFile {
+        ParsedRolloutFile {
+            messages: self.messages,
+            tool_calls: self.tool_calls,
+            artifacts: self.artifacts,
+            extracted: extract,
+        }
+    }
+}
+
+/// Parses one rollout file once, fanning every event out to the messages,
+/// tool_calls, and artifacts builders.
+///
+/// Sensitive values are extracted only for classes in `extract` (already
+/// narrowed to the request grant), preserving the pre-cache per-column
+/// `ReadFields` gating and its failure stages. A scan whose effective limit
+/// is reached mid-file stops early and reports `complete = false` so the
+/// partial parse is never cached.
+#[allow(clippy::too_many_arguments)]
+fn parse_file(
+    file: File,
+    len: u64,
+    session_id: &EntityId,
+    request: &ScanRequest,
+    extract: SensitiveClasses,
+    diagnostics: &ScanDiagnostics,
+    installation_salt: &[u8],
+    observer: &Option<Arc<dyn FileAccessObserver>>,
+) -> Result<(ParsedRolloutFile, bool), AdapterError> {
+    let fields = ReadFields {
+        content: extract.includes(SensitiveClasses::CONTENT),
+        arguments: extract.includes(SensitiveClasses::TOOL_INPUT),
+        output: extract.includes(SensitiveClasses::TOOL_OUTPUT),
+        artifacts: extract.includes(SensitiveClasses::ARTIFACTS),
+        artifact_content: extract.includes(SensitiveClasses::CONTENT),
+    };
+    let mut reader = BufReader::new(file.take(len));
+    let mut buffer = Vec::new();
+    let mut builders = RolloutBuilders::default();
+    let mut complete = true;
+    loop {
+        let parsed = parse_next(&mut reader, &fields, &mut buffer)?;
+        check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
+        request.budget.charge_bytes_read(parsed.bytes_read)?;
+        if let Some(observer) = observer {
+            observer.bytes_read(SourceKind::Rollout, parsed.bytes_read);
+        }
+        for kind in parsed.warnings {
+            diagnostics.push(warning(kind))?;
+        }
+        let Some(event) = parsed.event else {
+            break;
+        };
+        builders.feed(event, session_id, request, installation_salt, diagnostics)?;
+        let produced = match request.table {
+            TableName::Messages => Some(builders.messages.len()),
+            TableName::ToolCalls => Some(builders.tool_calls.len()),
+            TableName::Artifacts => Some(builders.artifacts.len()),
+            _ => None,
+        };
+        if let (Some(produced), Some(limit)) = (produced, request.limit)
+            && produced as u64 >= limit
+        {
+            complete = false;
+            break;
+        }
+    }
+    if complete {
+        // Unpaired calls flush at the pinned end keeping their `pending`
+        // status, exactly as the pre-cache per-table stream emitted them.
+        while let Some((_, call)) = builders.pending_tools.pop_front() {
+            builders.tool_calls.push(call);
+        }
+    }
+    Ok((builders.finish(extract), complete))
+}
+
+/// Clones the cached records of `table`, masking sensitive fields down to the
+/// requesting projection (the cache stores class-wide extractions).
+fn replay_records(
+    parsed: &ParsedRolloutFile,
+    table: TableName,
+    projection: &[ColumnName],
+) -> VecDeque<CanonicalRecord> {
+    match table {
+        TableName::Messages => {
+            let wants_content = projected(projection, "content");
+            parsed
+                .messages
+                .iter()
+                .map(|record| {
+                    let mut record = record.clone();
+                    if !wants_content {
+                        record.content = None;
+                        record.provenance.remove("content");
+                    }
+                    CanonicalRecord::Message(record)
+                })
+                .collect()
+        }
+        TableName::ToolCalls => {
+            let wants_arguments = projected(projection, "arguments");
+            let wants_output = projected(projection, "output");
+            parsed
+                .tool_calls
+                .iter()
+                .map(|record| {
+                    let mut record = record.clone();
+                    if !wants_arguments {
+                        record.arguments = None;
+                        record.provenance.remove("arguments");
+                    }
+                    if !wants_output {
+                        record.output = None;
+                        record.provenance.remove("output");
+                    }
+                    CanonicalRecord::ToolCall(record)
+                })
+                .collect()
+        }
+        TableName::Artifacts => {
+            let wants_content = projected(projection, "content");
+            let wants_json = projected(projection, "content_json");
+            parsed
+                .artifacts
+                .iter()
+                .map(|record| {
+                    let mut record = record.clone();
+                    if !wants_content {
+                        record.content = None;
+                        record.provenance.remove("content");
+                    }
+                    if !wants_json {
+                        record.content_json = None;
+                        record.provenance.remove("content_json");
+                    }
+                    CanonicalRecord::Artifact(record)
+                })
+                .collect()
+        }
+        _ => VecDeque::new(),
+    }
+}
+
+/// Re-checks one located rollout file at the end of a cache replay: the same
+/// binding/identity/length watermark `open_rollout_file` enforces, aligned
+/// with the §9 scan-end check for parses that were not re-read this scan.
+fn revalidate_rollout_path(
+    root: &RootBinding,
+    locator: &Path,
+    identity: FileIdentity,
+    len: u64,
+) -> Result<(), AdapterError> {
+    validate_binding(root)?;
+    let directory = open_bound_root(root)?;
+    let (parent, name) =
+        aql_fs::open_parent(&directory, locator).map_err(|_| AdapterError::SnapshotUnavailable)?;
+    let metadata = parent
+        .symlink_metadata(Path::new(&name))
+        .map_err(|_| AdapterError::SnapshotUnavailable)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() < len {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    if aql_fs::identity(&metadata) != identity {
+        return Err(AdapterError::SnapshotUnavailable);
+    }
+    Ok(())
 }
 
 impl CodexAdapter {
@@ -447,6 +892,21 @@ impl CodexAdapter {
             installation_salt: installation_salt.into(),
             observer: None,
             roots: Mutex::new(BTreeMap::new()),
+            parse_cache: Arc::new(Mutex::new(cache::ParseCache::new())),
+        }
+    }
+
+    /// Creates an adapter with a test-sized parse cache limit.
+    #[cfg(test)]
+    pub(crate) fn new_with_parse_cache_limit(
+        installation_salt: impl Into<Vec<u8>>,
+        parse_cache_bytes: usize,
+    ) -> Self {
+        Self {
+            installation_salt: installation_salt.into(),
+            observer: None,
+            roots: Mutex::new(BTreeMap::new()),
+            parse_cache: Arc::new(Mutex::new(cache::ParseCache::with_limit(parse_cache_bytes))),
         }
     }
 
@@ -564,72 +1024,72 @@ impl CodexAdapter {
 
     fn session_schema() -> Vec<ColumnCapability> {
         vec![
-            column("session_id", AccessClass::Safe),
-            column("native_id", AccessClass::Safe),
-            column("source_id", AccessClass::Safe),
-            column("agent_id", AccessClass::Safe),
-            column("title", AccessClass::Content),
-            column("preview", AccessClass::Content),
-            column("cwd", AccessClass::Path),
-            column("model", AccessClass::Safe),
-            column("provider", AccessClass::Safe),
-            column("created_at", AccessClass::Safe),
-            column("updated_at", AccessClass::Safe),
-            column("archived", AccessClass::Safe),
-            column("tokens_used", AccessClass::Safe),
+            column_capability("session_id"),
+            column_capability("native_id"),
+            column_capability("source_id"),
+            column_capability("agent_id"),
+            column_capability("title"),
+            column_capability("preview"),
+            column_capability("cwd"),
+            column_capability("model"),
+            column_capability("provider"),
+            column_capability("created_at"),
+            column_capability("updated_at"),
+            column_capability("archived"),
+            column_capability("tokens_used"),
         ]
     }
 
     fn message_schema() -> Vec<ColumnCapability> {
         vec![
-            column("message_id", AccessClass::Safe),
-            column("session_id", AccessClass::Safe),
-            column("sequence", AccessClass::Safe),
-            column("role", AccessClass::Safe),
-            column("kind", AccessClass::Safe),
-            column("content", AccessClass::Content),
-            column("created_at", AccessClass::Safe),
+            column_capability("message_id"),
+            column_capability("session_id"),
+            column_capability("sequence"),
+            column_capability("role"),
+            column_capability("kind"),
+            column_capability("content"),
+            column_capability("created_at"),
         ]
     }
 
     fn tool_schema() -> Vec<ColumnCapability> {
         vec![
-            column("tool_call_id", AccessClass::Safe),
-            column("session_id", AccessClass::Safe),
-            column("sequence", AccessClass::Safe),
-            column("tool_name", AccessClass::Safe),
-            column("arguments", AccessClass::ToolInput),
-            column("output", AccessClass::ToolOutput),
-            column("status", AccessClass::Safe),
+            column_capability("tool_call_id"),
+            column_capability("session_id"),
+            column_capability("sequence"),
+            column_capability("tool_name"),
+            column_capability("arguments"),
+            column_capability("output"),
+            column_capability("status"),
         ]
     }
 
     fn session_edge_schema() -> Vec<ColumnCapability> {
         vec![
-            column("edge_id", AccessClass::Safe),
-            column("source_id", AccessClass::Safe),
-            column("parent_session_id", AccessClass::Safe),
-            column("child_session_id", AccessClass::Safe),
-            column("edge_kind", AccessClass::Safe),
-            column("created_at", AccessClass::Safe),
-            column("native_edge_id", AccessClass::Safe),
+            column_capability("edge_id"),
+            column_capability("source_id"),
+            column_capability("parent_session_id"),
+            column_capability("child_session_id"),
+            column_capability("edge_kind"),
+            column_capability("created_at"),
+            column_capability("native_edge_id"),
         ]
     }
 
     fn artifact_schema() -> Vec<ColumnCapability> {
         vec![
-            column("artifact_id", AccessClass::Safe),
-            column("source_id", AccessClass::Safe),
-            column("session_id", AccessClass::Safe),
-            column("tool_call_id", AccessClass::Safe),
-            column("kind", AccessClass::Safe),
-            column("name", AccessClass::Content),
-            column("path", AccessClass::Path),
-            column("media_type", AccessClass::Safe),
-            column("size_bytes", AccessClass::Safe),
-            column("created_at", AccessClass::Safe),
-            column("content", AccessClass::Content),
-            column("content_json", AccessClass::Content),
+            column_capability("artifact_id"),
+            column_capability("source_id"),
+            column_capability("session_id"),
+            column_capability("tool_call_id"),
+            column_capability("kind"),
+            column_capability("name"),
+            column_capability("path"),
+            column_capability("media_type"),
+            column_capability("size_bytes"),
+            column_capability("created_at"),
+            column_capability("content"),
+            column_capability("content_json"),
         ]
     }
 }
@@ -638,19 +1098,28 @@ fn scan_session_edge(
     request: &ScanRequest,
     connection: &Connection,
     after_child_id: Option<&str>,
-) -> Result<Option<(CanonicalRecord, bool)>, AdapterError> {
-    let row = match after_child_id {
-            Some(after) => connection.query_row(
-                "SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges WHERE child_thread_id > ?1 ORDER BY child_thread_id LIMIT 1",
-                [after],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-            ),
-            None => connection.query_row(
-                "SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges ORDER BY child_thread_id LIMIT 1",
-                [],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-            ),
-        };
+) -> Result<Option<(CanonicalRecord, String, bool)>, AdapterError> {
+    // Both statements are prepared once per connection and reused with fresh
+    // bindings for every edge; the keyset cursor binds NULL on the first page.
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges WHERE (?1 IS NULL OR child_thread_id > ?1) ORDER BY child_thread_id LIMIT 1",
+        )
+        .map_err(|_| AdapterError::UnsupportedFormat {
+            stage: "prepare_session_edge".to_string(),
+        })?;
+    let mut child_exists_statement = connection
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1)")
+        .map_err(|_| AdapterError::UnsupportedFormat {
+            stage: "prepare_session_edge_child".to_string(),
+        })?;
+    let row = statement.query_row([after_child_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    });
     let (parent, child, status) = match row {
         Ok(row) => row,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
@@ -660,7 +1129,17 @@ fn scan_session_edge(
             });
         }
     };
-    check_scan_state(&request.cancellation, &request.budget, 1, 0)?;
+    check_scan_state(
+        &request.cancellation,
+        &request.budget,
+        1,
+        request.budget.bytes_read_used(),
+    )?;
+    let row_bytes = (parent.len() as u64)
+        .saturating_add(child.len() as u64)
+        .saturating_add(status.len() as u64)
+        .saturating_add(8);
+    request.budget.charge_bytes_read(row_bytes)?;
     request.budget.charge_records(1)?;
     let parent_native = NativeId::new(parent.clone());
     let child_native = NativeId::new(child.clone());
@@ -688,143 +1167,91 @@ fn scan_session_edge(
         ),
         extensions: BTreeMap::new(),
     };
-    let child_exists: i64 = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1)",
-            [&child],
-            |row| row.get(0),
-        )
+    let child_exists: i64 = child_exists_statement
+        .query_row([&child], |row| row.get(0))
         .map_err(|_| AdapterError::CorruptSource {
             stage: "check_session_edge_child".to_string(),
         })?;
     Ok(Some((
         CanonicalRecord::SessionEdge(record),
+        child,
         child_exists == 0,
     )))
 }
 
-fn scan_sessions(
-    request: &ScanRequest,
-    connection: &Connection,
-    after_id: Option<&str>,
-) -> Result<Vec<CanonicalRecord>, AdapterError> {
-    let available_columns = thread_columns(connection)?;
-    let mut selected_columns = vec!["id"];
-    for (logical, physical) in [
-        ("created_at", "created_at_ms"),
-        ("updated_at", "updated_at_ms"),
-        ("provider", "model_provider"),
-        ("cwd", "cwd"),
-        ("title", "title"),
-        ("tokens_used", "tokens_used"),
-        ("archived", "archived"),
-        ("model", "model"),
-        ("preview", "preview"),
-    ] {
-        if projected(&request.projection, logical) && available_columns.contains(physical) {
-            selected_columns.push(physical);
-        }
-    }
-    if request.predicates.iter().any(is_updated_at_range)
-        && available_columns.contains("updated_at_ms")
-    {
-        selected_columns.push("updated_at_ms");
-    }
-    selected_columns.sort_unstable();
-    selected_columns.dedup();
-    let query = format!(
-        "SELECT {} FROM threads{} ORDER BY id",
-        selected_columns.join(", "),
-        if after_id.is_some() {
-            " WHERE id > ?1"
-        } else {
-            ""
-        }
-    );
-    let mut statement =
-        connection
-            .prepare(&query)
-            .map_err(|_| AdapterError::UnsupportedFormat {
-                stage: "prepare_threads".to_string(),
-            })?;
-    let mut rows = match after_id {
-        Some(after_id) => statement.query([after_id]),
-        None => statement.query([]),
-    }
-    .map_err(|_| AdapterError::CorruptSource {
-        stage: "query_threads".to_string(),
-    })?;
-    let mut records = Vec::new();
-    while let Some(row) = rows.next().map_err(|_| AdapterError::CorruptSource {
-        stage: "read_threads".to_string(),
-    })? {
-        check_scan_state(
-            &request.cancellation,
-            &request.budget,
-            records.len() as u64 + 1,
-            0,
-        )?;
-        let native = NativeId::new(row.get::<_, String>("id").map_err(db_read_error)?);
-        let updated_at_ms = row.get::<_, i64>("updated_at_ms").ok();
-        if !matches_session_predicates(&native, updated_at_ms, &request.predicates) {
-            continue;
-        }
-        request.budget.charge_records(1)?;
-        let entity = EntityId::from_parts("codex", &request.source.source_id, &native);
-        let selected = |name| projected(&request.projection, name);
-        let mut record = SessionRecord {
-            session_id: entity,
-            native_id: native,
-            source_id: request.source.source_id.clone(),
-            agent_id: "codex".to_string(),
-            title: selected("title").then(|| row.get("title").ok()).flatten(),
-            preview: selected("preview")
-                .then(|| row.get("preview").ok())
-                .flatten(),
-            cwd: selected("cwd").then(|| row.get("cwd").ok()).flatten(),
-            project: None,
-            model: selected("model").then(|| row.get("model").ok()).flatten(),
-            provider: selected("provider")
-                .then(|| row.get("model_provider").ok())
-                .flatten(),
-            created_at: selected("created_at")
-                .then(|| timestamp_millis(row.get("created_at_ms").ok()))
-                .flatten(),
-            updated_at: selected("updated_at")
-                .then(|| timestamp_millis(row.get("updated_at_ms").ok()))
-                .flatten(),
-            status: None,
-            archived: selected("archived")
-                .then(|| row.get::<_, i64>("archived").ok().map(|value| value != 0))
-                .flatten(),
-            message_count: None,
-            tool_call_count: None,
-            tokens_used: selected("tokens_used")
-                .then(|| row.get("tokens_used").ok())
-                .flatten(),
-            identity_confidence: IdentityConfidence::Exact,
-            snapshot_state: SnapshotState::Weak,
-            provenance: BTreeMap::new(),
-            extensions: BTreeMap::new(),
+/// The fixed session query for one stream: column metadata is read and the
+/// SQL text is built exactly once, so iteration only rebinds the keyset
+/// cursor parameter on the cached prepared statement. Each flag records
+/// whether the physical column was both projected and present in the bound
+/// schema; a projected-but-missing optional column degrades to NULL, while a
+/// present column with a drifting value type fails closed on read.
+struct SessionQuery {
+    sql: String,
+    title: bool,
+    preview: bool,
+    cwd: bool,
+    model: bool,
+    provider: bool,
+    created_at: bool,
+    updated_at: bool,
+    updated_at_ms: bool,
+    archived: bool,
+    tokens_used: bool,
+}
+
+impl SessionQuery {
+    fn prepare(request: &ScanRequest, connection: &Connection) -> Result<Self, AdapterError> {
+        let available_columns = thread_columns(connection)?;
+        let selected = |logical: &str, physical: &str| {
+            projected(&request.projection, logical) && available_columns.contains(physical)
         };
-        let provenance_fields = session_provenance_fields(&record, &request.projection);
-        record.provenance = provenance_map_for_source(
-            &request.source.source_id,
-            Some(&request.source.format_fingerprint),
-            "state_database",
-            &provenance_fields,
-        );
-        let record = CanonicalRecord::Session(record);
-        check_record_value_size(&record, &request.budget)?;
-        records.push(record);
-        if request
-            .limit
-            .is_some_and(|limit| records.len() as u64 >= limit)
-        {
-            break;
+        let title = selected("title", "title");
+        let preview = selected("preview", "preview");
+        let cwd = selected("cwd", "cwd");
+        let model = selected("model", "model");
+        let provider = selected("provider", "model_provider");
+        let created_at = selected("created_at", "created_at_ms");
+        let updated_at = selected("updated_at", "updated_at_ms");
+        let archived = selected("archived", "archived");
+        let tokens_used = selected("tokens_used", "tokens_used");
+        let updated_at_ms = (updated_at || request.predicates.iter().any(is_updated_at_range))
+            && available_columns.contains("updated_at_ms");
+        let mut selected_columns = vec!["id"];
+        for (included, physical) in [
+            (created_at, "created_at_ms"),
+            (updated_at_ms, "updated_at_ms"),
+            (provider, "model_provider"),
+            (cwd, "cwd"),
+            (title, "title"),
+            (tokens_used, "tokens_used"),
+            (archived, "archived"),
+            (model, "model"),
+            (preview, "preview"),
+        ] {
+            if included {
+                selected_columns.push(physical);
+            }
         }
+        selected_columns.sort_unstable();
+        selected_columns.dedup();
+        let sql = format!(
+            "SELECT {} FROM threads WHERE (?1 IS NULL OR id > ?1) ORDER BY id LIMIT {SESSION_BATCH_SIZE}",
+            selected_columns.join(", ")
+        );
+        Ok(Self {
+            sql,
+            title,
+            preview,
+            cwd,
+            model,
+            provider,
+            created_at,
+            updated_at,
+            updated_at_ms,
+            archived,
+            tokens_used,
+        })
     }
-    Ok(records)
 }
 
 /// Reads `session_index.jsonl` once per scan under the shared budget and
@@ -863,10 +1290,13 @@ fn load_session_index_titles(
             stage: "open_session_index".to_string(),
         })?;
     let mut reader = BufReader::new(file.into_std());
-    while let Some((line, _complete, consumed)) = read_limited_line(
+    let mut line = Vec::new();
+    while let Some((_complete, consumed)) = read_limited_line(
         &mut reader,
+        &mut line,
         MAX_INDEX_RECORD_BYTES,
         "codex_index_record_bytes",
+        "codex_record_read",
     )? {
         check_scan_state(&request.cancellation, &request.budget, 0, 0)?;
         request.budget.charge_bytes_read(consumed as u64)?;
@@ -1125,14 +1555,12 @@ impl AgentAdapter for CodexAdapter {
             .iter()
             .map(|predicate| predicate_pushdown(request.table, predicate))
             .collect();
-        let limit_is_exact = predicates
+        let predicates_exact = predicates
             .iter()
-            .all(|state| *state == PushdownState::Exact)
-            && request.order_hint.is_empty();
+            .all(|state| *state == PushdownState::Exact);
+        let (effective_limit, limit_state) = limit_pushdown(&request, predicates_exact);
         let mut effective_request = request.clone();
-        if !limit_is_exact {
-            effective_request.limit = None;
-        }
+        effective_request.limit = effective_limit;
         if effective_request.table == TableName::SessionEdges {
             let root = self.root(&effective_request.source)?;
             let diagnostics = ScanDiagnostics::default();
@@ -1167,17 +1595,10 @@ impl AgentAdapter for CodexAdapter {
                     Ok(result) => result,
                     Err(error) => return Some(Err(error)),
                 };
-                let (record, dangling) = result?;
-                let CanonicalRecord::SessionEdge(edge) = &record else {
-                    return Some(Err(AdapterError::Internal {
-                        stage: "session_edge_record".to_string(),
-                    }));
-                };
-                after_child_id = edge
-                    .native_edge_id
-                    .as_ref()
-                    .and_then(|native| native.as_str().split_once("->"))
-                    .map(|(_, child)| child.to_string());
+                let (record, child, dangling) = result?;
+                // The keyset cursor comes from the row itself; the display
+                // `parent->child` edge ID is never parsed back into a cursor.
+                after_child_id = Some(child);
                 if dangling
                     && let Err(error) = stream_diagnostics.push(AdapterWarning {
                         kind: AdapterWarningKind::IncompleteCapability,
@@ -1194,13 +1615,7 @@ impl AgentAdapter for CodexAdapter {
                 records,
                 pushdown: PushdownReport {
                     predicates,
-                    limit: request.limit.map(|_| {
-                        if limit_is_exact {
-                            PushdownState::Exact
-                        } else {
-                            PushdownState::Unsupported
-                        }
-                    }),
+                    limit: limit_state,
                     ordering: request
                         .order_hint
                         .iter()
@@ -1227,6 +1642,7 @@ impl AgentAdapter for CodexAdapter {
                 connection: None,
                 request: effective_request,
                 diagnostics: diagnostics.clone(),
+                cache: Arc::clone(&self.parse_cache),
                 after_id: None,
                 current: None,
                 emitted: 0,
@@ -1237,13 +1653,7 @@ impl AgentAdapter for CodexAdapter {
                 records,
                 pushdown: PushdownReport {
                     predicates,
-                    limit: request.limit.map(|_| {
-                        if limit_is_exact {
-                            PushdownState::Exact
-                        } else {
-                            PushdownState::Unsupported
-                        }
-                    }),
+                    limit: limit_state,
                     ordering: request
                         .order_hint
                         .iter()
@@ -1265,24 +1675,21 @@ impl AgentAdapter for CodexAdapter {
             root,
             observer: self.observer.clone(),
             connection: None,
+            query: None,
+            buffered: VecDeque::new(),
             index_titles: None,
             request: effective_request,
             diagnostics: diagnostics.clone(),
             after_id: None,
             emitted: 0,
+            exhausted: false,
             finished: false,
         });
         Ok(ScanResult {
             records,
             pushdown: PushdownReport {
                 predicates,
-                limit: request.limit.map(|_| {
-                    if limit_is_exact {
-                        PushdownState::Exact
-                    } else {
-                        PushdownState::Unsupported
-                    }
-                }),
+                limit: limit_state,
                 ordering: request
                     .order_hint
                     .iter()
@@ -1297,17 +1704,6 @@ impl AgentAdapter for CodexAdapter {
             },
         })
     }
-}
-
-fn column(name: &str, access: AccessClass) -> ColumnCapability {
-    ColumnCapability {
-        name: ColumnName::new(name),
-        access,
-    }
-}
-
-fn projected(projection: &[ColumnName], name: &str) -> bool {
-    projection.iter().any(|column| column.as_str() == name)
 }
 
 fn db_read_error(_error: rusqlite::Error) -> AdapterError {
@@ -1367,20 +1763,15 @@ fn sidecar_path(database: &Path, suffix: &str) -> PathBuf {
 }
 
 fn optional_file_identity(path: &Path, stage: &str) -> Result<Option<FileIdentity>, AdapterError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            Err(AdapterError::UnsupportedFormat {
-                stage: stage.to_string(),
-            })
-        }
-        Ok(_) => aql_fs::file_identity(path)
-            .map(Some)
-            .map_err(|_| AdapterError::SnapshotUnavailable),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(AdapterError::PermissionDenied {
+    aql_fs::optional_file_identity(path).map_err(|error| match error {
+        aql_fs::OptionalFileError::NotRegularFile => AdapterError::UnsupportedFormat {
             stage: stage.to_string(),
-        }),
-    }
+        },
+        aql_fs::OptionalFileError::IdentityUnavailable => AdapterError::SnapshotUnavailable,
+        aql_fs::OptionalFileError::Io(_) => AdapterError::PermissionDenied {
+            stage: stage.to_string(),
+        },
+    })
 }
 
 /// Revalidates every identity bound at probe time, failing closed on
@@ -1452,66 +1843,45 @@ fn open_state_database(
 }
 
 fn open_state_database_file(database: &Path, active_wal: bool) -> Result<Connection, AdapterError> {
-    if active_wal {
+    let connection = if active_wal {
         Connection::open_with_flags(
             database,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
-        .map_err(|_| AdapterError::UnsupportedFormat {
-            stage: "open_state_database".to_string(),
-        })
     } else {
         Connection::open_with_flags(
-            immutable_uri(database)?,
+            immutable_uri(database, "state_database_uri")?,
             OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
+    }
+    .map_err(|_| AdapterError::UnsupportedFormat {
+        stage: "open_state_database".to_string(),
+    })?;
+    // Harden the connection against hostile database contents, mirroring the
+    // OpenCode adapter: defensive mode, no writable/trusted schema, no
+    // triggers or views, no double-quoted string literals, and no checkpoint
+    // on close. The adapter only runs hardcoded statements, so no authorizer
+    // is required on top of this.
+    connection
+        .set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .and_then(|_| connection.set_db_config(DbConfig::SQLITE_DBCONFIG_WRITABLE_SCHEMA, false))
+        .and_then(|_| connection.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false))
+        .and_then(|_| connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false))
+        .and_then(|_| connection.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW, false))
+        .and_then(|_| connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false))
+        .and_then(|_| connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false))
+        .and_then(|_| connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true))
         .map_err(|_| AdapterError::UnsupportedFormat {
-            stage: "open_state_database".to_string(),
-        })
-    }
-}
-
-/// Builds a `file:` URI that opens the database with immutable semantics,
-/// percent-encoding the characters SQLite treats as URI delimiters.
-fn immutable_uri(database: &Path) -> Result<String, AdapterError> {
-    let text = database
-        .to_str()
-        .ok_or_else(|| AdapterError::UnsupportedFormat {
-            stage: "state_database_uri".to_string(),
+            stage: "state_database_config".to_string(),
         })?;
-    let text = normalize_windows_verbatim(text);
-    let mut uri = String::with_capacity(text.len() + 24);
-    uri.push_str("file:");
-    let bytes = text.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        uri.push_str("///");
-    }
-    for character in text.chars() {
-        match character {
-            '\\' => uri.push('/'),
-            '%' => uri.push_str("%25"),
-            '?' => uri.push_str("%3F"),
-            '#' => uri.push_str("%23"),
-            _ => uri.push(character),
-        }
-    }
-    uri.push_str("?immutable=1");
-    Ok(uri)
-}
-
-#[cfg(windows)]
-fn normalize_windows_verbatim(text: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        return std::borrow::Cow::Owned(format!(r"\\{rest}"));
-    }
-    std::borrow::Cow::Borrowed(text.strip_prefix(r"\\?\").unwrap_or(text))
-}
-
-#[cfg(not(windows))]
-fn normalize_windows_verbatim(text: &str) -> &str {
-    text
+    connection
+        .execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;")
+        .map_err(|_| AdapterError::UnsupportedFormat {
+            stage: "state_database_read_only".to_string(),
+        })?;
+    Ok(connection)
 }
 
 /// Derives the opaque snapshot token from the identities bound during probing.
@@ -1573,9 +1943,12 @@ fn validate_rollout_locator(locator: &str) -> Result<PathBuf, AdapterError> {
 }
 
 /// Opens one validated rollout locator below the bound root without following
-/// any symlink component, returning the file and a fixed byte boundary taken
-/// from the opened file itself.
-fn open_rollout_file(root: &RootBinding, locator: &Path) -> Result<(File, u64), AdapterError> {
+/// any symlink component, returning the file plus the byte boundary and
+/// identity taken from the opened file itself.
+fn open_rollout_file(
+    root: &RootBinding,
+    locator: &Path,
+) -> Result<(File, u64, FileIdentity), AdapterError> {
     validate_binding(root)?;
     let directory = open_bound_root(root)?;
     let mut options = cap_std::fs::OpenOptions::new();
@@ -1589,7 +1962,6 @@ fn open_rollout_file(root: &RootBinding, locator: &Path) -> Result<(File, u64), 
                 stage: "open_rollout".to_string(),
             },
         })?;
-    let file = file.into_std();
     let metadata = file
         .metadata()
         .map_err(|_| AdapterError::PermissionDenied {
@@ -1600,14 +1972,39 @@ fn open_rollout_file(root: &RootBinding, locator: &Path) -> Result<(File, u64), 
             stage: "rollout_locator_type".to_string(),
         });
     }
-    Ok((file, metadata.len()))
+    let identity = aql_fs::identity(&metadata);
+    Ok((file.into_std(), metadata.len(), identity))
+}
+
+/// Counts serialized bytes without allocating the serialized form.
+struct CountingWriter(u64);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buffer.len() as u64);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Measures the serialized length of a JSON value without building the string.
+fn json_serialized_len(value: &JsonValue) -> u64 {
+    let mut writer = CountingWriter(0);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => writer.0,
+        // `Value` serialization cannot fail with an infallible writer.
+        Err(_) => u64::MAX,
+    }
 }
 
 fn check_record_value_size(
     record: &CanonicalRecord,
     budget: &ResourceBudget,
 ) -> Result<(), AdapterError> {
-    let sizes: Vec<usize> = match record {
+    let sizes: Vec<u64> = match record {
         CanonicalRecord::Session(value) => [
             value.title.as_ref(),
             value.preview.as_ref(),
@@ -1616,26 +2013,26 @@ fn check_record_value_size(
         ]
         .into_iter()
         .flatten()
-        .map(String::len)
+        .map(|value| value.len() as u64)
         .collect(),
         CanonicalRecord::Message(value) => value
             .content
             .iter()
-            .map(String::len)
-            .chain(value.content_json.iter().map(|json| json.to_string().len()))
+            .map(|value| value.len() as u64)
+            .chain(value.content_json.iter().map(json_serialized_len))
             .collect(),
         CanonicalRecord::ToolCall(value) => value
             .arguments
             .iter()
-            .map(|json| json.to_string().len())
-            .chain(value.output.iter().map(String::len))
+            .map(json_serialized_len)
+            .chain(value.output.iter().map(|value| value.len() as u64))
             .collect(),
         CanonicalRecord::Usage(value) => [value.model.as_ref(), value.provider.as_ref()]
             .into_iter()
             .flatten()
-            .map(String::len)
+            .map(|value| value.len() as u64)
             .collect(),
-        CanonicalRecord::SessionEdge(value) => vec![value.edge_kind.len()],
+        CanonicalRecord::SessionEdge(value) => vec![value.edge_kind.len() as u64],
         CanonicalRecord::Artifact(value) => [
             value.name.as_ref(),
             value.path.as_ref(),
@@ -1644,13 +2041,12 @@ fn check_record_value_size(
         ]
         .into_iter()
         .flatten()
-        .map(String::len)
-        .chain(value.content_json.iter().map(|json| json.to_string().len()))
+        .map(|value| value.len() as u64)
+        .chain(value.content_json.iter().map(json_serialized_len))
         .collect(),
     };
     if let Some(actual) = sizes
         .into_iter()
-        .map(|size| size as u64)
         .find(|size| *size > budget.max_single_value_bytes)
     {
         Err(AdapterError::BudgetExceeded {
@@ -1778,8 +2174,17 @@ fn session_provenance_fields<'a>(
     fields
 }
 
-fn timestamp_millis(value: Option<i64>) -> Option<DateTime<Utc>> {
-    value.and_then(DateTime::from_timestamp_millis)
+fn timestamp_millis(
+    value: Option<i64>,
+    stage: &str,
+) -> Result<Option<DateTime<Utc>>, AdapterError> {
+    value
+        .map(|millis| {
+            DateTime::from_timestamp_millis(millis).ok_or_else(|| AdapterError::CorruptSource {
+                stage: stage.to_string(),
+            })
+        })
+        .transpose()
 }
 
 fn matches_session_predicates(
@@ -1898,7 +2303,14 @@ fn tool_from_event(
     sequence: i64,
     payload: ParsedPayload,
 ) -> ToolCallRecord {
-    let call_id = payload.call_id.as_deref().unwrap_or("missing-call-id");
+    // A missing call ID still needs a unique, deterministic identity: the
+    // per-file event sequence keeps two id-less calls in one session from
+    // colliding into the same canonical entity across scans.
+    let call_id = payload
+        .call_id
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("missing-call-id#{sequence}"));
     let mut record = ToolCallRecord {
         tool_call_id: EntityId::new(format!("{}:{call_id}", session_id.as_str())),
         session_id,
@@ -1931,7 +2343,9 @@ fn tool_from_event(
     record
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Builds one artifact record from a parsed patch change. Payload columns are
+/// populated class-wide from the extracted change data; the replay path masks
+/// them down to each requesting projection.
 fn artifact_from_change(
     source_id: &SourceId,
     session_id: EntityId,
@@ -1939,7 +2353,6 @@ fn artifact_from_change(
     call_id: Option<&str>,
     change: ParsedArtifactChange,
     created_at: Option<DateTime<Utc>>,
-    projection: &[ColumnName],
     installation_salt: &[u8],
 ) -> ArtifactRecord {
     let identity_input = format!("{}\0{sequence}\0{}", session_id.as_str(), change.path);
@@ -1948,17 +2361,11 @@ fn artifact_from_change(
         &identity_input,
         installation_salt,
     ));
-    let include_content = projected(projection, "content");
-    let include_content_json = projected(projection, "content_json");
-    let content = include_content
-        .then(|| {
-            change
-                .content
-                .clone()
-                .or_else(|| change.unified_diff.clone())
-        })
-        .flatten();
-    let content_json = include_content_json.then(|| {
+    let content = change
+        .content
+        .clone()
+        .or_else(|| change.unified_diff.clone());
+    let content_json = {
         let mut object = serde_json::Map::new();
         if let Some(change_type) = &change.change_type {
             object.insert("type".to_string(), JsonValue::String(change_type.clone()));
@@ -1976,7 +2383,7 @@ fn artifact_from_change(
             object.insert("unified_diff".to_string(), JsonValue::String(value.clone()));
         }
         JsonValue::Object(object)
-    });
+    };
     let tool_call_id =
         call_id.map(|call_id| EntityId::new(format!("{}:{call_id}", session_id.as_str())));
     let mut record = ArtifactRecord {
@@ -1991,7 +2398,7 @@ fn artifact_from_change(
         size_bytes: None,
         created_at,
         content,
-        content_json,
+        content_json: Some(content_json),
         provenance: BTreeMap::new(),
         extensions: BTreeMap::new(),
     };
