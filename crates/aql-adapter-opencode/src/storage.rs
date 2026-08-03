@@ -38,20 +38,15 @@ pub(super) fn optional_file_identity(
     path: &Path,
     stage: &str,
 ) -> Result<Option<FileIdentity>, AdapterError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            Err(AdapterError::UnsupportedFormat {
-                stage: stage.to_string(),
-            })
-        }
-        Ok(_) => aql_fs::file_identity(path)
-            .map(Some)
-            .map_err(|_| AdapterError::SnapshotUnavailable),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(AdapterError::PermissionDenied {
+    aql_fs::optional_file_identity(path).map_err(|error| match error {
+        aql_fs::OptionalFileError::NotRegularFile => AdapterError::UnsupportedFormat {
             stage: stage.to_string(),
-        }),
-    }
+        },
+        aql_fs::OptionalFileError::IdentityUnavailable => AdapterError::SnapshotUnavailable,
+        aql_fs::OptionalFileError::Io(_) => AdapterError::PermissionDenied {
+            stage: stage.to_string(),
+        },
+    })
 }
 
 pub(super) fn table_columns(

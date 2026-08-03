@@ -2,22 +2,25 @@
 
 #![deny(missing_docs)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use aql_adapter_api::{
     AdapterError, AdapterSchema, AdapterWarning, AdapterWarningKind, AgentAdapter, Capabilities,
-    ColumnCapability, ColumnName, FileAccessObserver, Literal, Predicate, ProbeRequest,
-    ProbeResult, PushdownReport, PushdownState, ScanDiagnostics, ScanRequest, ScanResult,
-    SnapshotReport, SnapshotStrength, SourceKind, TableName, check_scan_state,
+    ColumnCapability, FileAccessObserver, Predicate, ProbeRequest, ProbeResult, PushdownReport,
+    PushdownState, ScanDiagnostics, ScanRequest, ScanResult, SnapshotReport, SnapshotStrength,
+    SourceKind, TableName, check_scan_state,
+    util::{
+        SessionPredicateCapabilities, append_content, column_capability, immutable_uri,
+        limit_pushdown, projected, session_matches, session_predicate_state,
+    },
     validate_projection_access,
 };
 use aql_model::{
-    AccessClass, CanonicalRecord, EntityId, IdentityConfidence, MessageRecord, NativeId,
-    SessionEdgeRecord, SessionRecord, SnapshotState, SourceId, SourceManifest, ToolCallRecord,
-    UsageRecord,
+    CanonicalRecord, EntityId, IdentityConfidence, MessageRecord, NativeId, SessionEdgeRecord,
+    SessionRecord, SnapshotState, SourceId, SourceManifest, ToolCallRecord, UsageRecord,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::config::DbConfig;
@@ -33,6 +36,15 @@ use authorizer::AuthorizerPolicy;
 use storage::{optional_file_identity, safe_directory, safe_file, table_columns};
 
 const MAX_JSON_RECORD_BYTES: u64 = 16 * 1024 * 1024;
+// Rows pulled per keyset batch. The batch queries below bake in `LIMIT 256`
+// and must agree with this value: a fill never buffers more rows than one
+// batch query returns, and the keyset cursor only advances when a buffered
+// row is consumed, so rows left unfetched are re-read by the next batch.
+const SCAN_BATCH_ROWS: usize = 256;
+// Memory guard for one buffered batch. A fill stops early once buffered
+// payload bytes exceed this bound, so worst-case buffering stays near this
+// value plus one record even for records close to `MAX_JSON_RECORD_BYTES`.
+const SCAN_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 type MessageCursor = (String, i64, String);
 type LoadedMessage = (CurrentMessage, MessageCursor, u64);
 type SessionCursor = (i64, String);
@@ -140,8 +152,9 @@ struct SessionStream {
     binding: RootBinding,
     request: ScanRequest,
     after: Option<SessionCursor>,
+    buffer: VecDeque<SessionRow>,
     predicates: Vec<Predicate>,
-    limit: Option<u64>,
+    effective_limit: Option<u64>,
     emitted: u64,
     finished: bool,
 }
@@ -152,7 +165,9 @@ struct EdgeStream {
     request: ScanRequest,
     diagnostics: ScanDiagnostics,
     after_child: Option<String>,
+    buffer: VecDeque<EdgeRow>,
     emitted: u64,
+    effective_limit: Option<u64>,
     finished: bool,
 }
 
@@ -169,7 +184,9 @@ struct MessagePartStream {
     diagnostics: ScanDiagnostics,
     mode: MessageMode,
     after_message: Option<MessageCursor>,
+    messages: VecDeque<MessageRow>,
     current: Option<CurrentMessage>,
+    parts: VecDeque<PartRow>,
     last_session: Option<String>,
     sequence: i64,
     emitted: u64,
@@ -220,9 +237,57 @@ struct UsageStream {
     binding: RootBinding,
     request: ScanRequest,
     after_message: Option<MessageCursor>,
+    messages: VecDeque<MessageRow>,
     emitted: u64,
     effective_limit: Option<u64>,
     finished: bool,
+}
+
+/// One raw `message` row buffered by a batch pull. JSON parsing and budget
+/// accounting are deferred until the row is consumed so error and charge
+/// positions match a row-at-a-time read exactly.
+struct MessageRow {
+    native_id: String,
+    session_native_id: String,
+    created_ms: i64,
+    data_len: i64,
+    data: Vec<u8>,
+}
+
+/// One raw `part` row buffered by a batch pull, consumed like [`MessageRow`].
+struct PartRow {
+    part_id: String,
+    data_len: i64,
+    data: Vec<u8>,
+}
+
+/// One raw `session` row buffered by a batch pull. Sensitive columns stay
+/// `None` unless the projection selected them, mirroring the previous
+/// row-at-a-time read.
+struct SessionRow {
+    native: String,
+    parent: Option<String>,
+    agent: Option<String>,
+    created_ms: i64,
+    updated_ms: i64,
+    archived_ms: Option<i64>,
+    tokens: [i64; 5],
+    model_len: Option<i64>,
+    model: Option<String>,
+    title_len: Option<i64>,
+    title: Option<String>,
+    directory_len: Option<i64>,
+    directory: Option<String>,
+    path_len: Option<i64>,
+    path: Option<String>,
+}
+
+/// One raw parent-edge row buffered by a batch pull.
+struct EdgeRow {
+    child: String,
+    parent: String,
+    created_ms: i64,
+    parent_exists: bool,
 }
 
 #[derive(Deserialize)]
@@ -449,7 +514,7 @@ impl OpenCodeAdapter {
             // The binding keeps `wal_identity == None`; the identity re-checks
             // fail closed if a WAL ever appears afterwards.
             Connection::open_with_flags(
-                immutable_uri(&database)?,
+                immutable_uri(&database, "opencode_database_open")?,
                 OpenFlags::SQLITE_OPEN_READ_ONLY
                     | OpenFlags::SQLITE_OPEN_NO_MUTEX
                     | OpenFlags::SQLITE_OPEN_URI
@@ -584,6 +649,16 @@ impl OpenCodeAdapter {
         connection
             .execute_batch("BEGIN")
             .map_err(|error| db_error(error, request, "opencode_snapshot_begin"))?;
+        // Binding revalidation cadence (contract section 9): the binding is
+        // verified when the stream opens (here and inside `open_connection`)
+        // and once more when the stream reaches natural exhaustion, so a
+        // root/database replaced mid-scan fails closed at the tail instead
+        // of silently completing. In between, the connection holds the
+        // database file handle inside one read transaction and per-record
+        // revalidation is intentionally not repeated — the same cadence the
+        // Claude adapter applies per transcript file. Early stops (limit,
+        // budget, cancellation) skip the end check. A failed check at open
+        // still fails closed and refuses the scan.
         Self::validate_binding(binding)?;
         Ok(connection)
     }
@@ -624,14 +699,21 @@ impl OpenCodeAdapter {
         let predicate_states = request
             .predicates
             .iter()
-            .map(session_predicate_state)
+            .map(|predicate| session_predicate_state(&SESSION_PREDICATE_CAPABILITIES, predicate))
             .collect::<Vec<_>>();
         let all_exact = predicate_states
             .iter()
             .all(|state| *state == PushdownState::Exact);
-        let exact_limit = request
-            .limit
-            .filter(|_| all_exact && request.order_hint.is_empty());
+        // Predicates are applied all-or-nothing. When they are not all exact
+        // the stream applies none of them, so every predicate must be
+        // reported as `Unsupported` to keep the report honest about what
+        // actually executed (contract section 5).
+        let reported_states = if all_exact {
+            predicate_states
+        } else {
+            vec![PushdownState::Unsupported; request.predicates.len()]
+        };
+        let (effective_limit, limit_state) = limit_pushdown(&request, all_exact);
         let diagnostics = ScanDiagnostics::default();
         Ok(ScanResult {
             records: Box::new(SessionStream {
@@ -639,24 +721,19 @@ impl OpenCodeAdapter {
                 binding,
                 request: request.clone(),
                 after: None,
+                buffer: VecDeque::new(),
                 predicates: if all_exact {
                     request.predicates.clone()
                 } else {
                     Vec::new()
                 },
-                limit: exact_limit,
+                effective_limit,
                 emitted: 0,
                 finished: false,
             }),
             pushdown: PushdownReport {
-                predicates: predicate_states,
-                limit: request.limit.map(|_| {
-                    if exact_limit.is_some() {
-                        PushdownState::Exact
-                    } else {
-                        PushdownState::Unsupported
-                    }
-                }),
+                predicates: reported_states,
+                limit: limit_state,
                 ordering: request
                     .order_hint
                     .iter()
@@ -677,9 +754,11 @@ impl OpenCodeAdapter {
         let policy = AuthorizerPolicy::table("session", ["id", "parent_id", "time_created"]);
         let connection = self.open_scan_connection(&binding, policy, &request)?;
         let diagnostics = ScanDiagnostics::default();
-        let limit = request
-            .limit
-            .filter(|_| request.predicates.is_empty() && request.order_hint.is_empty());
+        // The stream only keeps the limit when nothing needs re-checking by
+        // the engine; otherwise `effective_limit` stays `None` and the stream
+        // must not truncate, matching the message/part and usage streams.
+        let (effective_limit, limit_state) =
+            limit_pushdown(&request, request.predicates.is_empty());
         Ok(ScanResult {
             records: Box::new(EdgeStream {
                 connection,
@@ -687,7 +766,9 @@ impl OpenCodeAdapter {
                 request: request.clone(),
                 diagnostics: diagnostics.clone(),
                 after_child: None,
+                buffer: VecDeque::new(),
                 emitted: 0,
+                effective_limit,
                 finished: false,
             }),
             pushdown: PushdownReport {
@@ -696,13 +777,7 @@ impl OpenCodeAdapter {
                     .iter()
                     .map(|_| PushdownState::Unsupported)
                     .collect(),
-                limit: request.limit.map(|_| {
-                    if limit.is_some() {
-                        PushdownState::Exact
-                    } else {
-                        PushdownState::Unsupported
-                    }
-                }),
+                limit: limit_state,
                 ordering: request
                     .order_hint
                     .iter()
@@ -727,9 +802,8 @@ impl OpenCodeAdapter {
         let connection =
             self.open_scan_connection(&binding, AuthorizerPolicy::message_parts(), &request)?;
         let diagnostics = ScanDiagnostics::default();
-        let effective_limit = request
-            .limit
-            .filter(|_| request.predicates.is_empty() && request.order_hint.is_empty());
+        let (effective_limit, limit_state) =
+            limit_pushdown(&request, request.predicates.is_empty());
         Ok(ScanResult {
             records: Box::new(MessagePartStream {
                 connection,
@@ -738,7 +812,9 @@ impl OpenCodeAdapter {
                 diagnostics: diagnostics.clone(),
                 mode,
                 after_message: None,
+                messages: VecDeque::new(),
                 current: None,
+                parts: VecDeque::new(),
                 last_session: None,
                 sequence: 0,
                 emitted: 0,
@@ -751,13 +827,7 @@ impl OpenCodeAdapter {
                     .iter()
                     .map(|_| PushdownState::Unsupported)
                     .collect(),
-                limit: request.limit.map(|_| {
-                    if effective_limit.is_some() {
-                        PushdownState::Exact
-                    } else {
-                        PushdownState::Unsupported
-                    }
-                }),
+                limit: limit_state,
                 ordering: request
                     .order_hint
                     .iter()
@@ -777,9 +847,8 @@ impl OpenCodeAdapter {
         let binding = self.root_for(&request.source)?;
         let connection =
             self.open_scan_connection(&binding, AuthorizerPolicy::messages_only(), &request)?;
-        let effective_limit = request
-            .limit
-            .filter(|_| request.predicates.is_empty() && request.order_hint.is_empty());
+        let (effective_limit, limit_state) =
+            limit_pushdown(&request, request.predicates.is_empty());
         let diagnostics = ScanDiagnostics::default();
         Ok(ScanResult {
             records: Box::new(UsageStream {
@@ -787,6 +856,7 @@ impl OpenCodeAdapter {
                 binding,
                 request: request.clone(),
                 after_message: None,
+                messages: VecDeque::new(),
                 emitted: 0,
                 effective_limit,
                 finished: false,
@@ -797,13 +867,7 @@ impl OpenCodeAdapter {
                     .iter()
                     .map(|_| PushdownState::Unsupported)
                     .collect(),
-                limit: request.limit.map(|_| {
-                    if effective_limit.is_some() {
-                        PushdownState::Exact
-                    } else {
-                        PushdownState::Unsupported
-                    }
-                }),
+                limit: limit_state,
                 ordering: request
                     .order_hint
                     .iter()
@@ -894,6 +958,18 @@ impl AgentAdapter for OpenCodeAdapter {
     }
 }
 
+// End-of-stream watermark re-check (contract section 9): the binding was
+// verified when the stream opened; natural exhaustion verifies it once more
+// before reporting EOF so a root or database replaced mid-scan fails closed
+// instead of silently completing. Early stops (exact limit, budget,
+// cancellation) do not take this path and skip the check.
+fn end_of_stream(binding: &RootBinding) -> Option<Result<CanonicalRecord, AdapterError>> {
+    match OpenCodeAdapter::validate_binding(binding) {
+        Ok(()) => None,
+        Err(error) => Some(Err(error)),
+    }
+}
+
 impl Iterator for MessagePartStream {
     type Item = Result<CanonicalRecord, AdapterError>;
 
@@ -917,13 +993,23 @@ impl Iterator for MessagePartStream {
                 return Some(Err(error));
             }
             if self.current.is_none() {
-                match read_next_message(
-                    &self.connection,
-                    &self.binding,
-                    &self.request,
-                    self.after_message.as_ref(),
-                ) {
-                    Ok(Some((message, cursor, bytes))) => {
+                if self.messages.is_empty()
+                    && let Err(error) = fill_message_buffer(
+                        &self.connection,
+                        &self.request,
+                        self.after_message.as_ref(),
+                        &mut self.messages,
+                    )
+                {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+                let Some(row) = self.messages.pop_front() else {
+                    self.finished = true;
+                    return end_of_stream(&self.binding);
+                };
+                match load_message(row, &self.request) {
+                    Ok((message, cursor, bytes)) => {
                         if let Err(error) = self.request.budget.charge_bytes_read(bytes) {
                             self.finished = true;
                             return Some(Err(error));
@@ -935,10 +1021,6 @@ impl Iterator for MessagePartStream {
                         self.after_message = Some(cursor);
                         self.current = Some(message);
                     }
-                    Ok(None) => {
-                        self.finished = true;
-                        return None;
-                    }
                     Err(error) => {
                         self.finished = true;
                         return Some(Err(error));
@@ -946,16 +1028,34 @@ impl Iterator for MessagePartStream {
                 }
             }
             let mut current = self.current.take()?;
-            match read_next_part(
-                &self.connection,
-                &self.binding,
-                &self.request,
-                &current.session_native_id,
-                &current.native_id,
-                current.after_part.as_deref(),
-                self.mode,
-            ) {
-                Ok(Some((part_id, part, bytes))) => {
+            if self.parts.is_empty()
+                && let Err(error) = fill_part_buffer(
+                    &self.connection,
+                    &self.request,
+                    &current.session_native_id,
+                    &current.native_id,
+                    current.after_part.as_deref(),
+                    &mut self.parts,
+                )
+            {
+                self.finished = true;
+                return Some(Err(error));
+            }
+            let Some(part_row) = self.parts.pop_front() else {
+                if self.mode == MessageMode::Tools {
+                    continue;
+                }
+                self.sequence += 1;
+                let record = message_record(current, self.sequence, &self.request);
+                if let Err(error) = self.request.budget.charge_records(1) {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+                self.emitted += 1;
+                return Some(Ok(CanonicalRecord::Message(record)));
+            };
+            match load_part(part_row, &self.request, self.mode) {
+                Ok((part_id, part, bytes)) => {
                     current.after_part = Some(part_id);
                     if let Err(error) = self.request.budget.charge_bytes_read(bytes) {
                         self.finished = true;
@@ -964,8 +1064,11 @@ impl Iterator for MessagePartStream {
                     match part {
                         ParsedPart::Text(text) => {
                             if let Some(text) = text
-                                && let Err(error) =
-                                    append_content(&mut current.content, &text, &self.request)
+                                && let Err(error) = append_content(
+                                    &mut current.content,
+                                    &text,
+                                    self.request.budget.max_single_value_bytes,
+                                )
                             {
                                 self.finished = true;
                                 return Some(Err(error));
@@ -999,19 +1102,6 @@ impl Iterator for MessagePartStream {
                         }
                     }
                 }
-                Ok(None) => {
-                    if self.mode == MessageMode::Tools {
-                        continue;
-                    }
-                    self.sequence += 1;
-                    let record = message_record(current, self.sequence, &self.request);
-                    if let Err(error) = self.request.budget.charge_records(1) {
-                        self.finished = true;
-                        return Some(Err(error));
-                    }
-                    self.emitted += 1;
-                    return Some(Ok(CanonicalRecord::Message(record)));
-                }
                 Err(error) => {
                     self.finished = true;
                     return Some(Err(error));
@@ -1043,17 +1133,23 @@ impl Iterator for UsageStream {
                 self.finished = true;
                 return Some(Err(error));
             }
-            let (message, cursor, bytes) = match read_next_message(
-                &self.connection,
-                &self.binding,
-                &self.request,
-                self.after_message.as_ref(),
-            ) {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    self.finished = true;
-                    return None;
-                }
+            if self.messages.is_empty()
+                && let Err(error) = fill_message_buffer(
+                    &self.connection,
+                    &self.request,
+                    self.after_message.as_ref(),
+                    &mut self.messages,
+                )
+            {
+                self.finished = true;
+                return Some(Err(error));
+            }
+            let Some(row) = self.messages.pop_front() else {
+                self.finished = true;
+                return end_of_stream(&self.binding);
+            };
+            let (message, cursor, bytes) = match load_message(row, &self.request) {
+                Ok(value) => value,
                 Err(error) => {
                     self.finished = true;
                     return Some(Err(error));
@@ -1105,7 +1201,11 @@ impl Iterator for SessionStream {
     type Item = Result<CanonicalRecord, AdapterError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished || self.limit.is_some_and(|limit| self.emitted >= limit) {
+        if self.finished
+            || self
+                .effective_limit
+                .is_some_and(|limit| self.emitted >= limit)
+        {
             self.finished = true;
             return None;
         }
@@ -1119,18 +1219,23 @@ impl Iterator for SessionStream {
                 self.finished = true;
                 return Some(Err(error));
             }
-            let result = read_next_session(
-                &self.connection,
-                &self.binding,
-                &self.request,
-                self.after.as_ref(),
-            );
-            let (record, cursor, bytes) = match result {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    self.finished = true;
-                    return None;
-                }
+            if self.buffer.is_empty()
+                && let Err(error) = fill_session_buffer(
+                    &self.connection,
+                    &self.request,
+                    self.after.as_ref(),
+                    &mut self.buffer,
+                )
+            {
+                self.finished = true;
+                return Some(Err(error));
+            }
+            let Some(row) = self.buffer.pop_front() else {
+                self.finished = true;
+                return end_of_stream(&self.binding);
+            };
+            let (record, cursor, bytes) = match load_session(row, &self.request) {
+                Ok(value) => value,
                 Err(error) => {
                     self.finished = true;
                     return Some(Err(error));
@@ -1141,11 +1246,9 @@ impl Iterator for SessionStream {
                 self.finished = true;
                 return Some(Err(error));
             }
-            if !self
-                .predicates
-                .iter()
-                .all(|predicate| session_matches(&record, predicate))
-            {
+            if !self.predicates.iter().all(|predicate| {
+                session_matches(&SESSION_PREDICATE_CAPABILITIES, &record, predicate)
+            }) {
                 continue;
             }
             if let Err(error) = self.request.budget.charge_records(1) {
@@ -1164,8 +1267,7 @@ impl Iterator for EdgeStream {
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished
             || self
-                .request
-                .limit
+                .effective_limit
                 .is_some_and(|limit| self.emitted >= limit)
         {
             self.finished = true;
@@ -1180,13 +1282,23 @@ impl Iterator for EdgeStream {
             self.finished = true;
             return Some(Err(error));
         }
-        match read_next_edge(
-            &self.connection,
-            &self.binding,
-            &self.request,
-            self.after_child.as_deref(),
-        ) {
-            Ok(Some((record, child, bytes, dangling))) => {
+        if self.buffer.is_empty()
+            && let Err(error) = fill_edge_buffer(
+                &self.connection,
+                &self.request,
+                self.after_child.as_deref(),
+                &mut self.buffer,
+            )
+        {
+            self.finished = true;
+            return Some(Err(error));
+        }
+        let Some(row) = self.buffer.pop_front() else {
+            self.finished = true;
+            return end_of_stream(&self.binding);
+        };
+        match load_edge(row, &self.request) {
+            Ok((record, child, bytes, dangling)) => {
                 self.after_child = Some(child);
                 if let Err(error) = self.request.budget.charge_bytes_read(bytes) {
                     self.finished = true;
@@ -1209,10 +1321,6 @@ impl Iterator for EdgeStream {
                 self.emitted += 1;
                 Some(Ok(CanonicalRecord::SessionEdge(record)))
             }
-            Ok(None) => {
-                self.finished = true;
-                None
-            }
             Err(error) => {
                 self.finished = true;
                 Some(Err(error))
@@ -1221,13 +1329,17 @@ impl Iterator for EdgeStream {
     }
 }
 
-fn read_next_message(
+// Batch pull of up to `SCAN_BATCH_ROWS` message rows (also bounded by
+// `SCAN_BATCH_BYTES`) starting after the keyset cursor. One prepare per batch
+// replaces the previous prepare-per-record, and the keyset `WHERE`/`ORDER BY`
+// shape is unchanged so the emitted row order matches the old
+// `LIMIT 1`-per-record walk exactly.
+fn fill_message_buffer(
     connection: &Connection,
-    binding: &RootBinding,
     request: &ScanRequest,
     after: Option<&MessageCursor>,
-) -> Result<Option<LoadedMessage>, AdapterError> {
-    OpenCodeAdapter::validate_binding(binding)?;
+    buffer: &mut VecDeque<MessageRow>,
+) -> Result<(), AdapterError> {
     let mut statement = connection
         .prepare(
             "SELECT id, session_id, time_created, length(CAST(data AS BLOB)) AS data_len, data \
@@ -1235,7 +1347,7 @@ fn read_next_message(
              WHERE (?1 IS NULL OR session_id > ?1 \
                     OR (session_id = ?1 AND time_created > ?2) \
                     OR (session_id = ?1 AND time_created = ?2 AND id > ?3)) \
-             ORDER BY session_id, time_created, id LIMIT 1",
+             ORDER BY session_id, time_created, id LIMIT 256",
         )
         .map_err(|error| db_error(error, request, "opencode_message_prepare"))?;
     let session = after.map(|cursor| cursor.0.as_str());
@@ -1244,28 +1356,54 @@ fn read_next_message(
     let mut rows = statement
         .query(rusqlite::params![session, created, id])
         .map_err(|error| db_error(error, request, "opencode_message_query"))?;
-    let Some(row) = rows
-        .next()
-        .map_err(|error| db_error(error, request, "opencode_message_row"))?
-    else {
-        OpenCodeAdapter::validate_binding(binding)?;
-        return Ok(None);
-    };
-    let native_id: String = row
-        .get("id")
-        .map_err(|error| db_error(error, request, "opencode_message_id"))?;
-    let session_native_id: String = row
-        .get("session_id")
-        .map_err(|error| db_error(error, request, "opencode_message_session"))?;
-    let created_ms: i64 = row
-        .get("time_created")
-        .map_err(|error| db_error(error, request, "opencode_message_created"))?;
-    let data_len: i64 = row
-        .get("data_len")
-        .map_err(|error| db_error(error, request, "opencode_message_length"))?;
+    let mut batch_bytes = 0_u64;
+    while buffer.len() < SCAN_BATCH_ROWS && batch_bytes < SCAN_BATCH_BYTES {
+        let Some(row) = rows
+            .next()
+            .map_err(|error| db_error(error, request, "opencode_message_row"))?
+        else {
+            break;
+        };
+        let native_id: String = row
+            .get("id")
+            .map_err(|error| db_error(error, request, "opencode_message_id"))?;
+        let session_native_id: String = row
+            .get("session_id")
+            .map_err(|error| db_error(error, request, "opencode_message_session"))?;
+        let created_ms: i64 = row
+            .get("time_created")
+            .map_err(|error| db_error(error, request, "opencode_message_created"))?;
+        let data_len: i64 = row
+            .get("data_len")
+            .map_err(|error| db_error(error, request, "opencode_message_length"))?;
+        let data = text_value(row, "data", request, "opencode_message_data")?.to_vec();
+        batch_bytes = batch_bytes.saturating_add(
+            data.len() as u64 + native_id.len() as u64 + session_native_id.len() as u64,
+        );
+        buffer.push_back(MessageRow {
+            native_id,
+            session_native_id,
+            created_ms,
+            data_len,
+            data,
+        });
+    }
+    Ok(())
+}
+
+// Converts one buffered message row into the current message, applying the
+// same per-record size, parse, and byte-accounting steps (in the same order)
+// as the previous row-at-a-time read.
+fn load_message(row: MessageRow, request: &ScanRequest) -> Result<LoadedMessage, AdapterError> {
+    let MessageRow {
+        native_id,
+        session_native_id,
+        created_ms,
+        data_len,
+        data,
+    } = row;
     let data_len = bounded_record_length(data_len, request, "opencode_message_size")?;
-    let raw = text_value(row, "data", request, "opencode_message_data")?;
-    let metadata = parse_message_metadata(raw)?;
+    let metadata = parse_message_metadata(&data)?;
     let created_at = timestamp(created_ms, "opencode_message_created")?;
     let bytes = data_len
         .checked_add(native_id.len() as u64)
@@ -1275,8 +1413,7 @@ fn read_next_message(
             resource: "bytes_read".to_string(),
             actual: u64::MAX,
         })?;
-    OpenCodeAdapter::validate_binding(binding)?;
-    Ok(Some((
+    Ok((
         CurrentMessage {
             native_id: native_id.clone(),
             session_native_id: session_native_id.clone(),
@@ -1287,60 +1424,85 @@ fn read_next_message(
         },
         (session_native_id, created_ms, native_id),
         bytes,
-    )))
+    ))
 }
 
-fn read_next_part(
+// Batch pull of one message's parts after the keyset cursor, same ordering
+// and batching rationale as `fill_message_buffer`.
+fn fill_part_buffer(
     connection: &Connection,
-    binding: &RootBinding,
     request: &ScanRequest,
     session_id: &str,
     message_id: &str,
     after_part: Option<&str>,
-    mode: MessageMode,
-) -> Result<Option<(String, ParsedPart, u64)>, AdapterError> {
-    OpenCodeAdapter::validate_binding(binding)?;
+    buffer: &mut VecDeque<PartRow>,
+) -> Result<(), AdapterError> {
     let mut statement = connection
         .prepare(
             "SELECT id, length(CAST(data AS BLOB)) AS data_len, data \
              FROM part \
              WHERE session_id = ?1 AND message_id = ?2 AND (?3 IS NULL OR id > ?3) \
-             ORDER BY id LIMIT 1",
+             ORDER BY id LIMIT 256",
         )
         .map_err(|error| db_error(error, request, "opencode_part_prepare"))?;
     let mut rows = statement
         .query(rusqlite::params![session_id, message_id, after_part])
         .map_err(|error| db_error(error, request, "opencode_part_query"))?;
-    let Some(row) = rows
-        .next()
-        .map_err(|error| db_error(error, request, "opencode_part_row"))?
-    else {
-        OpenCodeAdapter::validate_binding(binding)?;
-        return Ok(None);
-    };
-    let part_id: String = row
-        .get("id")
-        .map_err(|error| db_error(error, request, "opencode_part_id"))?;
-    let data_len: i64 = row
-        .get("data_len")
-        .map_err(|error| db_error(error, request, "opencode_part_length"))?;
+    let mut batch_bytes = 0_u64;
+    while buffer.len() < SCAN_BATCH_ROWS && batch_bytes < SCAN_BATCH_BYTES {
+        let Some(row) = rows
+            .next()
+            .map_err(|error| db_error(error, request, "opencode_part_row"))?
+        else {
+            break;
+        };
+        let part_id: String = row
+            .get("id")
+            .map_err(|error| db_error(error, request, "opencode_part_id"))?;
+        let data_len: i64 = row
+            .get("data_len")
+            .map_err(|error| db_error(error, request, "opencode_part_length"))?;
+        let data = text_value(row, "data", request, "opencode_part_data")?.to_vec();
+        batch_bytes = batch_bytes.saturating_add(data.len() as u64 + part_id.len() as u64);
+        buffer.push_back(PartRow {
+            part_id,
+            data_len,
+            data,
+        });
+    }
+    Ok(())
+}
+
+// Parses one buffered part row, mirroring the previous row-at-a-time parse
+// order: size bound, kind probe, then mode-specific payload parsing.
+fn load_part(
+    row: PartRow,
+    request: &ScanRequest,
+    mode: MessageMode,
+) -> Result<(String, ParsedPart, u64), AdapterError> {
+    let PartRow {
+        part_id,
+        data_len,
+        data,
+    } = row;
     let data_len = bounded_record_length(data_len, request, "opencode_part_size")?;
-    let raw = text_value(row, "data", request, "opencode_part_data")?;
     let kind =
-        serde_json::from_slice::<PartKind>(raw).map_err(|_| AdapterError::CorruptSource {
+        serde_json::from_slice::<PartKind>(&data).map_err(|_| AdapterError::CorruptSource {
             stage: "opencode_part_kind".to_string(),
         })?;
     let parsed = match (mode, kind.part_type.as_str()) {
         (MessageMode::Messages, "text") => {
-            if projected(&request.projection, "content")
-                || projected(&request.projection, "content_json")
-            {
-                ParsedPart::Text(Some(parse_text_part(raw, request)?))
+            // `content` is filled only when the projection asks for it. A
+            // `content_json`-only projection skips text parsing entirely:
+            // the engine advertises the column and the adapter emits NULL,
+            // matching the codex adapter (contract section 4).
+            if projected(&request.projection, "content") {
+                ParsedPart::Text(Some(parse_text_part(&data, request)?))
             } else {
                 ParsedPart::Text(None)
             }
         }
-        (MessageMode::Tools, "tool") => ParsedPart::Tool(parse_tool_part(raw, request)?),
+        (MessageMode::Tools, "tool") => ParsedPart::Tool(parse_tool_part(&data, request)?),
         (
             _,
             "reasoning" | "file" | "patch" | "snapshot" | "subtask" | "compaction" | "retry"
@@ -1355,8 +1517,7 @@ fn read_next_part(
                 resource: "bytes_read".to_string(),
                 actual: u64::MAX,
             })?;
-    OpenCodeAdapter::validate_binding(binding)?;
-    Ok(Some((part_id, parsed, bytes)))
+    Ok((part_id, parsed, bytes))
 }
 
 fn parse_message_metadata(raw: &[u8]) -> Result<MessageMetadata, AdapterError> {
@@ -1446,7 +1607,7 @@ fn parse_text_part(raw: &[u8], request: &ScanRequest) -> Result<String, AdapterE
         serde_json::from_slice::<TextPart<'_>>(raw).map_err(|_| AdapterError::CorruptSource {
             stage: "opencode_text_part".to_string(),
         })?;
-    check_raw_value(value.text, request, "opencode_text_size")?;
+    check_raw_value(value.text, request)?;
     serde_json::from_str::<String>(value.text.get()).map_err(|_| AdapterError::CorruptSource {
         stage: "opencode_text_value".to_string(),
     })
@@ -1552,7 +1713,7 @@ fn parse_arguments(
     if !selected {
         return Ok(None);
     }
-    check_raw_value(value, request, "opencode_tool_input_size")?;
+    check_raw_value(value, request)?;
     serde_json::from_str(value.get())
         .map(Some)
         .map_err(|_| AdapterError::CorruptSource {
@@ -1568,7 +1729,7 @@ fn parse_output(
     if !selected {
         return Ok(None);
     }
-    check_raw_value(value, request, "opencode_tool_output_size")?;
+    check_raw_value(value, request)?;
     serde_json::from_str(value.get())
         .map(Some)
         .map_err(|_| AdapterError::CorruptSource {
@@ -1576,11 +1737,7 @@ fn parse_output(
         })
 }
 
-fn check_raw_value(
-    value: &RawValue,
-    request: &ScanRequest,
-    stage: &str,
-) -> Result<(), AdapterError> {
+fn check_raw_value(value: &RawValue, request: &ScanRequest) -> Result<(), AdapterError> {
     let length = value.get().len() as u64;
     if length > request.budget.max_single_value_bytes {
         return Err(AdapterError::BudgetExceeded {
@@ -1588,35 +1745,6 @@ fn check_raw_value(
             actual: length,
         });
     }
-    let _ = stage;
-    Ok(())
-}
-
-fn append_content(
-    current: &mut Option<String>,
-    text: &str,
-    request: &ScanRequest,
-) -> Result<(), AdapterError> {
-    let separator = usize::from(current.is_some());
-    let existing = current.as_ref().map_or(0, String::len);
-    let total = existing
-        .checked_add(separator)
-        .and_then(|value| value.checked_add(text.len()))
-        .ok_or_else(|| AdapterError::BudgetExceeded {
-            resource: "single_value_bytes".to_string(),
-            actual: u64::MAX,
-        })?;
-    if total as u64 > request.budget.max_single_value_bytes {
-        return Err(AdapterError::BudgetExceeded {
-            resource: "single_value_bytes".to_string(),
-            actual: total as u64,
-        });
-    }
-    let target = current.get_or_insert_with(String::new);
-    if !target.is_empty() {
-        target.push('\n');
-    }
-    target.push_str(text);
     Ok(())
 }
 
@@ -1715,13 +1843,15 @@ fn text_value<'a>(
     }
 }
 
-fn read_next_session(
+// Batch pull of session rows after the keyset cursor. The selected-column
+// list, keyset `WHERE` shape, and ordering are unchanged from the previous
+// per-record `LIMIT 1` walk; see `fill_message_buffer`.
+fn fill_session_buffer(
     connection: &Connection,
-    binding: &RootBinding,
     request: &ScanRequest,
     after: Option<&SessionCursor>,
-) -> Result<Option<LoadedSession>, AdapterError> {
-    OpenCodeAdapter::validate_binding(binding)?;
+    buffer: &mut VecDeque<SessionRow>,
+) -> Result<(), AdapterError> {
     let wants_model =
         projected(&request.projection, "model") || projected(&request.projection, "provider");
     let wants_title = projected(&request.projection, "title");
@@ -1758,7 +1888,7 @@ fn read_next_session(
     let sql = format!(
         "SELECT {} FROM session \
          WHERE (?1 IS NULL OR time_updated > ?1 OR (time_updated = ?1 AND id > ?2)) \
-         ORDER BY time_updated, id LIMIT 1",
+         ORDER BY time_updated, id LIMIT {SCAN_BATCH_ROWS}",
         selected.join(", ")
     );
     let after_time = after.map(|cursor| cursor.0);
@@ -1769,51 +1899,143 @@ fn read_next_session(
     let mut rows = statement
         .query(rusqlite::params![after_time, after_id])
         .map_err(|error| db_error(error, request, "opencode_session_query"))?;
-    let Some(row) = rows
-        .next()
-        .map_err(|error| db_error(error, request, "opencode_session_row"))?
-    else {
-        OpenCodeAdapter::validate_binding(binding)?;
-        return Ok(None);
-    };
-    let native: String = row
-        .get("id")
-        .map_err(|error| db_error(error, request, "opencode_session_id"))?;
-    let parent: Option<String> = row
-        .get("parent_id")
-        .map_err(|error| db_error(error, request, "opencode_session_parent"))?;
-    let agent: Option<String> = row
-        .get("agent")
-        .map_err(|error| db_error(error, request, "opencode_session_agent"))?;
-    let created_ms: i64 = row
-        .get("time_created")
-        .map_err(|error| db_error(error, request, "opencode_session_created"))?;
-    let updated_ms: i64 = row
-        .get("time_updated")
-        .map_err(|error| db_error(error, request, "opencode_session_updated"))?;
-    let archived_ms: Option<i64> = row
-        .get("time_archived")
-        .map_err(|error| db_error(error, request, "opencode_session_archived"))?;
-    let token_values = [
-        row.get::<_, i64>("tokens_input"),
-        row.get::<_, i64>("tokens_output"),
-        row.get::<_, i64>("tokens_reasoning"),
-        row.get::<_, i64>("tokens_cache_read"),
-        row.get::<_, i64>("tokens_cache_write"),
-    ]
-    .into_iter()
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|error| db_error(error, request, "opencode_session_tokens"))?;
-    let tokens_used = checked_token_sum(&token_values)?;
+    let mut batch_bytes = 0_u64;
+    while buffer.len() < SCAN_BATCH_ROWS && batch_bytes < SCAN_BATCH_BYTES {
+        let Some(row) = rows
+            .next()
+            .map_err(|error| db_error(error, request, "opencode_session_row"))?
+        else {
+            break;
+        };
+        let native: String = row
+            .get("id")
+            .map_err(|error| db_error(error, request, "opencode_session_id"))?;
+        let parent: Option<String> = row
+            .get("parent_id")
+            .map_err(|error| db_error(error, request, "opencode_session_parent"))?;
+        let agent: Option<String> = row
+            .get("agent")
+            .map_err(|error| db_error(error, request, "opencode_session_agent"))?;
+        let created_ms: i64 = row
+            .get("time_created")
+            .map_err(|error| db_error(error, request, "opencode_session_created"))?;
+        let updated_ms: i64 = row
+            .get("time_updated")
+            .map_err(|error| db_error(error, request, "opencode_session_updated"))?;
+        let archived_ms: Option<i64> = row
+            .get("time_archived")
+            .map_err(|error| db_error(error, request, "opencode_session_archived"))?;
+        let read_token = |column: &str| {
+            row.get::<_, i64>(column)
+                .map_err(|error| db_error(error, request, "opencode_session_tokens"))
+        };
+        let tokens = [
+            read_token("tokens_input")?,
+            read_token("tokens_output")?,
+            read_token("tokens_reasoning")?,
+            read_token("tokens_cache_read")?,
+            read_token("tokens_cache_write")?,
+        ];
+        let mut model_len = None;
+        let mut model = None;
+        if wants_model {
+            model_len = row
+                .get("model_len")
+                .map_err(|error| db_error(error, request, "opencode_session_model_length"))?;
+            model = row
+                .get("model")
+                .map_err(|error| db_error(error, request, "opencode_session_model"))?;
+        }
+        let mut title_len = None;
+        let mut title = None;
+        if wants_title {
+            title_len = row
+                .get("title_len")
+                .map_err(|error| db_error(error, request, "opencode_session_title"))?;
+            title = row
+                .get("title")
+                .map_err(|error| db_error(error, request, "opencode_session_title"))?;
+        }
+        let mut directory_len = None;
+        let mut directory = None;
+        if wants_cwd {
+            directory_len = row
+                .get("directory_len")
+                .map_err(|error| db_error(error, request, "opencode_session_directory"))?;
+            directory = row
+                .get("directory")
+                .map_err(|error| db_error(error, request, "opencode_session_directory"))?;
+        }
+        let mut path_len = None;
+        let mut path = None;
+        if wants_project {
+            path_len = row
+                .get("path_len")
+                .map_err(|error| db_error(error, request, "opencode_session_path"))?;
+            path = row
+                .get("path")
+                .map_err(|error| db_error(error, request, "opencode_session_path"))?;
+        }
+        batch_bytes = batch_bytes.saturating_add(
+            native.len() as u64
+                + parent.as_ref().map_or(0, String::len) as u64
+                + agent.as_ref().map_or(0, String::len) as u64
+                + model.as_ref().map_or(0, String::len) as u64
+                + title.as_ref().map_or(0, String::len) as u64
+                + directory.as_ref().map_or(0, String::len) as u64
+                + path.as_ref().map_or(0, String::len) as u64,
+        );
+        buffer.push_back(SessionRow {
+            native,
+            parent,
+            agent,
+            created_ms,
+            updated_ms,
+            archived_ms,
+            tokens,
+            model_len,
+            model,
+            title_len,
+            title,
+            directory_len,
+            directory,
+            path_len,
+            path,
+        });
+    }
+    Ok(())
+}
+
+// Converts one buffered session row into a record, applying the same
+// per-record checks (token sum, sensitive length bounds, model JSON parse,
+// timestamps) in the same order as the previous row-at-a-time read.
+fn load_session(row: SessionRow, request: &ScanRequest) -> Result<LoadedSession, AdapterError> {
+    let SessionRow {
+        native,
+        parent,
+        agent,
+        created_ms,
+        updated_ms,
+        archived_ms,
+        tokens,
+        model_len,
+        model,
+        title_len,
+        title,
+        directory_len,
+        directory,
+        path_len,
+        path,
+    } = row;
+    let wants_model =
+        projected(&request.projection, "model") || projected(&request.projection, "provider");
+    let wants_title = projected(&request.projection, "title");
+    let wants_cwd = projected(&request.projection, "cwd");
+    let wants_project = projected(&request.projection, "project");
+    let tokens_used = checked_token_sum(&tokens)?;
     let (model, provider, model_bytes) = if wants_model {
-        let length: Option<i64> = row
-            .get("model_len")
-            .map_err(|error| db_error(error, request, "opencode_session_model_length"))?;
-        check_optional_length(length, request, "opencode_session_model_size")?;
-        let value: Option<String> = row
-            .get("model")
-            .map_err(|error| db_error(error, request, "opencode_session_model"))?;
-        let parsed = value
+        check_optional_length(model_len, request, "opencode_session_model_size")?;
+        let parsed = model
             .as_deref()
             .map(serde_json::from_str::<ModelValue>)
             .transpose()
@@ -1823,32 +2045,29 @@ fn read_next_session(
         (
             parsed.as_ref().map(|value| value.id.clone()),
             parsed.as_ref().map(|value| value.provider_id.clone()),
-            value.as_ref().map_or(0, String::len) as u64,
+            model.as_ref().map_or(0, String::len) as u64,
         )
     } else {
         (None, None, 0)
     };
-    let (title, title_bytes) = read_optional_text(
-        row,
+    let (title, title_bytes) = buffered_optional_text(
+        title_len,
+        title,
         wants_title,
-        "title_len",
-        "title",
         request,
         "opencode_session_title",
     )?;
-    let (cwd, cwd_bytes) = read_optional_text(
-        row,
+    let (cwd, cwd_bytes) = buffered_optional_text(
+        directory_len,
+        directory,
         wants_cwd,
-        "directory_len",
-        "directory",
         request,
         "opencode_session_directory",
     )?;
-    let (project, project_bytes) = read_optional_text(
-        row,
+    let (project, project_bytes) = buffered_optional_text(
+        path_len,
+        path,
         wants_project,
-        "path_len",
-        "path",
         request,
         "opencode_session_path",
     )?;
@@ -1867,8 +2086,7 @@ fn read_next_session(
         + cwd_bytes
         + project_bytes
         + 8 * 8;
-    OpenCodeAdapter::validate_binding(binding)?;
-    Ok(Some((
+    Ok((
         SessionRecord {
             session_id,
             native_id,
@@ -1894,47 +2112,72 @@ fn read_next_session(
         },
         (updated_ms, native),
         bytes,
-    )))
+    ))
 }
 
-fn read_next_edge(
+// Batch pull of parent-edge rows after the keyset cursor, same ordering and
+// batching rationale as `fill_message_buffer`.
+fn fill_edge_buffer(
     connection: &Connection,
-    binding: &RootBinding,
     request: &ScanRequest,
     after_child: Option<&str>,
-) -> Result<Option<(SessionEdgeRecord, String, u64, bool)>, AdapterError> {
-    OpenCodeAdapter::validate_binding(binding)?;
+    buffer: &mut VecDeque<EdgeRow>,
+) -> Result<(), AdapterError> {
     let mut statement = connection
         .prepare(
             "SELECT child.id, child.parent_id, child.time_created, \
                     EXISTS(SELECT 1 FROM session parent WHERE parent.id = child.parent_id) \
              FROM session child \
              WHERE child.parent_id IS NOT NULL AND (?1 IS NULL OR child.id > ?1) \
-             ORDER BY child.id LIMIT 1",
+             ORDER BY child.id LIMIT 256",
         )
         .map_err(|error| db_error(error, request, "opencode_edge_prepare"))?;
     let mut rows = statement
         .query([after_child])
         .map_err(|error| db_error(error, request, "opencode_edge_query"))?;
-    let Some(row) = rows
-        .next()
-        .map_err(|error| db_error(error, request, "opencode_edge_row"))?
-    else {
-        OpenCodeAdapter::validate_binding(binding)?;
-        return Ok(None);
-    };
-    let child: String = row
-        .get(0)
-        .map_err(|error| db_error(error, request, "opencode_edge_child"))?;
-    let parent: String = row
-        .get(1)
-        .map_err(|error| db_error(error, request, "opencode_edge_parent"))?;
-    let created_ms: i64 = row
-        .get(2)
-        .map_err(|error| db_error(error, request, "opencode_edge_created"))?;
-    let parent_exists: bool = row
-        .get(3)
-        .map_err(|error| db_error(error, request, "opencode_edge_parent_exists"))?;
+    let mut batch_bytes = 0_u64;
+    while buffer.len() < SCAN_BATCH_ROWS && batch_bytes < SCAN_BATCH_BYTES {
+        let Some(row) = rows
+            .next()
+            .map_err(|error| db_error(error, request, "opencode_edge_row"))?
+        else {
+            break;
+        };
+        let child: String = row
+            .get(0)
+            .map_err(|error| db_error(error, request, "opencode_edge_child"))?;
+        let parent: String = row
+            .get(1)
+            .map_err(|error| db_error(error, request, "opencode_edge_parent"))?;
+        let created_ms: i64 = row
+            .get(2)
+            .map_err(|error| db_error(error, request, "opencode_edge_created"))?;
+        let parent_exists: bool = row
+            .get(3)
+            .map_err(|error| db_error(error, request, "opencode_edge_parent_exists"))?;
+        batch_bytes = batch_bytes.saturating_add(child.len() as u64 + parent.len() as u64);
+        buffer.push_back(EdgeRow {
+            child,
+            parent,
+            created_ms,
+            parent_exists,
+        });
+    }
+    Ok(())
+}
+
+// Converts one buffered edge row into a record, mirroring the previous
+// row-at-a-time construction and byte accounting.
+fn load_edge(
+    row: EdgeRow,
+    request: &ScanRequest,
+) -> Result<(SessionEdgeRecord, String, u64, bool), AdapterError> {
+    let EdgeRow {
+        child,
+        parent,
+        created_ms,
+        parent_exists,
+    } = row;
     let child_native = NativeId::new(child.clone());
     let parent_native = NativeId::new(parent.clone());
     let native_edge = NativeId::new(format!("{parent}->{child}"));
@@ -1957,33 +2200,25 @@ fn read_next_edge(
         provenance: BTreeMap::new(),
         extensions: BTreeMap::new(),
     };
-    OpenCodeAdapter::validate_binding(binding)?;
-    Ok(Some((
+    Ok((
         record,
         child.clone(),
         (child.len() + parent.len() + 8) as u64,
         !parent_exists,
-    )))
+    ))
 }
 
-fn read_optional_text(
-    row: &rusqlite::Row<'_>,
+fn buffered_optional_text(
+    length: Option<i64>,
+    value: Option<String>,
     selected: bool,
-    length_column: &str,
-    value_column: &str,
     request: &ScanRequest,
     stage: &str,
 ) -> Result<(Option<String>, u64), AdapterError> {
     if !selected {
         return Ok((None, 0));
     }
-    let length: Option<i64> = row
-        .get(length_column)
-        .map_err(|error| db_error(error, request, stage))?;
     check_optional_length(length, request, stage)?;
-    let value: Option<String> = row
-        .get(value_column)
-        .map_err(|error| db_error(error, request, stage))?;
     let bytes = value.as_ref().map_or(0, String::len) as u64;
     Ok((value, bytes))
 }
@@ -2029,157 +2264,63 @@ fn timestamp(value: i64, stage: &str) -> Result<DateTime<Utc>, AdapterError> {
     })
 }
 
-fn session_predicate_state(predicate: &Predicate) -> PushdownState {
-    let exact = match predicate {
-        Predicate::Eq(column, literal) => session_literal_supported(column, literal),
-        Predicate::In(column, literals) => {
-            !literals.is_empty()
-                && literals
-                    .iter()
-                    .all(|literal| session_literal_supported(column, literal))
-        }
-        Predicate::IsNull(column) => column.as_str() == "status",
-        Predicate::And(predicates) => predicates
-            .iter()
-            .all(|predicate| session_predicate_state(predicate) == PushdownState::Exact),
-        Predicate::Range { .. } | Predicate::Unsupported(_) => false,
-    };
-    if exact {
-        PushdownState::Exact
-    } else {
-        PushdownState::Unsupported
-    }
-}
-
-fn session_literal_supported(column: &ColumnName, literal: &Literal) -> bool {
-    matches!(
-        (column.as_str(), literal),
-        (
-            "session_id" | "native_id" | "source_id" | "agent_id",
-            Literal::Text(_)
-        ) | ("archived", Literal::Bool(_))
-    )
-}
-
-fn session_matches(session: &SessionRecord, predicate: &Predicate) -> bool {
-    match predicate {
-        Predicate::Eq(column, literal) => session_value_matches(session, column, literal),
-        Predicate::In(column, literals) => literals
-            .iter()
-            .any(|literal| session_value_matches(session, column, literal)),
-        Predicate::IsNull(column) => column.as_str() == "status" && session.status.is_none(),
-        Predicate::And(predicates) => predicates
-            .iter()
-            .all(|predicate| session_matches(session, predicate)),
-        Predicate::Range { .. } | Predicate::Unsupported(_) => true,
-    }
-}
-
-fn session_value_matches(session: &SessionRecord, column: &ColumnName, literal: &Literal) -> bool {
-    match (column.as_str(), literal) {
-        ("session_id", Literal::Text(value)) => session.session_id.as_str() == value,
-        ("native_id", Literal::Text(value)) => session.native_id.as_str() == value,
-        ("source_id", Literal::Text(value)) => session.source_id.as_str() == value,
-        ("agent_id", Literal::Text(value)) => &session.agent_id == value,
-        ("archived", Literal::Bool(value)) => session.archived == Some(*value),
-        _ => false,
-    }
-}
+const SESSION_PREDICATE_CAPABILITIES: SessionPredicateCapabilities = SessionPredicateCapabilities {
+    eq_text: &["session_id", "native_id", "source_id", "agent_id"],
+    eq_bool: &["archived"],
+    is_null: &["status"],
+};
 
 fn columns() -> Vec<ColumnCapability> {
     [
-        ("session_id", AccessClass::Safe),
-        ("native_id", AccessClass::Safe),
-        ("source_id", AccessClass::Safe),
-        ("agent_id", AccessClass::Safe),
-        ("title", AccessClass::Content),
-        ("preview", AccessClass::Content),
-        ("cwd", AccessClass::Path),
-        ("project", AccessClass::Path),
-        ("model", AccessClass::Safe),
-        ("provider", AccessClass::Safe),
-        ("created_at", AccessClass::Safe),
-        ("updated_at", AccessClass::Safe),
-        ("status", AccessClass::Safe),
-        ("archived", AccessClass::Safe),
-        ("message_count", AccessClass::Safe),
-        ("tool_call_count", AccessClass::Safe),
-        ("tokens_used", AccessClass::Safe),
-        ("edge_id", AccessClass::Safe),
-        ("parent_session_id", AccessClass::Safe),
-        ("child_session_id", AccessClass::Safe),
-        ("edge_kind", AccessClass::Safe),
-        ("native_edge_id", AccessClass::Safe),
-        ("message_id", AccessClass::Safe),
-        ("sequence", AccessClass::Safe),
-        ("role", AccessClass::Safe),
-        ("kind", AccessClass::Safe),
-        ("content", AccessClass::Content),
-        ("content_json", AccessClass::Content),
-        ("input_tokens", AccessClass::Safe),
-        ("output_tokens", AccessClass::Safe),
-        ("cached_tokens", AccessClass::Safe),
-        ("is_error", AccessClass::Safe),
-        ("tool_call_id", AccessClass::Safe),
-        ("tool_name", AccessClass::Safe),
-        ("namespace", AccessClass::Safe),
-        ("arguments", AccessClass::ToolInput),
-        ("output", AccessClass::ToolOutput),
-        ("started_at", AccessClass::Safe),
-        ("ended_at", AccessClass::Safe),
-        ("duration_ms", AccessClass::Safe),
-        ("exit_code", AccessClass::Safe),
-        ("usage_id", AccessClass::Safe),
-        ("bucket_start", AccessClass::Safe),
-        ("total_tokens", AccessClass::Safe),
-        ("error_count", AccessClass::Safe),
+        "session_id",
+        "native_id",
+        "source_id",
+        "agent_id",
+        "title",
+        "preview",
+        "cwd",
+        "project",
+        "model",
+        "provider",
+        "created_at",
+        "updated_at",
+        "status",
+        "archived",
+        "message_count",
+        "tool_call_count",
+        "tokens_used",
+        "edge_id",
+        "parent_session_id",
+        "child_session_id",
+        "edge_kind",
+        "native_edge_id",
+        "message_id",
+        "sequence",
+        "role",
+        "kind",
+        "content",
+        "content_json",
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+        "is_error",
+        "tool_call_id",
+        "tool_name",
+        "namespace",
+        "arguments",
+        "output",
+        "started_at",
+        "ended_at",
+        "duration_ms",
+        "exit_code",
+        "usage_id",
+        "bucket_start",
+        "total_tokens",
+        "error_count",
     ]
     .into_iter()
-    .map(|(name, access)| ColumnCapability {
-        name: ColumnName::new(name),
-        access,
-    })
+    .map(column_capability)
     .collect()
-}
-
-fn projected(projection: &[ColumnName], name: &str) -> bool {
-    projection.iter().any(|column| column.as_str() == name)
-}
-
-/// Builds a `file:` URI with immutable semantics for a sidecar-free database.
-///
-/// The path is percent-encoded so that URI delimiters (`?`, `#`, `%`) and
-/// non-ASCII bytes in the data root cannot corrupt the query string.
-fn immutable_uri(path: &Path) -> Result<String, AdapterError> {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let text = path
-        .to_str()
-        .ok_or_else(|| AdapterError::UnsupportedFormat {
-            stage: "opencode_database_open".to_string(),
-        })?;
-    let mut uri = String::with_capacity(text.len() + "file:?immutable=1".len());
-    uri.push_str("file:");
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'/'
-            | b'\\'
-            | b':'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~' => uri.push(char::from(byte)),
-            _ => {
-                uri.push('%');
-                uri.push(char::from(HEX[usize::from(byte >> 4)]));
-                uri.push(char::from(HEX[usize::from(byte & 0x0F)]));
-            }
-        }
-    }
-    uri.push_str("?immutable=1");
-    Ok(uri)
 }
 
 fn db_error(error: rusqlite::Error, request: &ScanRequest, stage: &str) -> AdapterError {
