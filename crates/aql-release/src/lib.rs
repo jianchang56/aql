@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -466,7 +466,9 @@ pub fn publish(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
     fs::hard_link(temp.path(), path)?;
-    File::open(parent)?.sync_all()?;
+    // Sync through the shared primitive: directory handles cannot be opened
+    // with `File::open` on every supported platform (notably Windows).
+    aql_fs::sync_dir(&open_directory(&parent.canonicalize()?)?)?;
     Ok(())
 }
 
