@@ -336,6 +336,39 @@ fn malformed_wire_fails_but_truncated_tail_preserves_prior_records() {
 }
 
 #[test]
+fn out_of_range_wire_timestamp_fails_closed() {
+    let fixtures = fixtures();
+    let root = fixtures.join("full");
+    let wire = root.join("sessions/wd_workspace_84b61923346a/session-full/agents/main/wire.jsonl");
+    let original = fs::read_to_string(&wire).expect("fixture wire must be readable");
+    let modified = original.replacen(
+        r#""time":1767225602000"#,
+        r#""time":9223372036854775807"#,
+        1,
+    );
+    assert_ne!(modified, original);
+    fs::write(&wire, modified).expect("fixture wire must be writable");
+
+    let adapter = KimiCodeAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &root);
+    let mut result = adapter
+        .scan(table_request(source, TableName::Messages, &["message_id"]))
+        .expect("creating a message stream must not read the source");
+    let actual = result.records.next();
+    let actual_stage = match &actual {
+        Some(Err(error)) => error.to_string(),
+        Some(Ok(_)) => "unexpected record".to_string(),
+        None => "end-of-stream".to_string(),
+    };
+    assert!(
+        matches!(actual, Some(Err(AdapterError::CorruptSource { stage })) if stage == "kimi_timestamp"),
+        "out-of-range epoch millis must fail closed at kimi_timestamp, got: {actual_stage}"
+    );
+    drop(result);
+    fs::remove_dir_all(fixtures).expect("fixtures removed");
+}
+
+#[test]
 fn wire_boundary_excludes_appends_after_first_record() {
     let fixtures = fixtures();
     let root = fixtures.join("full");
@@ -681,6 +714,36 @@ fn exact_identity_predicate_pushes_limit_and_unsupported_predicate_does_not() {
     assert_eq!(result.pushdown.predicates, vec![PushdownState::Unsupported]);
     assert_eq!(result.pushdown.limit, Some(PushdownState::Unsupported));
     assert_eq!(result.records.count(), 2);
+    fs::remove_dir_all(fixtures).expect("fixtures removed");
+}
+
+#[test]
+fn mixed_predicates_are_all_reported_unsupported_and_not_applied() {
+    let fixtures = fixtures();
+    let adapter = KimiCodeAdapter::new(b"fixture-salt".to_vec());
+    let source = manifest(&adapter, &fixtures.join("multi-session"));
+    let mut scan = request(source, &["session_id", "native_id"]);
+    scan.predicates.push(Predicate::Eq(
+        ColumnName::new("native_id"),
+        Literal::Text("session-beta".to_string()),
+    ));
+    scan.predicates
+        .push(Predicate::Unsupported("synthetic".to_string()));
+    scan.limit = Some(1);
+    let result = adapter.scan(scan).expect("mixed scan starts");
+    assert_eq!(
+        result.pushdown.predicates,
+        vec![PushdownState::Unsupported, PushdownState::Unsupported]
+    );
+    assert_eq!(result.pushdown.limit, Some(PushdownState::Unsupported));
+    assert_eq!(
+        result
+            .records
+            .collect::<Result<Vec<_>, _>>()
+            .expect("mixed predicates are not applied")
+            .len(),
+        2
+    );
     fs::remove_dir_all(fixtures).expect("fixtures removed");
 }
 

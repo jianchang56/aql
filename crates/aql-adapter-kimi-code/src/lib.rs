@@ -6,17 +6,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use aql_adapter_api::{
     AdapterError, AdapterSchema, AdapterWarning, AdapterWarningKind, AgentAdapter, Capabilities,
-    ColumnCapability, ColumnName, Literal, Predicate, ProbeRequest, ProbeResult, PushdownReport,
-    PushdownState, ScanDiagnostics, ScanRequest, ScanResult, SnapshotReport, SnapshotStrength,
-    TableName, check_scan_state, validate_projection_access,
+    ColumnCapability, Predicate, ProbeRequest, ProbeResult, PushdownReport, PushdownState,
+    ScanDiagnostics, ScanRequest, ScanResult, SnapshotReport, SnapshotStrength, TableName,
+    check_scan_state,
+    util::{
+        SessionPredicateCapabilities, column_capability, limit_pushdown, projected,
+        session_matches, session_predicate_state,
+    },
+    validate_projection_access,
 };
 use aql_model::{
-    AccessClass, CanonicalRecord, EntityId, IdentityConfidence, NativeId, SessionRecord,
-    SnapshotState, SourceId, SourceManifest,
+    CanonicalRecord, EntityId, IdentityConfidence, NativeId, SessionRecord, SnapshotState,
+    SourceId, SourceManifest,
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -30,12 +35,20 @@ const FORMAT: &str = "kimi-code-0.23.3-wire-1.4";
 type SessionKey = (String, String);
 type LocatedSession = (PathBuf, SessionKey);
 
+mod cache;
 mod wire;
 
+use cache::ParseCacheHandle;
+
 /// Read-only adapter for Kimi Code indexes, session state, and declared wire streams.
+///
+/// One adapter instance serves one query (callers rebind sources per query);
+/// `parse_cache` holds the single-pass parse of each agent wire file for that
+/// lifetime only, bounded by an in-memory byte cap.
 pub struct KimiCodeAdapter {
     installation_salt: Vec<u8>,
     roots: Mutex<BTreeMap<SourceId, RootBinding>>,
+    parse_cache: ParseCacheHandle,
 }
 
 #[derive(Clone)]
@@ -67,74 +80,31 @@ struct SessionFilterStream {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SafeState {
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    archived: Option<bool>,
-    agents: BTreeMap<String, SafeAgent>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SafeAgent {
     #[serde(rename = "type")]
     agent_type: String,
     parent_agent_id: Option<String>,
 }
 
+/// One-pass view over `state.json`: every consumed field stays borrowed raw
+/// JSON so the file is parsed exactly once. Each field is measured and
+/// materialized at its consumer, under that consumer's error stage, matching
+/// the previous per-consumer re-parses point by point.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TitleState {
-    title: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PreviewState {
-    last_prompt: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PathState {
-    work_dir: Option<String>,
-    custom: Option<PathLegacyCustom>,
-}
-
-#[derive(Deserialize)]
-struct PathLegacyCustom {
-    cwd: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RawTitle<'a> {
+struct RawState<'a> {
+    created_at: &'a serde_json::value::RawValue,
+    updated_at: &'a serde_json::value::RawValue,
+    archived: Option<bool>,
+    agents: &'a serde_json::value::RawValue,
     #[serde(borrow)]
     title: Option<&'a serde_json::value::RawValue>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawPreview<'a> {
     #[serde(borrow)]
     last_prompt: Option<&'a serde_json::value::RawValue>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawPath<'a> {
     #[serde(borrow)]
     work_dir: Option<&'a serde_json::value::RawValue>,
     #[serde(borrow)]
-    custom: Option<RawLegacyCustom<'a>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawWorkdirAuthority<'a> {
-    #[serde(borrow)]
-    work_dir: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
-    custom: Option<RawLegacyCustom<'a>>,
+    custom: Option<&'a serde_json::value::RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -159,6 +129,20 @@ impl KimiCodeAdapter {
         Self {
             installation_salt: installation_salt.into(),
             roots: Mutex::new(BTreeMap::new()),
+            parse_cache: Arc::new(Mutex::new(cache::ParseCache::new())),
+        }
+    }
+
+    /// Creates an adapter with a test-sized parse cache limit.
+    #[cfg(test)]
+    pub(crate) fn new_with_parse_cache_limit(
+        installation_salt: impl Into<Vec<u8>>,
+        parse_cache_bytes: usize,
+    ) -> Self {
+        Self {
+            installation_salt: installation_salt.into(),
+            roots: Mutex::new(BTreeMap::new()),
+            parse_cache: Arc::new(Mutex::new(cache::ParseCache::with_limit(parse_cache_bytes))),
         }
     }
 
@@ -326,20 +310,45 @@ impl KimiCodeAdapter {
             return Err(AdapterError::SnapshotUnavailable);
         }
         validate_session_chain(root, path)?;
-        let safe: SafeState =
+        let raw: RawState<'_> =
             serde_json::from_slice(&bytes).map_err(|_| AdapterError::CorruptSource {
                 stage: "kimi_state_parse".to_string(),
             })?;
-        let bucket_verified = validate_workdir_bucket(&bytes, path)?;
-        validate_agents(&safe.agents)?;
+        let created_at =
+            serde_json::from_str::<DateTime<Utc>>(raw.created_at.get()).map_err(|_| {
+                AdapterError::CorruptSource {
+                    stage: "kimi_state_parse".to_string(),
+                }
+            })?;
+        let updated_at =
+            serde_json::from_str::<DateTime<Utc>>(raw.updated_at.get()).map_err(|_| {
+                AdapterError::CorruptSource {
+                    stage: "kimi_state_parse".to_string(),
+                }
+            })?;
+        let agents = serde_json::from_str::<BTreeMap<String, SafeAgent>>(raw.agents.get())
+            .map_err(|_| AdapterError::CorruptSource {
+                stage: "kimi_state_parse".to_string(),
+            })?;
+        let custom = raw
+            .custom
+            .map(|value| serde_json::from_str::<RawLegacyCustom<'_>>(value.get()))
+            .transpose()
+            .map_err(|_| AdapterError::CorruptSource {
+                stage: "kimi_state_path".to_string(),
+            })?;
+        let legacy_cwd = custom.and_then(|custom| custom.cwd);
+        let bucket_verified = validate_workdir_bucket(raw.work_dir, legacy_cwd, path)?;
+        validate_agents(&agents)?;
         let wants_title = projected(&request.projection, "title");
         let wants_preview = projected(&request.projection, "preview");
         let wants_path =
             projected(&request.projection, "cwd") || projected(&request.projection, "project");
         let title = if wants_title {
-            validate_title_size(&bytes, request.budget.max_single_value_bytes)?;
-            serde_json::from_slice::<TitleState>(&bytes)
-                .map(|state| state.title)
+            raw_string_size(raw.title, request.budget.max_single_value_bytes)?;
+            raw.title
+                .map(|value| serde_json::from_str::<String>(value.get()))
+                .transpose()
                 .map_err(|_| AdapterError::CorruptSource {
                     stage: "kimi_state_content".to_string(),
                 })?
@@ -347,22 +356,35 @@ impl KimiCodeAdapter {
             None
         };
         let preview = if wants_preview {
-            validate_preview_size(&bytes, request.budget.max_single_value_bytes)?;
-            serde_json::from_slice::<PreviewState>(&bytes)
-                .map(|state| state.last_prompt)
+            raw_string_size(raw.last_prompt, request.budget.max_single_value_bytes)?;
+            raw.last_prompt
+                .map(|value| serde_json::from_str::<String>(value.get()))
+                .transpose()
                 .map_err(|_| AdapterError::CorruptSource {
                     stage: "kimi_state_content".to_string(),
                 })?
         } else {
             None
         };
-        let path_state = if wants_path {
-            validate_path_size(&bytes, request.budget.max_single_value_bytes)?;
-            Some(serde_json::from_slice::<PathState>(&bytes).map_err(|_| {
-                AdapterError::CorruptSource {
+        let cwd = if wants_path {
+            raw_string_size(
+                raw.work_dir.or(legacy_cwd),
+                request.budget.max_single_value_bytes,
+            )?;
+            let work_dir = raw
+                .work_dir
+                .map(|value| serde_json::from_str::<String>(value.get()))
+                .transpose()
+                .map_err(|_| AdapterError::CorruptSource {
                     stage: "kimi_state_path".to_string(),
-                }
-            })?)
+                })?;
+            let legacy = legacy_cwd
+                .map(|value| serde_json::from_str::<String>(value.get()))
+                .transpose()
+                .map_err(|_| AdapterError::CorruptSource {
+                    stage: "kimi_state_path".to_string(),
+                })?;
+            work_dir.or(legacy)
         } else {
             None
         };
@@ -382,18 +404,14 @@ impl KimiCodeAdapter {
             agent_id: "kimi-code".to_string(),
             title,
             preview,
-            cwd: path_state.and_then(|state| {
-                state
-                    .work_dir
-                    .or_else(|| state.custom.and_then(|custom| custom.cwd))
-            }),
+            cwd,
             project: None,
             model: None,
             provider: None,
-            created_at: Some(safe.created_at),
-            updated_at: Some(safe.updated_at),
+            created_at: Some(created_at),
+            updated_at: Some(updated_at),
             status: None,
-            archived: safe.archived,
+            archived: raw.archived,
             message_count: None,
             tool_call_count: None,
             tokens_used: None,
@@ -406,7 +424,7 @@ impl KimiCodeAdapter {
             provenance: BTreeMap::new(),
             extensions: BTreeMap::new(),
         }];
-        for (agent_id, agent) in &safe.agents {
+        for (agent_id, agent) in &agents {
             if agent_id == "main" {
                 continue;
             }
@@ -426,10 +444,10 @@ impl KimiCodeAdapter {
                 project: None,
                 model: None,
                 provider: None,
-                created_at: Some(safe.created_at),
-                updated_at: Some(safe.updated_at),
+                created_at: Some(created_at),
+                updated_at: Some(updated_at),
                 status: Some(agent.agent_type.clone()),
-                archived: safe.archived,
+                archived: raw.archived,
                 message_count: None,
                 tool_call_count: None,
                 tokens_used: None,
@@ -616,7 +634,7 @@ impl AgentAdapter for KimiCodeAdapter {
             TableName::Messages | TableName::ToolCalls | TableName::Usage
         ) {
             let root = self.root_for(&request.source)?;
-            return wire::scan(root, request);
+            return wire::scan(root, request, Arc::clone(&self.parse_cache));
         }
         if request.table == TableName::SessionEdges {
             let root = self.root_for(&request.source)?;
@@ -632,26 +650,22 @@ impl AgentAdapter for KimiCodeAdapter {
         let predicate_states = request
             .predicates
             .iter()
-            .map(session_predicate_state)
+            .map(|predicate| session_predicate_state(&SESSION_PREDICATE_CAPABILITIES, predicate))
             .collect::<Vec<_>>();
         let predicates_exact = predicate_states
             .iter()
             .all(|state| *state == PushdownState::Exact);
-        let filter_predicates = if predicates_exact {
-            request.predicates.clone()
+        // Filtering is all-or-nothing: unless every predicate can be applied
+        // exactly, none are, so the report must not claim partial execution.
+        let (predicate_states, filter_predicates) = if predicates_exact {
+            (predicate_states, request.predicates.clone())
         } else {
-            Vec::new()
+            (
+                vec![PushdownState::Unsupported; predicate_states.len()],
+                Vec::new(),
+            )
         };
-        let filter_limit = request
-            .limit
-            .filter(|_| predicates_exact && request.order_hint.is_empty());
-        let limit_state = request.limit.map(|_| {
-            if filter_limit.is_some() {
-                PushdownState::Exact
-            } else {
-                PushdownState::Unsupported
-            }
-        });
+        let (filter_limit, limit_state) = limit_pushdown(&request, predicates_exact);
         let ordering_count = request.order_hint.len();
         request.limit = None;
         Ok(ScanResult {
@@ -811,11 +825,9 @@ impl Iterator for SessionFilterStream {
             let record = self.inner.next()?;
             match record {
                 Ok(CanonicalRecord::Session(session)) => {
-                    if self
-                        .predicates
-                        .iter()
-                        .all(|predicate| session_matches(&session, predicate))
-                    {
+                    if self.predicates.iter().all(|predicate| {
+                        session_matches(&SESSION_PREDICATE_CAPABILITIES, &session, predicate)
+                    }) {
                         self.emitted += 1;
                         return Some(Ok(CanonicalRecord::Session(session)));
                     }
@@ -831,67 +843,11 @@ impl Iterator for SessionFilterStream {
     }
 }
 
-fn session_predicate_state(predicate: &Predicate) -> PushdownState {
-    let exact = match predicate {
-        Predicate::Eq(column, literal) => session_literal_supported(column, literal),
-        Predicate::In(column, literals) => {
-            !literals.is_empty()
-                && literals
-                    .iter()
-                    .all(|literal| session_literal_supported(column, literal))
-        }
-        Predicate::IsNull(column) => matches!(column.as_str(), "status" | "archived"),
-        Predicate::And(predicates) => predicates
-            .iter()
-            .all(|predicate| session_predicate_state(predicate) == PushdownState::Exact),
-        Predicate::Range { .. } | Predicate::Unsupported(_) => false,
-    };
-    if exact {
-        PushdownState::Exact
-    } else {
-        PushdownState::Unsupported
-    }
-}
-
-fn session_literal_supported(column: &ColumnName, literal: &Literal) -> bool {
-    matches!(
-        (column.as_str(), literal),
-        (
-            "session_id" | "native_id" | "source_id" | "agent_id" | "status",
-            Literal::Text(_)
-        ) | ("archived", Literal::Bool(_))
-    )
-}
-
-fn session_matches(session: &SessionRecord, predicate: &Predicate) -> bool {
-    match predicate {
-        Predicate::Eq(column, literal) => session_value_matches(session, column, literal),
-        Predicate::In(column, literals) => literals
-            .iter()
-            .any(|literal| session_value_matches(session, column, literal)),
-        Predicate::IsNull(column) => match column.as_str() {
-            "status" => session.status.is_none(),
-            "archived" => session.archived.is_none(),
-            _ => false,
-        },
-        Predicate::And(predicates) => predicates
-            .iter()
-            .all(|predicate| session_matches(session, predicate)),
-        Predicate::Range { .. } | Predicate::Unsupported(_) => true,
-    }
-}
-
-fn session_value_matches(session: &SessionRecord, column: &ColumnName, literal: &Literal) -> bool {
-    match (column.as_str(), literal) {
-        ("session_id", Literal::Text(value)) => session.session_id.as_str() == value,
-        ("native_id", Literal::Text(value)) => session.native_id.as_str() == value,
-        ("source_id", Literal::Text(value)) => session.source_id.as_str() == value,
-        ("agent_id", Literal::Text(value)) => &session.agent_id == value,
-        ("status", Literal::Text(value)) => session.status.as_ref() == Some(value),
-        ("archived", Literal::Bool(value)) => session.archived == Some(*value),
-        _ => false,
-    }
-}
+const SESSION_PREDICATE_CAPABILITIES: SessionPredicateCapabilities = SessionPredicateCapabilities {
+    eq_text: &["session_id", "native_id", "source_id", "agent_id", "status"],
+    eq_bool: &["archived"],
+    is_null: &["status", "archived"],
+};
 
 fn safe_id(value: &str) -> bool {
     !matches!(value, "." | "..")
@@ -1024,43 +980,12 @@ fn raw_string_size(
     Ok(())
 }
 
-fn validate_title_size(bytes: &[u8], maximum: u64) -> Result<(), AdapterError> {
-    let raw: RawTitle<'_> =
-        serde_json::from_slice(bytes).map_err(|_| AdapterError::CorruptSource {
-            stage: "kimi_state_content".to_string(),
-        })?;
-    raw_string_size(raw.title, maximum)
-}
-
-fn validate_preview_size(bytes: &[u8], maximum: u64) -> Result<(), AdapterError> {
-    let raw: RawPreview<'_> =
-        serde_json::from_slice(bytes).map_err(|_| AdapterError::CorruptSource {
-            stage: "kimi_state_content".to_string(),
-        })?;
-    raw_string_size(raw.last_prompt, maximum)
-}
-
-fn validate_path_size(bytes: &[u8], maximum: u64) -> Result<(), AdapterError> {
-    let raw: RawPath<'_> =
-        serde_json::from_slice(bytes).map_err(|_| AdapterError::CorruptSource {
-            stage: "kimi_state_path".to_string(),
-        })?;
-    raw_string_size(
-        raw.work_dir
-            .or_else(|| raw.custom.and_then(|custom| custom.cwd)),
-        maximum,
-    )
-}
-
-fn validate_workdir_bucket(bytes: &[u8], session: &Path) -> Result<bool, AdapterError> {
-    let raw: RawWorkdirAuthority<'_> =
-        serde_json::from_slice(bytes).map_err(|_| AdapterError::CorruptSource {
-            stage: "kimi_state_path".to_string(),
-        })?;
-    let Some(work_dir) = raw
-        .work_dir
-        .or_else(|| raw.custom.and_then(|custom| custom.cwd))
-    else {
+fn validate_workdir_bucket(
+    work_dir: Option<&serde_json::value::RawValue>,
+    legacy_cwd: Option<&serde_json::value::RawValue>,
+    session: &Path,
+) -> Result<bool, AdapterError> {
+    let Some(work_dir) = work_dir.or(legacy_cwd) else {
         return Ok(false);
     };
     let digest = hash_normalized_json_path(work_dir.get().as_bytes())?;
@@ -1279,72 +1204,54 @@ fn validate_agents(agents: &BTreeMap<String, SafeAgent>) -> Result<(), AdapterEr
     Ok(())
 }
 
-fn projected(projection: &[ColumnName], name: &str) -> bool {
-    projection.iter().any(|column| column.as_str() == name)
-}
-
-fn normalize_limit(request: &mut ScanRequest) -> Option<PushdownState> {
-    request.limit.map(|_| {
-        if request.predicates.is_empty() && request.order_hint.is_empty() {
-            PushdownState::Exact
-        } else {
-            request.limit = None;
-            PushdownState::Unsupported
-        }
-    })
-}
-
 fn columns() -> Vec<ColumnCapability> {
     [
-        ("session_id", AccessClass::Safe),
-        ("native_id", AccessClass::Safe),
-        ("source_id", AccessClass::Safe),
-        ("agent_id", AccessClass::Safe),
-        ("title", AccessClass::Content),
-        ("preview", AccessClass::Content),
-        ("cwd", AccessClass::Path),
-        ("project", AccessClass::Path),
-        ("created_at", AccessClass::Safe),
-        ("updated_at", AccessClass::Safe),
-        ("archived", AccessClass::Safe),
-        ("model", AccessClass::Safe),
-        ("message_id", AccessClass::Safe),
-        ("sequence", AccessClass::Safe),
-        ("role", AccessClass::Safe),
-        ("kind", AccessClass::Safe),
-        ("content", AccessClass::Content),
-        ("content_json", AccessClass::Content),
-        ("is_error", AccessClass::Safe),
-        ("tool_call_id", AccessClass::Safe),
-        ("tool_name", AccessClass::Safe),
-        ("namespace", AccessClass::Safe),
-        ("arguments", AccessClass::ToolInput),
-        ("output", AccessClass::ToolOutput),
-        ("status", AccessClass::Safe),
-        ("started_at", AccessClass::Safe),
-        ("ended_at", AccessClass::Safe),
-        ("duration_ms", AccessClass::Safe),
-        ("exit_code", AccessClass::Safe),
-        ("usage_id", AccessClass::Safe),
-        ("provider", AccessClass::Safe),
-        ("bucket_start", AccessClass::Safe),
-        ("input_tokens", AccessClass::Safe),
-        ("output_tokens", AccessClass::Safe),
-        ("cached_tokens", AccessClass::Safe),
-        ("total_tokens", AccessClass::Safe),
-        ("message_count", AccessClass::Safe),
-        ("tool_call_count", AccessClass::Safe),
-        ("error_count", AccessClass::Safe),
-        ("edge_id", AccessClass::Safe),
-        ("parent_session_id", AccessClass::Safe),
-        ("child_session_id", AccessClass::Safe),
-        ("edge_kind", AccessClass::Safe),
-        ("native_edge_id", AccessClass::Safe),
+        "session_id",
+        "native_id",
+        "source_id",
+        "agent_id",
+        "title",
+        "preview",
+        "cwd",
+        "project",
+        "created_at",
+        "updated_at",
+        "archived",
+        "model",
+        "message_id",
+        "sequence",
+        "role",
+        "kind",
+        "content",
+        "content_json",
+        "is_error",
+        "tool_call_id",
+        "tool_name",
+        "namespace",
+        "arguments",
+        "output",
+        "status",
+        "started_at",
+        "ended_at",
+        "duration_ms",
+        "exit_code",
+        "usage_id",
+        "provider",
+        "bucket_start",
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+        "total_tokens",
+        "message_count",
+        "tool_call_count",
+        "error_count",
+        "edge_id",
+        "parent_session_id",
+        "child_session_id",
+        "edge_kind",
+        "native_edge_id",
     ]
     .into_iter()
-    .map(|(name, access)| ColumnCapability {
-        name: ColumnName::new(name),
-        access,
-    })
+    .map(column_capability)
     .collect()
 }
